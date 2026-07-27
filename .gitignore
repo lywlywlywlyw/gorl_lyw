@@ -20,3 +20,10 @@ data/
 # OS
 .DS_Store
 Thumbs.db
+
+datasets/
+logs/
+wandb/
+results/
+nohup*.out
+output*.log

@@ -10,6 +10,8 @@ numpy>=1.24.0
 tqdm>=4.65.0
 
 # MuJoCo environment
+gymnasium>=1.0.0
+imageio>=2.31.0
 mujoco==3.3.6
 mujoco-mjx==3.3.6
 playground==0.0.5
