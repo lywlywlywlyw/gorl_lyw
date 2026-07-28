@@ -39,13 +39,13 @@ import jax_dataclasses as jdc
 import numpy as np
 import optax
 import tyro
-import gymnasium as gym
 from jax import Array
 from jax import numpy as jnp
 from tqdm import trange
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
+from d4rl_envs.mjx_envs import make_d4rl_env, normalize_task
 from flow_policy import encoder_ppo, math_utils, networks
 from flow_policy.decoder_fm import DecoderFMConfig, DecoderFMState
 
@@ -471,42 +471,25 @@ def validate_config(config: FrozenOfflineConfig) -> None:
         raise ValueError("wandb_mode must be online, offline, or disabled.")
 
 
-def d4rl_gymnasium_env_id(dataset_id: str) -> str:
-    """Map a D4RL MuJoCo dataset ID to its Gymnasium environment."""
-    environment = dataset_id.split("-", 1)[0].lower()
-    mapping = {
-        "walker2d": "Walker2d-v5",
-        "halfcheetah": "HalfCheetah-v5",
-        "hopper": "Hopper-v5",
-        "ant": "Ant-v5",
-    }
-    if environment not in mapping:
-        raise ValueError(
-            f"D4RL dataset {dataset_id!r} has no Gymnasium environment mapping. "
-            f"Supported D4RL MuJoCo tasks: {sorted(mapping)}."
-        )
-    return mapping[environment]
-
-
 def make_dataset_environment(
     config: FrozenOfflineConfig,
 ) -> tuple[Any, str]:
     """Create the environment corresponding to the selected offline dataset."""
     if config.env_name is not None:
-        environment_id = config.env_name
+        environment_source = config.env_name
     elif config.d4rl_dataset is not None:
-        environment_id = d4rl_gymnasium_env_id(config.d4rl_dataset)
+        environment_source = config.d4rl_dataset
     else:
         raise ValueError(
             "--env-name is required when loading a custom --data-path."
         )
     try:
-        environment = gym.make(environment_id)
+        environment = make_d4rl_env(environment_source)
+        environment_id = normalize_task(environment_source)
     except Exception as error:
         raise RuntimeError(
-            f"Could not create Gymnasium environment {environment_id!r} for "
-            "the offline dataset. Ensure Gymnasium MuJoCo dependencies are "
-            "installed."
+            f"Could not create D4RL-compatible MJX environment "
+            f"{environment_source!r} for the offline dataset."
         ) from error
     return environment, environment_id
 
@@ -516,7 +499,7 @@ def make_encoder_config(
     action_dim: int,
     episode_length: int,
 ) -> encoder_ppo.EncoderConfig:
-    """Build checkpoint metadata without depending on MuJoCo Playground."""
+    """Build checkpoint metadata for the shared Playground/MJX environment."""
     return encoder_ppo.EncoderConfig(
         action_repeat=1,
         batch_size=config.batch_size,
@@ -952,22 +935,18 @@ def main(config: FrozenOfflineConfig) -> None:
         config.env_name = environment_id
         obs_dim = buffer.observations.shape[-1]
         action_dim = buffer.actions.shape[-1]
-        if env.observation_space.shape != (obs_dim,):
+        if env.observation_size != obs_dim:
             raise ValueError(
                 f"Dataset observation dim {obs_dim} does not match "
-                f"{environment_id} observation space "
-                f"{env.observation_space.shape}."
+                f"{environment_id} MJX observation size "
+                f"{env.observation_size}."
             )
-        if env.action_space.shape != (action_dim,):
+        if env.action_size != action_dim:
             raise ValueError(
                 f"Dataset action dim {action_dim} does not match "
-                f"{environment_id} action space {env.action_space.shape}."
+                f"{environment_id} MJX action size {env.action_size}."
             )
-        episode_length = int(
-            env.spec.max_episode_steps
-            if env.spec is not None and env.spec.max_episode_steps is not None
-            else config.episode_length
-        )
+        episode_length = int(config.episode_length)
         online_config = make_encoder_config(
             config, action_dim, episode_length
         )

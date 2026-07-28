@@ -20,11 +20,12 @@ import jax
 import jax_dataclasses as jdc
 import numpy as np
 import tyro
-from brax import envs as brax_envs
 from jax import numpy as jnp
 from tqdm import trange
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from d4rl_envs.mjx_envs import make_d4rl_env
 
 from flow_policy import encoder_ppo
 from flow_policy.agent import EncoderFMAgent
@@ -97,13 +98,13 @@ class Config:
 
 
 @jdc.pytree_dataclass
-class BraxRolloutState:
-    """Brax-State equivalent of flow_policy's MJX Playground rollout state."""
+class MjxRolloutState:
+    """Playground rollout state with action collection for FM retraining."""
 
     env: jdc.Static[Any]
     env_state: Any
     first_obs: jax.Array
-    first_pipeline_state: Any
+    first_data: Any
     steps: jax.Array
     num_envs: jdc.Static[int]
     prng: jax.Array
@@ -112,16 +113,16 @@ class BraxRolloutState:
     @jdc.jit
     def init(
         env: jdc.Static[Any], prng: jax.Array, num_envs: jdc.Static[int]
-    ) -> "BraxRolloutState":
+    ) -> "MjxRolloutState":
         prng, reset_prng = jax.random.split(prng)
         state = jax.vmap(env.reset)(
             jax.random.split(reset_prng, num=num_envs)
         )
-        return BraxRolloutState(
+        return MjxRolloutState(
             env=env,
             env_state=state,
             first_obs=state.obs,
-            first_pipeline_state=state.pipeline_state,
+            first_data=state.data,
             steps=jnp.zeros_like(state.done),
             num_envs=num_envs,
             prng=prng,
@@ -136,8 +137,8 @@ class BraxRolloutState:
         auto_reset: jdc.Static[bool] = True,
         deterministic: jdc.Static[bool] = False,
         apply_tanh_in_rollout: jdc.Static[bool] = True,
-    ) -> tuple["BraxRolloutState", Any]:
-        def step(carry: BraxRolloutState, _):
+    ) -> tuple["MjxRolloutState", Any]:
+        def step(carry: MjxRolloutState, _):
             key, next_key = jax.random.split(carry.prng)
             z, z_info = agent.sample_z(
                 carry.env_state.obs, key, deterministic=deterministic
@@ -174,10 +175,10 @@ class BraxRolloutState:
                     obs=jax.tree.map(
                         choose, carry.first_obs, next_state.obs
                     ),
-                    pipeline_state=jax.tree.map(
+                    data=jax.tree.map(
                         choose,
-                        carry.first_pipeline_state,
-                        next_state.pipeline_state,
+                        carry.first_data,
+                        next_state.data,
                     ),
                     done=jnp.zeros_like(next_state.done),
                 )
@@ -201,8 +202,8 @@ class BraxRolloutState:
         episode_length: jdc.Static[int],
         iterations_per_env: jdc.Static[int],
         apply_tanh_in_rollout: jdc.Static[bool] = True,
-    ) -> tuple["BraxRolloutState", jax.Array, jax.Array, jax.Array]:
-        def step(carry: BraxRolloutState, _):
+    ) -> tuple["MjxRolloutState", jax.Array, jax.Array, jax.Array]:
+        def step(carry: MjxRolloutState, _):
             key, next_key = jax.random.split(carry.prng)
             z, _ = agent.sample_z(
                 carry.env_state.obs, key, deterministic=False
@@ -228,10 +229,10 @@ class BraxRolloutState:
 
             reset_state = next_state.replace(
                 obs=jax.tree.map(choose, carry.first_obs, next_state.obs),
-                pipeline_state=jax.tree.map(
+                data=jax.tree.map(
                     choose,
-                    carry.first_pipeline_state,
-                    next_state.pipeline_state,
+                    carry.first_data,
+                    next_state.data,
                 ),
                 done=jnp.zeros_like(next_state.done),
             )
@@ -453,7 +454,7 @@ def evaluate(
     config: Config,
     key: jax.Array,
 ) -> dict[str, float]:
-    rollout = BraxRolloutState.init(
+    rollout = MjxRolloutState.init(
         agent.ppo_z_state.env,
         key,
         config.eval_episodes,
@@ -543,7 +544,7 @@ def train_encoder(
     # the state when swapping configs while preserving all training state.
     ppo = jdc.replace(agent.ppo_z_state, config=new_config)
     agent = jdc.replace(agent, ppo_z_state=ppo)
-    rollout = BraxRolloutState.init(
+    rollout = MjxRolloutState.init(
         env,
         prng=jax.random.key(config.seed + stage + 1),
         num_envs=config.num_envs,
@@ -642,7 +643,7 @@ def collect_data(
     config: Config,
     stage: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    rollout = BraxRolloutState.init(
+    rollout = MjxRolloutState.init(
         env,
         prng=jax.random.key(config.seed + stage + 50_000),
         num_envs=config.num_envs,
@@ -823,7 +824,7 @@ def main(config: Config) -> None:
         ) as file:
             header = pickle.load(file)
     source_env, task = resolve_task(header, config)
-    env = brax_envs.get_environment(task, backend="mjx")
+    env = make_d4rl_env(task)
     checkpoint, encoder, decoder = load_states(
         config.offline_checkpoint, env, config, timesteps[0]
     )
