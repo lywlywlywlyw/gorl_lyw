@@ -537,8 +537,11 @@ def train_encoder(
     global_offset: int,
 ) -> tuple[EncoderFMAgent, float]:
     new_config = encoder_config(config, timesteps, env.action_size, stage)
-    with jdc.copy_and_mutate(agent.ppo_z_state) as ppo:
-        ppo.config = new_config
+    # EncoderConfig contains jdc.Static fields whose values can change between
+    # stages (for example num_timesteps and max_grad_norm).  copy_and_mutate
+    # only permits assignments with an identical PyTree structure, so rebuild
+    # the state when swapping configs while preserving all training state.
+    ppo = jdc.replace(agent.ppo_z_state, config=new_config)
     agent = jdc.replace(agent, ppo_z_state=ppo)
     rollout = BraxRolloutState.init(
         env,
