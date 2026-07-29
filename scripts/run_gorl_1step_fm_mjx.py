@@ -72,14 +72,16 @@ class Config:
 
     data_collection_iterations: int = 20
     collection_steps_per_iteration: int = 480
-    fm_batch_size: int = 8192
+    fm_batch_size: int = 128
     fm_num_epochs: int = 50
-    fm_learning_rate: float = 3e-4
+    fm_learning_rate: float = 1e-4
     fm_max_samples: int = 10_000_000
     fm_validation_fraction: float = 0.1
     fm_patience: int = 20
-    fm_hidden_size: int = 64
-    fm_num_layers: int = 4
+    fm_timestep_embed_dim: int = 256
+    fm_down_dims: tuple[int, ...] = (256, 512, 1024)
+    fm_kernel_size: int = 5
+    fm_n_groups: int = 8
     fm_hybrid_sampling: bool = False
     fm_high_quality_ratio: float = 0.8
     fm_high_quality_percentile: float = 0.5
@@ -366,13 +368,19 @@ def load_states(
         )
         decoder_config = Decoder1StepFMConfig(
             flow_steps=1,
-            timestep_embed_dim=8,
-            hidden_dims=(config.fm_hidden_size,) * config.fm_num_layers,
+            timestep_embed_dim=config.fm_timestep_embed_dim,
+            down_dims=config.fm_down_dims,
+            kernel_size=config.fm_kernel_size,
+            n_groups=config.fm_n_groups,
+            condition_type="film",
+            use_down_condition=True,
+            use_mid_condition=True,
+            use_up_condition=True,
             policy_output_scale=1.0,
             learning_rate=config.fm_learning_rate,
             batch_size=config.fm_batch_size,
             num_epochs=config.fm_num_epochs,
-            n_samples_per_action=8,
+            n_samples_per_action=1,
             normalize_observations=True,
             normalize_actions=True,
             feather_std=0.0,
@@ -399,6 +407,11 @@ def load_states(
     missing = required.difference(checkpoint)
     if missing:
         raise KeyError(f"Offline checkpoint missing keys: {sorted(missing)}")
+    if not hasattr(checkpoint["config"], "down_dims"):
+        raise ValueError(
+            "The checkpoint contains the old MLP one-step decoder. "
+            "Retrain it with the MP1-compatible ConditionalUnet1D."
+        )
     checkpoint_obs_dim = int(checkpoint["obs_dim"])
     checkpoint_action_dim = int(checkpoint["action_dim"])
     if (
@@ -433,13 +446,23 @@ def load_states(
             learning_rate=config.fm_learning_rate,
             batch_size=config.fm_batch_size,
         )
-        decoder.opt = __import__("optax").adam(config.fm_learning_rate)
+        decoder.opt = Decoder1StepFMState._make_optimizer(decoder.config)
         decoder.opt_state = decoder.opt.init(decoder.params)
-    expected_hidden = (config.fm_hidden_size,) * config.fm_num_layers
-    if tuple(decoder.config.hidden_dims) != expected_hidden:
+    expected_structure = (
+        tuple(decoder.config.down_dims) == config.fm_down_dims
+        and decoder.config.timestep_embed_dim == config.fm_timestep_embed_dim
+        and decoder.config.kernel_size == config.fm_kernel_size
+        and decoder.config.n_groups == config.fm_n_groups
+    )
+    if not expected_structure:
         raise ValueError(
-            f"FM hidden_dims={decoder.config.hidden_dims}, "
-            f"expected={expected_hidden}."
+            "FM checkpoint structure does not match the online configuration: "
+            f"checkpoint=(embed={decoder.config.timestep_embed_dim}, "
+            f"down_dims={decoder.config.down_dims}, "
+            f"kernel={decoder.config.kernel_size}, groups={decoder.config.n_groups}), "
+            f"online=(embed={config.fm_timestep_embed_dim}, "
+            f"down_dims={config.fm_down_dims}, "
+            f"kernel={config.fm_kernel_size}, groups={config.fm_n_groups})."
         )
     return checkpoint, encoder, decoder
 
@@ -510,15 +533,16 @@ def save_checkpoint(
         "action_stats": decoder.action_stats,
         "config": decoder.config,
         "obs_dim": int(decoder.obs_stats.mean.shape[-1]),
-        "action_dim": int(decoder.params[-1][0].shape[-1]),
+        "action_dim": decoder.action_dim,
         "ppo_z_params": agent.ppo_z_state.params,
         "ppo_z_obs_stats": agent.ppo_z_state.obs_stats,
         "fm_params": decoder.params,
         "fm_obs_stats": decoder.obs_stats,
+        "fm_action_stats": decoder.action_stats,
         "env_name": source_env,
         "d4rl_dataset": config.d4rl_dataset,
         "decoder_type": "1step_fm",
-        "z_dim": int(decoder.params[-1][0].shape[-1]),
+        "z_dim": decoder.action_dim,
         "online_config": asdict(config),
         "online_stage": stage,
         "stage_timesteps": steps,
@@ -721,9 +745,7 @@ def validation_loss(
         batch_act = jnp.asarray(actions[start : start + decoder.config.batch_size])
         if len(batch_obs) == 0:
             continue
-        normalized = (
-            batch_obs - decoder.obs_stats.mean
-        ) / (decoder.obs_stats.std + 1e-8)
+        normalized = decoder._normalize_obs(batch_obs)
         key, eps_key, time_key = jax.random.split(key, 3)
         eps = jax.random.normal(eps_key, batch_act.shape)
         times, starts = decoder.sample_t_r(time_key, len(batch_obs))

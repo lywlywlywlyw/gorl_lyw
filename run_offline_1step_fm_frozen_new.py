@@ -73,10 +73,12 @@ class FrozenOfflineConfig:
     episode_length: int = 1000
 
     # Decoder: train once to convergence, then freeze permanently.
-    decoder_learning_rate: float = 3e-4
-    decoder_hidden_size: int = 64
-    decoder_num_layers: int = 4
-    decoder_batch_size: int = 8192
+    decoder_learning_rate: float = 1e-4
+    decoder_timestep_embed_dim: int = 256
+    decoder_down_dims: tuple[int, ...] = (256, 512, 1024)
+    decoder_kernel_size: int = 5
+    decoder_n_groups: int = 8
+    decoder_batch_size: int = 128
     decoder_max_epochs: int = 200
     decoder_min_epochs: int = 20
     decoder_patience: int = 20
@@ -85,7 +87,7 @@ class FrozenOfflineConfig:
     decoder_eval_batches: int = 32
     flow_steps: int = 1
     latent_inverse_steps: int = 20
-    n_fm_samples_per_action: int = 8
+    n_fm_samples_per_action: int = 1
 
     # IQL encoder. The policy and value layouts are fixed by EncoderState.init.
     encoder_iql_steps: int = 500_000
@@ -547,8 +549,8 @@ def inverse_fm_batch(
     return action_norm + decoder.meanflow_forward(
         obs_norm,
         action_norm,
-        decoder.embed_timestep(t),
-        decoder.embed_timestep(r),
+        t,
+        r,
     )
 
 def forward_fm_batch(
@@ -600,9 +602,7 @@ def decoder_validation_loss(
         batch = indices[start : start + decoder.config.batch_size]
         obs = jnp.asarray(buffer.observations[batch])
         actions = jnp.asarray(buffer.actions[batch])
-        obs_norm = (obs - decoder.obs_stats.mean) / (
-            decoder.obs_stats.std + 1e-8
-        )
+        obs_norm = decoder._normalize_obs(obs)
         key, eps_key, time_key = jax.random.split(key, 3)
         eps = jax.random.normal(eps_key, actions.shape)
         times, starts = decoder.sample_t_r(time_key, len(batch))
@@ -838,7 +838,7 @@ def save_compatible_checkpoint(
     value_params: PyTree,
 ) -> None:
     obs_dim = int(decoder.obs_stats.mean.shape[-1])
-    action_dim = int(decoder.params[-1][0].shape[-1])
+    action_dim = decoder.action_dim
     checkpoint = {
         # Standalone FM schema loaded by train_encoder_ppo.py.
         "params": decoder.params,
@@ -890,7 +890,7 @@ def save_encoder_checkpoint(
         "decoder_type": "1step_fm",
         "iteration": 0,
         "reward": float("-inf"),
-        "z_dim": int(decoder.params[-1][0].shape[-1]),
+        "z_dim": decoder.action_dim,
         "fm_params": decoder.params,
         "fm_obs_stats": decoder.obs_stats,
         "fm_action_stats": decoder.action_stats,
@@ -951,9 +951,14 @@ def main(config: FrozenOfflineConfig) -> None:
         )
         decoder_config = Decoder1StepFMConfig(
             flow_steps=config.flow_steps,
-            timestep_embed_dim=8,
-            hidden_dims=(config.decoder_hidden_size,)
-            * config.decoder_num_layers,
+            timestep_embed_dim=config.decoder_timestep_embed_dim,
+            down_dims=config.decoder_down_dims,
+            kernel_size=config.decoder_kernel_size,
+            n_groups=config.decoder_n_groups,
+            condition_type="film",
+            use_down_condition=True,
+            use_mid_condition=True,
+            use_up_condition=True,
             policy_output_scale=1.0,
             learning_rate=config.decoder_learning_rate,
             batch_size=config.decoder_batch_size,

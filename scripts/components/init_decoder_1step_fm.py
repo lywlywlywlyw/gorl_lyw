@@ -38,13 +38,19 @@ def main(
 
     config = Decoder1StepFMConfig(
         flow_steps=1,
-        timestep_embed_dim=8,
-        hidden_dims=(64, 64, 64, 64),
+        timestep_embed_dim=256,
+        down_dims=(256, 512, 1024),
+        kernel_size=5,
+        n_groups=8,
+        condition_type="film",
+        use_down_condition=True,
+        use_mid_condition=True,
+        use_up_condition=True,
         policy_output_scale=1.0,
-        learning_rate=3e-4,
-        batch_size=2048,
+        learning_rate=1e-4,
+        batch_size=128,
         num_epochs=1,
-        n_samples_per_action=8,
+        n_samples_per_action=1,
         normalize_observations=True,
         normalize_actions=True,
         feather_std=0.0,
@@ -53,15 +59,8 @@ def main(
     prng = jax.random.PRNGKey(seed)
     fm_state = Decoder1StepFMState.init(prng, obs_dim, action_dim, config)
 
-    def zero_params(params):
-        if isinstance(params, tuple):
-            return tuple(zero_params(p) for p in params)
-        if isinstance(params, list):
-            return [zero_params(p) for p in params]
-        return jnp.zeros_like(params)
-
     with jdc.copy_and_mutate(fm_state) as fm_state:
-        fm_state.params = zero_params(fm_state.params)
+        fm_state.params = jax.tree.map(jnp.zeros_like, fm_state.params)
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)

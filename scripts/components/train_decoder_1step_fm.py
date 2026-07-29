@@ -19,8 +19,8 @@ from flow_policy.decoder_1step_fm import Decoder1StepFMConfig, Decoder1StepFMSta
 def train_fm(
     data_path: str = "data/ppo_training_data_WalkerWalk_20250928_212057.pkl",
     num_epochs: int = 80,
-    batch_size: int = 8192,
-    learning_rate: float = 3e-4,
+    batch_size: int = 128,
+    learning_rate: float = 1e-4,
     validation_split: float = 0.1,
     max_samples: int | None = 10000000,
     episode_length: int = 1000,
@@ -31,8 +31,10 @@ def train_fm(
     high_quality_percentile: float = 0.5,
     output_dir: str = "fm_models",
     seed: int = 42,
-    hidden_size: int = 128,
-    num_layers: int = 4,
+    timestep_embed_dim: int = 256,
+    down_dims: tuple[int, ...] = (256, 512, 1024),
+    kernel_size: int = 5,
+    n_groups: int = 8,
 ) -> None:
     """Train one-step MeanFlow decoder on collected PPO data."""
 
@@ -136,17 +138,21 @@ def train_fm(
 
     obs_dim = states.shape[1]
     action_dim = actions.shape[1]
-    hidden_dims = tuple([hidden_size] * num_layers)
-
     config = Decoder1StepFMConfig(
         flow_steps=1,
-        timestep_embed_dim=8,
-        hidden_dims=hidden_dims,
+        timestep_embed_dim=timestep_embed_dim,
+        down_dims=down_dims,
+        kernel_size=kernel_size,
+        n_groups=n_groups,
+        condition_type="film",
+        use_down_condition=True,
+        use_mid_condition=True,
+        use_up_condition=True,
         policy_output_scale=1.0,
         learning_rate=learning_rate,
         batch_size=batch_size,
         num_epochs=num_epochs,
-        n_samples_per_action=8,
+        n_samples_per_action=1,
         normalize_observations=True,
         normalize_actions=True,
         feather_std=0.0,
