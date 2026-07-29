@@ -539,12 +539,17 @@ def inverse_fm_batch(
     actions: Array,
     num_steps: int,
 ) -> Array:
-    def step(_: Array, latent: Array) -> Array:
-        decoded = forward_fm_batch(decoder, observations, latent)
-        return latent + actions - decoded
-
-    return jax.lax.fori_loop(0, num_steps, step, actions)
-
+    del num_steps  # One-step MeanFlow has an analytic action-to-noise inverse.
+    obs_norm = decoder._normalize_obs(observations)
+    action_norm = decoder._normalize_action(actions)
+    t = jnp.zeros((actions.shape[0], 1))
+    r = jnp.ones((actions.shape[0], 1))
+    return action_norm + decoder.meanflow_forward(
+        obs_norm,
+        action_norm,
+        decoder.embed_timestep(t),
+        decoder.embed_timestep(r),
+    )
 
 def forward_fm_batch(
     decoder: Decoder1StepFMState, observations: Array, latents: Array
@@ -599,17 +604,13 @@ def decoder_validation_loss(
             decoder.obs_stats.std + 1e-8
         )
         key, eps_key, time_key = jax.random.split(key, 3)
-        eps = jax.random.normal(
-            eps_key,
-            (len(batch), decoder.config.n_samples_per_action, actions.shape[-1]),
-        )
-        times, starts = decoder.sample_t_r(
-            time_key, len(batch), decoder.config.n_samples_per_action
+        eps = jax.random.normal(eps_key, actions.shape)
+        times, starts = decoder.sample_t_r(time_key, len(batch))
+        total_loss, _, _ = decoder.compute_meanflow_loss(
+            obs_norm, actions, eps, times, starts
         )
         losses.append(
-            float(jnp.mean(
-                decoder.compute_meanflow_loss(obs_norm, actions, eps, times, starts)
-            ))
+            float(total_loss)
         )
     return float(np.mean(losses)), key
 
@@ -842,6 +843,7 @@ def save_compatible_checkpoint(
         # Standalone FM schema loaded by train_encoder_ppo.py.
         "params": decoder.params,
         "obs_stats": decoder.obs_stats,
+        "action_stats": decoder.action_stats,
         "config": decoder.config,
         "obs_dim": obs_dim,
         "action_dim": action_dim,
@@ -855,6 +857,7 @@ def save_compatible_checkpoint(
         "z_dim": action_dim,
         "fm_params": decoder.params,
         "fm_obs_stats": decoder.obs_stats,
+        "fm_action_stats": decoder.action_stats,
         "online_encoder_config": online_config,
         # Offline-only training state/metadata.
         "offline_config": asdict(config),
@@ -890,6 +893,7 @@ def save_encoder_checkpoint(
         "z_dim": int(decoder.params[-1][0].shape[-1]),
         "fm_params": decoder.params,
         "fm_obs_stats": decoder.obs_stats,
+        "fm_action_stats": decoder.action_stats,
     }
     with open(path, "wb") as file:
         pickle.dump(checkpoint, file)
@@ -956,6 +960,7 @@ def main(config: FrozenOfflineConfig) -> None:
             num_epochs=config.decoder_max_epochs,
             n_samples_per_action=config.n_fm_samples_per_action,
             normalize_observations=True,
+            normalize_actions=True,
             feather_std=0.0,
         )
         decoder = Decoder1StepFMState.init(
@@ -964,6 +969,9 @@ def main(config: FrozenOfflineConfig) -> None:
         with jdc.copy_and_mutate(decoder) as decoder:
             decoder.obs_stats = decoder.obs_stats.update(
                 jnp.asarray(buffer.observations)
+            )
+            decoder.action_stats = decoder.action_stats.update(
+                jnp.asarray(buffer.actions)
             )
 
         # Keep the same policy/value layer layouts used by EncoderState.init,
@@ -1046,8 +1054,8 @@ def main(config: FrozenOfflineConfig) -> None:
                 "phase": "decoder",
                 "global_step": global_step,
                 "decoder/epoch": epoch + 1,
-                "decoder/train_meanflow_loss": float(np.mean(losses)),
-                "decoder/validation_meanflow_loss": validation_loss,
+                "decoder/train_loss": float(np.mean(losses)),
+                "decoder/validation_loss": validation_loss,
                 **comparison,
             }
             append_metrics(metrics_path, record)

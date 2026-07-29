@@ -27,3 +27,4 @@ wandb/
 results/
 nohup*.out
 output*.log
+ref/

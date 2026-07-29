@@ -374,6 +374,7 @@ def load_states(
             num_epochs=config.fm_num_epochs,
             n_samples_per_action=8,
             normalize_observations=True,
+            normalize_actions=True,
             feather_std=0.0,
         )
         decoder = Decoder1StepFMState.init(
@@ -425,6 +426,8 @@ def load_states(
     with jdc.copy_and_mutate(decoder) as decoder:
         decoder.params = checkpoint["params"]
         decoder.obs_stats = checkpoint["obs_stats"]
+        if "action_stats" in checkpoint:
+            decoder.action_stats = checkpoint["action_stats"]
         decoder.config = jdc.replace(
             decoder.config,
             learning_rate=config.fm_learning_rate,
@@ -504,6 +507,7 @@ def save_checkpoint(
     payload = {
         "params": decoder.params,
         "obs_stats": decoder.obs_stats,
+        "action_stats": decoder.action_stats,
         "config": decoder.config,
         "obs_dim": int(decoder.obs_stats.mean.shape[-1]),
         "action_dim": int(decoder.params[-1][0].shape[-1]),
@@ -721,21 +725,13 @@ def validation_loss(
             batch_obs - decoder.obs_stats.mean
         ) / (decoder.obs_stats.std + 1e-8)
         key, eps_key, time_key = jax.random.split(key, 3)
-        eps = jax.random.normal(
-            eps_key,
-            (
-                len(batch_obs),
-                decoder.config.n_samples_per_action,
-                actions.shape[-1],
-            ),
-        )
-        times, starts = decoder.sample_t_r(
-            time_key, len(batch_obs), decoder.config.n_samples_per_action
+        eps = jax.random.normal(eps_key, batch_act.shape)
+        times, starts = decoder.sample_t_r(time_key, len(batch_obs))
+        total_loss, _, _ = decoder.compute_meanflow_loss(
+            normalized, batch_act, eps, times, starts
         )
         losses.append(
-            float(jnp.mean(decoder.compute_meanflow_loss(
-                normalized, batch_act, eps, times, starts
-            )))
+            float(total_loss)
         )
     return float(np.mean(losses)), key
 
@@ -763,6 +759,9 @@ def train_decoder(
     decoder = agent.fm_state
     with jdc.copy_and_mutate(decoder) as decoder:
         decoder.obs_stats = decoder.obs_stats.update(jnp.asarray(obs[train_rows]))
+        decoder.action_stats = decoder.action_stats.update(
+            jnp.asarray(actions[train_rows])
+        )
     best_params = jax.tree.map(jnp.copy, decoder.params)
     best_opt_state = jax.tree.map(jnp.copy, decoder.opt_state)
     best_steps = jnp.copy(decoder.steps)

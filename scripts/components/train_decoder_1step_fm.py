@@ -148,6 +148,7 @@ def train_fm(
         num_epochs=num_epochs,
         n_samples_per_action=8,
         normalize_observations=True,
+        normalize_actions=True,
         feather_std=0.0,
     )
 
@@ -156,6 +157,7 @@ def train_fm(
 
     with jdc.copy_and_mutate(fm_state) as fm_state:
         fm_state.obs_stats = fm_state.obs_stats.update(jnp.array(train_states))
+        fm_state.action_stats = fm_state.action_stats.update(jnp.array(train_actions))
 
     n_batches = n_train // batch_size
     best_val_loss = float("inf")
@@ -194,24 +196,17 @@ def train_fm(
             obs_norm = fm_state._normalize_obs(batch_obs)
 
             prng_val_eps, prng_val_tr, prng = jax.random.split(prng, 3)
-            val_eps = jax.random.normal(
-                prng_val_eps,
-                (batch_size, fm_state.config.n_samples_per_action, action_dim),
-            )
-            val_t, val_r = fm_state.sample_t_r(
-                prng_val_tr,
-                batch_size,
-                fm_state.config.n_samples_per_action,
-            )
+            val_eps = jax.random.normal(prng_val_eps, batch_actions.shape)
+            val_t, val_r = fm_state.sample_t_r(prng_val_tr, batch_size)
 
-            meanflow_loss = fm_state.compute_meanflow_loss(
+            total_loss, _, _ = fm_state.compute_meanflow_loss(
                 obs_norm,
                 batch_actions,
                 val_eps,
                 val_t,
                 val_r,
             )
-            val_batch_losses.append(float(jnp.mean(meanflow_loss)))
+            val_batch_losses.append(float(total_loss))
 
         val_loss = float(np.mean(val_batch_losses)) if val_batch_losses else train_loss
         val_losses.append(val_loss)
@@ -224,6 +219,7 @@ def train_fm(
             checkpoint = {
                 "params": fm_state.params,
                 "obs_stats": fm_state.obs_stats,
+                "action_stats": fm_state.action_stats,
                 "config": config,
                 "epoch": epoch + 1,
                 "train_loss": train_loss,
@@ -246,6 +242,7 @@ def train_fm(
     final_checkpoint = {
         "params": fm_state.params,
         "obs_stats": fm_state.obs_stats,
+        "action_stats": fm_state.action_stats,
         "config": config,
         "epoch": num_epochs,
         "train_loss": train_losses[-1],

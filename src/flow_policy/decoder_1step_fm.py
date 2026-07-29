@@ -33,6 +33,7 @@ class Decoder1StepFMConfig:
     n_samples_per_action: jdc.Static[int] = 8
 
     normalize_observations: jdc.Static[bool] = True
+    normalize_actions: jdc.Static[bool] = True
 
     # MP1/MeanFlow sampling of interval endpoints.
     flow_ratio: float = 0.5
@@ -41,6 +42,9 @@ class Decoder1StepFMConfig:
     lognorm_sigma: float = 1.0
     adaptive_loss_gamma: float = 0.5
     adaptive_loss_c: float = 1e-3
+    guidance_scale: float = 2.0
+    dispersive_loss_weight: float = 0.5
+    dispersive_tau: float = 1.0
 
     feather_std: float = 0.0
 
@@ -52,6 +56,7 @@ class Decoder1StepFMState:
     config: Decoder1StepFMConfig
     params: MlpWeights
     obs_stats: math_utils.RunningStats
+    action_stats: math_utils.RunningStats
     opt: jdc.Static[optax.GradientTransformation]
     opt_state: optax.OptState
     prng: Array
@@ -76,6 +81,7 @@ class Decoder1StepFMState:
             config=config,
             params=meanflow_net,
             obs_stats=math_utils.RunningStats.init((obs_dim,)),
+            action_stats=math_utils.RunningStats.init((action_dim,)),
             opt=opt,
             opt_state=opt.init(meanflow_net),
             prng=prng1,
@@ -111,6 +117,18 @@ class Decoder1StepFMState:
             return (obs - self.obs_stats.mean) / (self.obs_stats.std + 1e-8)
         return obs
 
+    def _normalize_action(self, action: Array) -> Array:
+        if self.config.normalize_actions:
+            return (action - self.action_stats.mean) / (
+                self.action_stats.std + 1e-8
+            )
+        return action
+
+    def _unnormalize_action(self, action: Array) -> Array:
+        if self.config.normalize_actions:
+            return action * (self.action_stats.std + 1e-8) + self.action_stats.mean
+        return action
+
     def sample_action(
         self,
         obs: Array,
@@ -132,12 +150,13 @@ class Decoder1StepFMState:
 
         t = jnp.ones((*batch_dims, 1))
         r = jnp.zeros((*batch_dims, 1))
-        action = z - self.meanflow_forward(
+        action_norm = z - self.meanflow_forward(
             obs_norm,
             z,
             self.embed_timestep(t),
             self.embed_timestep(r),
         )
+        action = self._unnormalize_action(action_norm)
 
         if not deterministic:
             action = action + (
@@ -168,12 +187,13 @@ class Decoder1StepFMState:
         (*batch_dims, _) = obs_norm.shape
         t = jnp.ones((*batch_dims, 1))
         r = jnp.zeros((*batch_dims, 1))
-        action = z - self.meanflow_forward(
+        action_norm = z - self.meanflow_forward(
             obs_norm,
             z,
             self.embed_timestep(t),
             self.embed_timestep(r),
         )
+        action = self._unnormalize_action(action_norm)
 
         if not deterministic:
             action_dim = self.params[-1][0].shape[-1]
@@ -191,16 +211,15 @@ class Decoder1StepFMState:
         self,
         prng: Array,
         batch_size: int,
-        samples_dim: int,
     ) -> tuple[Array, Array]:
-        """Sample MeanFlow interval endpoints with MP1's max/min convention."""
+        """Sample one (t, r) pair per batch item, matching MeanPolicy."""
         prng_time, prng_flow = jax.random.split(prng)
 
         if self.config.time_dist == "uniform":
-            samples = jax.random.uniform(prng_time, (batch_size, samples_dim, 2))
+            samples = jax.random.uniform(prng_time, (batch_size, 2))
         elif self.config.time_dist == "lognorm":
             normal_samples = (
-                jax.random.normal(prng_time, (batch_size, samples_dim, 2))
+                jax.random.normal(prng_time, (batch_size, 2))
                 * self.config.lognorm_sigma
                 + self.config.lognorm_mu
             )
@@ -212,11 +231,11 @@ class Decoder1StepFMState:
         r = jnp.minimum(samples[..., 0], samples[..., 1])
 
         flow_mask = (
-            jax.random.uniform(prng_flow, (batch_size, samples_dim))
+            jax.random.uniform(prng_flow, (batch_size,))
             < self.config.flow_ratio
         )
         r = jnp.where(flow_mask, t, r)
-        return t[..., None], r[..., None]
+        return t[:, None], r[:, None]
 
     def adaptive_l2_loss(self, error: Array) -> Array:
         """MP1 adaptive L2 loss, reduced over action dimensions."""
@@ -226,6 +245,13 @@ class Decoder1StepFMState:
             1.0 / jnp.power(delta_sq + self.config.adaptive_loss_c, p)
         )
         return weight * delta_sq
+
+    def dispersive_loss(self, prediction: Array) -> Array:
+        """Encourage predictions within the batch to remain dispersed."""
+        differences = prediction[:, None, :] - prediction[None, :, :]
+        distances = jnp.sum(differences**2, axis=-1)
+        distances = distances / jnp.maximum(jnp.max(distances), 1e-8)
+        return jnp.log(jnp.mean(jnp.exp(-distances / self.config.dispersive_tau)))
 
     def compute_meanflow_loss(
         self,
@@ -241,41 +267,39 @@ class Decoder1StepFMState:
         The learned u approximates the interval-averaged velocity from r to t,
         so inference recovers x_0 by x_1 - u(x_1, 1, 0).
         """
-        (*batch_dims, action_dim) = action.shape
-        samples_dim = self.config.n_samples_per_action
+        assert action.ndim == eps.ndim == 2
+        assert eps.shape == action.shape
+        assert t.shape == r.shape == (action.shape[0], 1)
 
-        assert eps.shape == (*batch_dims, samples_dim, action_dim)
-        assert t.shape == (*batch_dims, samples_dim, 1)
-        assert r.shape == (*batch_dims, samples_dim, 1)
-
-        x_t = t * eps + (1.0 - t) * action[..., None, :]
-        v = eps - action[..., None, :]
-
-        obs_dim = obs_norm.shape[-1]
-        sample_shape = (*batch_dims, samples_dim)
-        obs_sample = jnp.broadcast_to(
-            obs_norm[..., None, :],
-            (*sample_shape, obs_dim),
-        )
+        action_norm = self._normalize_action(action)
+        x_t = t * eps + (1.0 - t) * action_norm
+        v = eps - action_norm
 
         def model_fn(z_arg: Array, t_arg: Array, r_arg: Array) -> Array:
             return self.meanflow_forward(
-                obs_sample,
+                obs_norm,
                 z_arg,
                 self.embed_timestep(t_arg),
                 self.embed_timestep(r_arg),
             )
 
+        u_t = jax.lax.stop_gradient(
+            model_fn(x_t, t, t)
+        )
+        v_hat = (
+            self.config.guidance_scale * v
+            + (1.0 - self.config.guidance_scale) * u_t
+        )
         u, dudt = jax.jvp(
             model_fn,
             (x_t, t, r),
-            (v, jnp.ones_like(t), jnp.zeros_like(r)),
+            (v_hat, jnp.ones_like(t), jnp.zeros_like(r)),
         )
-        u_target = jax.lax.stop_gradient(v - (t - r) * dudt)
-        loss = self.adaptive_l2_loss(u - u_target)
-
-        assert loss.shape == (*batch_dims, samples_dim)
-        return loss
+        u_target = jax.lax.stop_gradient(v_hat - (t - r) * dudt)
+        meanflow_loss = jnp.mean(self.adaptive_l2_loss(u - u_target))
+        dis_loss = self.dispersive_loss(u)
+        loss = meanflow_loss + self.config.dispersive_loss_weight * dis_loss
+        return loss, meanflow_loss, dis_loss
 
     def train_step(
         self,
@@ -288,24 +312,22 @@ class Decoder1StepFMState:
         obs_norm = self._normalize_obs(batch_obs)
 
         prng_eps, prng_tr, self_prng = jax.random.split(self.prng, 3)
-        eps = jax.random.normal(
-            prng_eps,
-            (batch_size, self.config.n_samples_per_action, action_dim),
-        )
-        t, r = self.sample_t_r(prng_tr, batch_size, self.config.n_samples_per_action)
+        eps = jax.random.normal(prng_eps, (batch_size, action_dim))
+        t, r = self.sample_t_r(prng_tr, batch_size)
 
         def loss_fn(params):
             state_with_params = jdc.replace(self, params=params)
-            meanflow_loss = state_with_params.compute_meanflow_loss(
+            loss, meanflow_loss, dis_loss = state_with_params.compute_meanflow_loss(
                 obs_norm,
                 batch_actions,
                 eps,
                 t,
                 r,
             )
-            loss = jnp.mean(meanflow_loss)
             metrics = {
                 "loss": loss,
+                "meanflow_loss": meanflow_loss,
+                "dis_loss": dis_loss,
                 "t_mean": jnp.mean(t),
                 "r_mean": jnp.mean(r),
             }
