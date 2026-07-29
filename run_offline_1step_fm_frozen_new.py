@@ -88,6 +88,7 @@ class FrozenOfflineConfig:
     flow_steps: int = 1
     latent_inverse_steps: int = 20
     n_fm_samples_per_action: int = 1
+    use_lbifm: bool = False
 
     # IQL encoder. The policy and value layouts are fixed by EncoderState.init.
     encoder_iql_steps: int = 500_000
@@ -966,6 +967,7 @@ def main(config: FrozenOfflineConfig) -> None:
             n_samples_per_action=config.n_fm_samples_per_action,
             normalize_observations=True,
             normalize_actions=True,
+            use_lbifm=config.use_lbifm,
             feather_std=0.0,
         )
         decoder = Decoder1StepFMState.init(
@@ -1026,6 +1028,7 @@ def main(config: FrozenOfflineConfig) -> None:
         previous_latents: np.ndarray | None = None
         for epoch in trange(config.decoder_max_epochs, desc="Decoder epochs"):
             losses = []
+            bifm_losses = []
             permutation = rng.permutation(train_indices)
             for start in range(0, len(permutation), config.decoder_batch_size):
                 batch = permutation[start : start + config.decoder_batch_size]
@@ -1034,6 +1037,7 @@ def main(config: FrozenOfflineConfig) -> None:
                     jnp.asarray(buffer.actions[batch]),
                 )
                 losses.append(float(metrics["loss"]))
+                bifm_losses.append(float(metrics["bifm_loss"]))
                 global_step += 1
             validation_loss, key = decoder_validation_loss(
                 decoder,
@@ -1060,6 +1064,7 @@ def main(config: FrozenOfflineConfig) -> None:
                 "global_step": global_step,
                 "decoder/epoch": epoch + 1,
                 "decoder/train_loss": float(np.mean(losses)),
+                "decoder/train_bifm_loss": float(np.mean(bifm_losses)),
                 "decoder/validation_loss": validation_loss,
                 **comparison,
             }

@@ -248,6 +248,7 @@ class Decoder1StepFMConfig:
     guidance_scale: float = 2.0
     dispersive_loss_weight: float = 0.5
     dispersive_tau: float = 1.0
+    use_lbifm: jdc.Static[bool] = False
     feather_std: float = 0.0
 
 
@@ -505,12 +506,19 @@ class Decoder1StepFMState:
         r = jnp.where(mask, t, r)
         return t[:, None], r[:, None]
 
-    def adaptive_l2_loss(self, error: Array) -> Array:
+    def adaptive_l2_loss(
+        self, error: Array, sample_mask: Array | None = None
+    ) -> Array:
         delta_sq = jnp.mean(error**2, axis=-1)
         p = 1.0 - self.config.adaptive_loss_gamma
         weight = jax.lax.stop_gradient(
             1.0 / jnp.power(delta_sq + self.config.adaptive_loss_c, p)
         )
+        if sample_mask is not None:
+            sample_mask = sample_mask.astype(delta_sq.dtype)
+            return jnp.sum(sample_mask * weight * delta_sq) / jnp.maximum(
+                jnp.sum(sample_mask), 1.0
+            )
         return jnp.mean(weight * delta_sq)
 
     def dispersive_loss(self, feature: Array) -> Array:
@@ -530,9 +538,24 @@ class Decoder1StepFMState:
         r: Array,
         params: Any | None = None,
     ) -> tuple[Array, Array, Array]:
+        loss, meanflow_loss, dis_loss, _ = self._compute_training_losses(
+            obs_norm, action, eps, t, r, params=params
+        )
+        return loss, meanflow_loss, dis_loss
+
+    def _compute_training_losses(
+        self,
+        obs_norm: Array,
+        action: Array,
+        eps: Array,
+        t: Array,
+        r: Array,
+        params: Any | None = None,
+    ) -> tuple[Array, Array, Array, Array]:
         params = self.params if params is None else params
         action_norm = self._normalize_action(action)
         x_t = t * eps + (1.0 - t) * action_norm
+        x_r = r * eps + (1.0 - r) * action_norm
         v = eps - action_norm
 
         def model_fn(
@@ -557,8 +580,19 @@ class Decoder1StepFMState:
             (self.dispersive_loss(feature) for feature in features),
             start=jnp.zeros(()),
         )
-        loss = meanflow_loss + self.config.dispersive_loss_weight * dis_loss
-        return loss, meanflow_loss, dis_loss
+        bifm_loss = jnp.zeros(())
+        if self.config.use_lbifm:
+            backward_u, _ = model_fn(x_r, r, t)
+            nonzero_interval = jnp.squeeze(t != r, axis=-1)
+            bifm_loss = self.adaptive_l2_loss(
+                u + backward_u, sample_mask=nonzero_interval
+            )
+        loss = (
+            meanflow_loss
+            + self.config.dispersive_loss_weight * dis_loss
+            + bifm_loss
+        )
+        return loss, meanflow_loss, dis_loss, bifm_loss
 
     def train_step(
         self, batch_obs: Array, batch_actions: Array
@@ -570,13 +604,16 @@ class Decoder1StepFMState:
         t, r = self.sample_t_r(prng_tr, batch_size)
 
         def loss_fn(params: Any):
-            loss, meanflow_loss, dis_loss = self.compute_meanflow_loss(
-                obs_norm, batch_actions, eps, t, r, params=params
+            loss, meanflow_loss, dis_loss, bifm_loss = (
+                self._compute_training_losses(
+                    obs_norm, batch_actions, eps, t, r, params=params
+                )
             )
             return loss, {
                 "loss": loss,
                 "meanflow_loss": meanflow_loss,
                 "dis_loss": dis_loss,
+                "bifm_loss": bifm_loss,
                 "t_mean": jnp.mean(t),
                 "r_mean": jnp.mean(r),
             }
