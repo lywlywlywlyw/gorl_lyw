@@ -248,6 +248,7 @@ class Decoder1StepFMConfig:
     guidance_scale: float = 2.0
     dispersive_loss_weight: float = 0.5
     dispersive_tau: float = 1.0
+    dispersive_chunk_size: jdc.Static[int] = 512
     use_lbifm: jdc.Static[bool] = False
     feather_std: float = 0.0
 
@@ -522,12 +523,55 @@ class Decoder1StepFMState:
         return jnp.mean(weight * delta_sq)
 
     def dispersive_loss(self, feature: Array) -> Array:
-        difference = feature[:, None, :] - feature[None, :, :]
-        distance = jnp.sum(difference**2, axis=-1)
-        distance = distance / jnp.maximum(jnp.max(distance), 1e-8)
-        return jnp.log(
-            jnp.mean(jnp.exp(-distance / self.config.dispersive_tau))
+        """Compute the all-pairs loss without materializing a B x B x D array."""
+        batch_size = feature.shape[0]
+        chunk_size = min(self.config.dispersive_chunk_size, batch_size)
+        padded_size = (
+            (batch_size + chunk_size - 1) // chunk_size
+        ) * chunk_size
+        feature = jnp.pad(feature, ((0, padded_size - batch_size), (0, 0)))
+        squared_norm = jnp.sum(feature**2, axis=-1)
+        valid_columns = jnp.arange(padded_size) < batch_size
+        num_chunks = padded_size // chunk_size
+
+        def block_distance(block_index: int) -> tuple[Array, Array]:
+            start = block_index * chunk_size
+            block = jax.lax.dynamic_slice_in_dim(feature, start, chunk_size)
+            block_norm = jax.lax.dynamic_slice_in_dim(
+                squared_norm, start, chunk_size
+            )
+            distance = (
+                block_norm[:, None]
+                + squared_norm[None, :]
+                - 2.0 * block @ feature.T
+            )
+            # Roundoff in the norm identity can produce tiny negative values.
+            distance = jnp.maximum(distance, 0.0)
+            valid_rows = (start + jnp.arange(chunk_size)) < batch_size
+            valid = valid_rows[:, None] & valid_columns[None, :]
+            return distance, valid
+
+        def update_max(block_index: int, current_max: Array) -> Array:
+            distance, valid = block_distance(block_index)
+            return jnp.maximum(
+                current_max,
+                jnp.max(jnp.where(valid, distance, 0.0)),
+            )
+
+        max_distance = jax.lax.fori_loop(
+            0, num_chunks, update_max, jnp.zeros((), dtype=feature.dtype)
         )
+        scale = jnp.maximum(max_distance, 1e-8) * self.config.dispersive_tau
+
+        def update_sum(block_index: int, current_sum: Array) -> Array:
+            distance, valid = block_distance(block_index)
+            values = jnp.exp(-distance / scale)
+            return current_sum + jnp.sum(jnp.where(valid, values, 0.0))
+
+        total = jax.lax.fori_loop(
+            0, num_chunks, update_sum, jnp.zeros((), dtype=feature.dtype)
+        )
+        return jnp.log(total / (batch_size * batch_size))
 
     def compute_meanflow_loss(
         self,
@@ -594,6 +638,7 @@ class Decoder1StepFMState:
         )
         return loss, meanflow_loss, dis_loss, bifm_loss
 
+    @jax.jit
     def train_step(
         self, batch_obs: Array, batch_actions: Array
     ) -> tuple["Decoder1StepFMState", dict[str, Array]]:

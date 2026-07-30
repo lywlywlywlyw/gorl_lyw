@@ -78,13 +78,14 @@ class FrozenOfflineConfig:
     decoder_down_dims: tuple[int, ...] = (256, 512, 1024)
     decoder_kernel_size: int = 5
     decoder_n_groups: int = 8
-    decoder_batch_size: int = 128
+    decoder_batch_size: int = 8192
     decoder_max_epochs: int = 200
     decoder_min_epochs: int = 20
     decoder_patience: int = 20
     decoder_validation_fraction: float = 0.05
     decoder_min_delta: float = 1e-4
     decoder_eval_batches: int = 32
+    decoder_dispersive_chunk_size: int = 512
     flow_steps: int = 1
     latent_inverse_steps: int = 20
     n_fm_samples_per_action: int = 1
@@ -464,6 +465,7 @@ def validate_config(config: FrozenOfflineConfig) -> None:
     if min(
         config.batch_size,
         config.decoder_batch_size,
+        config.decoder_dispersive_chunk_size,
         config.encoder_iql_steps,
         config.latent_inverse_steps,
         config.comparison_samples,
@@ -965,6 +967,7 @@ def main(config: FrozenOfflineConfig) -> None:
             batch_size=config.decoder_batch_size,
             num_epochs=config.decoder_max_epochs,
             n_samples_per_action=config.n_fm_samples_per_action,
+            dispersive_chunk_size=config.decoder_dispersive_chunk_size,
             normalize_observations=True,
             normalize_actions=True,
             use_lbifm=config.use_lbifm,
