@@ -78,7 +78,7 @@ class FrozenOfflineConfig:
     decoder_down_dims: tuple[int, ...] = (256, 512, 1024)
     decoder_kernel_size: int = 5
     decoder_n_groups: int = 8
-    decoder_batch_size: int = 8192
+    decoder_batch_size: int = 4096
     decoder_max_epochs: int = 200
     decoder_min_epochs: int = 20
     decoder_patience: int = 20
@@ -1032,6 +1032,8 @@ def main(config: FrozenOfflineConfig) -> None:
         for epoch in trange(config.decoder_max_epochs, desc="Decoder epochs"):
             losses = []
             bifm_losses = []
+            meanflow_loss = []
+            dis_loss = []
             permutation = rng.permutation(train_indices)
             for start in range(0, len(permutation), config.decoder_batch_size):
                 batch = permutation[start : start + config.decoder_batch_size]
@@ -1041,6 +1043,8 @@ def main(config: FrozenOfflineConfig) -> None:
                 )
                 losses.append(float(metrics["loss"]))
                 bifm_losses.append(float(metrics["bifm_loss"]))
+                meanflow_loss.append(float(metrics["meanflow_loss"]))
+                dis_loss.append(float(metrics["dis_loss"]))
                 global_step += 1
             validation_loss, key = decoder_validation_loss(
                 decoder,
@@ -1068,6 +1072,8 @@ def main(config: FrozenOfflineConfig) -> None:
                 "decoder/epoch": epoch + 1,
                 "decoder/train_loss": float(np.mean(losses)),
                 "decoder/train_bifm_loss": float(np.mean(bifm_losses)),
+                "decoder/train_meanflow_loss": float(np.mean(meanflow_loss)),
+                "decoder/train_dis_loss": float(np.mean(dis_loss)),
                 "decoder/validation_loss": validation_loss,
                 **comparison,
             }
