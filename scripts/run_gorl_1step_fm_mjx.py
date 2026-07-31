@@ -382,7 +382,7 @@ def load_states(
             num_epochs=config.fm_num_epochs,
             n_samples_per_action=1,
             normalize_observations=True,
-            normalize_actions=True,
+            normalize_actions=False,
             feather_std=0.0,
         )
         decoder = Decoder1StepFMState.init(

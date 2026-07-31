@@ -237,7 +237,7 @@ class Decoder1StepFMConfig:
     n_samples_per_action: jdc.Static[int] = 1
 
     normalize_observations: jdc.Static[bool] = True
-    normalize_actions: jdc.Static[bool] = True
+    normalize_actions: jdc.Static[bool] = False
     normalization_mode: jdc.Static[str] = "limits"
     flow_ratio: float = 0.5
     time_dist: jdc.Static[str] = "lognorm"

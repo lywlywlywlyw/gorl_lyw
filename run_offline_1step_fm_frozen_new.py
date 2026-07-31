@@ -546,12 +546,11 @@ def inverse_fm_batch(
 ) -> Array:
     del num_steps  # One-step MeanFlow has an analytic action-to-noise inverse.
     obs_norm = decoder._normalize_obs(observations)
-    action_norm = decoder._normalize_action(actions)
     t = jnp.zeros((actions.shape[0], 1))
     r = jnp.ones((actions.shape[0], 1))
-    return action_norm + decoder.meanflow_forward(
+    return actions + decoder.meanflow_forward(
         obs_norm,
-        action_norm,
+        actions,
         t,
         r,
     )
@@ -884,6 +883,7 @@ def save_encoder_checkpoint(
     decoder: Decoder1StepFMState,
     encoder_params: encoder_ppo.ActorCriticParams,
     encoder_obs_stats: Any,
+
 ) -> None:
     checkpoint = {
         "ppo_z_params": encoder_params,
@@ -969,7 +969,7 @@ def main(config: FrozenOfflineConfig) -> None:
             n_samples_per_action=config.n_fm_samples_per_action,
             dispersive_chunk_size=config.decoder_dispersive_chunk_size,
             normalize_observations=True,
-            normalize_actions=True,
+            normalize_actions=False,
             use_lbifm=config.use_lbifm,
             feather_std=0.0,
         )
@@ -992,17 +992,8 @@ def main(config: FrozenOfflineConfig) -> None:
         value_params = networks.mlp_init(
             value_key, (obs_dim, 256, 256, 256, 256, 256, 1)
         )
-        encoder_obs_stats = math_utils.RunningStats.init((obs_dim,)).update(
-            jnp.asarray(buffer.observations)
-        )
-        obs_mean = np.asarray(encoder_obs_stats.mean)
-        obs_std = np.asarray(encoder_obs_stats.std)
-        normalized_observations = (
-            buffer.observations - obs_mean
-        ) / (obs_std + 1e-8)
-        normalized_next_observations = (
-            buffer.next_observations - obs_mean
-        ) / (obs_std + 1e-8)
+        normalized_observations = decoder._normalize_obs(buffer.observations)
+        normalized_next_observations = decoder._normalize_obs(buffer.next_observations)
 
         q_dims = (
             obs_dim + action_dim,
@@ -1232,7 +1223,7 @@ def main(config: FrozenOfflineConfig) -> None:
                     online_config,
                     decoder,
                     periodic_encoder_params,
-                    encoder_obs_stats,
+                    decoder.obs_stats,
                     q1_params,
                     q2_params,
                     value_params,
@@ -1243,7 +1234,7 @@ def main(config: FrozenOfflineConfig) -> None:
                     online_config,
                     decoder,
                     periodic_encoder_params,
-                    encoder_obs_stats,
+                    decoder.obs_stats,
                 )
                 print(
                     "Saved periodic checkpoints at IQL step "
@@ -1262,7 +1253,7 @@ def main(config: FrozenOfflineConfig) -> None:
             online_config,
             decoder,
             trained_encoder_params,
-            encoder_obs_stats,
+            decoder.obs_stats,
             q1_params,
             q2_params,
             value_params,
@@ -1273,7 +1264,7 @@ def main(config: FrozenOfflineConfig) -> None:
             online_config,
             decoder,
             trained_encoder_params,
-            encoder_obs_stats,
+            decoder.obs_stats,
         )
         print(f"Saved online-compatible decoder checkpoint: {decoder_path}")
         print(f"Saved online-compatible encoder checkpoint: {encoder_path}")
