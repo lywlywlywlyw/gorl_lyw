@@ -1,4 +1,10 @@
-"""One-step MeanFlow decoder matching MP1's conditional 1D U-Net."""
+"""One-step MeanFlow decoder implemented as a conditional residual MLP.
+
+The decoder operates on a single action vector rather than an action horizon.
+Consequently, an MLP is a better inductive bias than the 1D U-Net used by the
+sequence decoder: it avoids repeatedly down/up-sampling a horizon of length one
+while retaining strong state/time conditioning through FiLM residual blocks.
+"""
 
 from __future__ import annotations
 
@@ -11,20 +17,10 @@ import optax
 from jax import Array
 from jax import numpy as jnp
 
-def _match_horizon(x: Array, target: int) -> Array:
-    """Center-crop/pad NWC features to a skip connection's horizon."""
-    current = x.shape[1]
-    if current > target:
-        start = (current - target) // 2
-        return x[:, start : start + target, :]
-    if current < target:
-        total = target - current
-        return jnp.pad(x, ((0, 0), (total // 2, total - total // 2), (0, 0)))
-    return x
 
 
 class SinusoidalPosEmb(nn.Module):
-    """Exact sinusoidal basis used by MP1."""
+    """Sinusoidal embedding for continuous MeanFlow times."""
 
     dim: int
 
@@ -48,64 +44,49 @@ class TimeEncoder(nn.Module):
         return nn.Dense(self.dim)(x)
 
 
-class Conv1dBlock(nn.Module):
-    out_channels: int
-    kernel_size: int
-    n_groups: int
+class ConditionalResidualMLPBlock(nn.Module):
+    """Pre-normalized residual MLP block with FiLM conditioning."""
 
-    @nn.compact
-    def __call__(self, x: Array) -> Array:
-        x = nn.Conv(
-            self.out_channels,
-            kernel_size=(self.kernel_size,),
-            padding="SAME",
-        )(x)
-        x = nn.GroupNorm(
-            num_groups=self.n_groups,
-            epsilon=1e-5,
-        )(x)
-        return jax.nn.mish(x)
-
-
-class ConditionalResidualBlock1D(nn.Module):
-    out_channels: int
-    cond_dim: int
-    kernel_size: int
-    n_groups: int
+    hidden_dim: int
+    expansion: int
 
     @nn.compact
     def __call__(self, x: Array, cond: Array) -> Array:
-        residual = x
-        out = Conv1dBlock(
-            self.out_channels, self.kernel_size, self.n_groups
-        )(x)
-
-        film = nn.Dense(self.out_channels * 2)(jax.nn.mish(cond))
+        out = nn.LayerNorm(epsilon=1e-5, name="norm")(x)
+        film = nn.Dense(
+            self.hidden_dim * 2,
+            kernel_init=nn.initializers.zeros_init(),
+            bias_init=nn.initializers.zeros_init(),
+            name="film",
+        )(jax.nn.silu(cond))
         scale, bias = jnp.split(film, 2, axis=-1)
-        out = scale[:, None, :] * out + bias[:, None, :]
-
-        out = Conv1dBlock(
-            self.out_channels, self.kernel_size, self.n_groups
+        out = out * (1.0 + scale) + bias
+        out = nn.Dense(self.hidden_dim * self.expansion, name="expand")(out)
+        out = jax.nn.silu(out)
+        out = nn.Dense(
+            self.hidden_dim,
+            kernel_init=nn.initializers.zeros_init(),
+            bias_init=nn.initializers.zeros_init(),
+            name="project",
         )(out)
-        if residual.shape[-1] != self.out_channels:
-            residual = nn.Conv(
-                self.out_channels, kernel_size=(1,), padding="SAME"
-            )(residual)
-        return out + residual
+        return x + out
 
 
-class ConditionalUnet1D(nn.Module):
-    """JAX port of MP1 conditional_unet1d_meanflow_dis.py (FiLM path)."""
+class ConditionalResidualMLP(nn.Module):
+    """Conditional vector field for one-step MeanFlow.
+
+    Observation and both MeanFlow times are encoded into one condition vector.
+    Each residual block receives that condition through an independent FiLM
+    projection. Intermediate block activations are returned for the existing
+    dispersive regularizer.
+    """
 
     input_dim: int
     global_cond_dim: int
-    diffusion_step_embed_dim: int
-    down_dims: tuple[int, ...]
-    kernel_size: int
-    n_groups: int
-    use_down_condition: bool
-    use_mid_condition: bool
-    use_up_condition: bool
+    time_embed_dim: int
+    hidden_dim: int
+    num_res_blocks: int
+    mlp_expansion: int
 
     @nn.compact
     def __call__(
@@ -115,115 +96,50 @@ class ConditionalUnet1D(nn.Module):
         r: Array,
         global_cond: Array,
     ) -> tuple[Array, tuple[Array, ...]]:
-        original_horizon = sample.shape[1]
         t_embed = TimeEncoder(
-            self.diffusion_step_embed_dim, name="diffusion_step_encoder"
+            self.time_embed_dim, name="time_encoder"
         )(timestep)
         r_embed = TimeEncoder(
-            self.diffusion_step_embed_dim, name="diffusion_step_encoder_rs"
+            self.time_embed_dim, name="start_time_encoder"
         )(r)
-        global_feature = jnp.concatenate(
-            [t_embed + r_embed, global_cond], axis=-1
-        )
-        cond_dim = self.diffusion_step_embed_dim + self.global_cond_dim
+        cond = jnp.concatenate([global_cond, t_embed, r_embed], axis=-1)
+        cond = nn.Dense(self.hidden_dim, name="condition_input")(cond)
+        cond = jax.nn.silu(cond)
+        cond = nn.Dense(self.hidden_dim, name="condition_output")(cond)
 
-        # Present in MP1's decoder parameterization, although its result is not
-        # consumed by meanpolicy_dis.py.
-        variance = sample
-        for index in range(3):
-            variance = nn.Dense(512, name=f"var_est_{index}")(variance)
-            variance = jax.nn.silu(variance)
-        _ = nn.Dense(1, name="var_est_3")(variance)
-
-        all_dims = (self.input_dim,) + self.down_dims
-        in_out = tuple(zip(all_dims[:-1], all_dims[1:]))
-        x = sample
-        skips: list[Array] = []
-        down_latents: list[Array] = []
-
-        for index, (_, dim_out) in enumerate(in_out):
-            cond = global_feature if self.use_down_condition else jnp.zeros_like(
-                global_feature
-            )
-            x = ConditionalResidualBlock1D(
-                dim_out, cond_dim, self.kernel_size, self.n_groups,
-                name=f"down_{index}_resnet_0",
+        x = nn.Dense(self.hidden_dim, name="sample_input")(sample)
+        features: list[Array] = []
+        for index in range(self.num_res_blocks):
+            x = ConditionalResidualMLPBlock(
+                hidden_dim=self.hidden_dim,
+                expansion=self.mlp_expansion,
+                name=f"residual_block_{index}",
             )(x, cond)
-            x = ConditionalResidualBlock1D(
-                dim_out, cond_dim, self.kernel_size, self.n_groups,
-                name=f"down_{index}_resnet_1",
-            )(x, cond)
-            skips.append(x)
-            down_latents.append(x.reshape((x.shape[0], -1)))
-            if index < len(in_out) - 1:
-                x = nn.Conv(
-                    dim_out,
-                    kernel_size=(3,),
-                    strides=(2,),
-                    padding="SAME",
-                    name=f"down_{index}_sample",
-                )(x)
+            # Two representative depths are sufficient for the O(B^2)
+            # dispersive regularizer and avoid scaling its cost with depth.
+            if index in (self.num_res_blocks // 2 - 1, self.num_res_blocks - 1):
+                features.append(x)
 
-        mid_dim = all_dims[-1]
-        mid_cond = global_feature if self.use_mid_condition else jnp.zeros_like(
-            global_feature
-        )
-        for index in range(2):
-            x = ConditionalResidualBlock1D(
-                mid_dim, cond_dim, self.kernel_size, self.n_groups,
-                name=f"mid_{index}",
-            )(x, mid_cond)
-
-        reversed_pairs = tuple(reversed(in_out[1:]))
-        for index, (dim_in, _) in enumerate(reversed_pairs):
-            skip = skips.pop()
-            x = _match_horizon(x, skip.shape[1])
-            x = jnp.concatenate([x, skip], axis=-1)
-            up_cond = (
-                global_feature
-                if self.use_up_condition
-                else jnp.zeros_like(global_feature)
-            )
-            x = ConditionalResidualBlock1D(
-                dim_in, cond_dim, self.kernel_size, self.n_groups,
-                name=f"up_{index}_resnet_0",
-            )(x, up_cond)
-            x = ConditionalResidualBlock1D(
-                dim_in, cond_dim, self.kernel_size, self.n_groups,
-                name=f"up_{index}_resnet_1",
-            )(x, up_cond)
-            x = nn.ConvTranspose(
-                dim_in,
-                kernel_size=(4,),
-                strides=(2,),
-                padding="SAME",
-                name=f"up_{index}_sample",
-            )(x)
-
-        x = _match_horizon(x, original_horizon)
-        x = Conv1dBlock(
-            self.down_dims[0], self.kernel_size, self.n_groups,
-            name="final_block",
-        )(x)
-        velocity = nn.Conv(
+        x = nn.LayerNorm(epsilon=1e-5, name="output_norm")(x)
+        x = jax.nn.silu(x)
+        velocity = nn.Dense(
             self.input_dim,
-            kernel_size=(1,),
-            padding="SAME",
-            name="final_conv",
+            kernel_init=nn.initializers.zeros_init(),
+            bias_init=nn.initializers.zeros_init(),
+            name="velocity_output",
         )(x)
-        return velocity, tuple(down_latents[:-1])
+        return velocity, tuple(features)
+
+
 
 @jdc.pytree_dataclass
 class Decoder1StepFMConfig:
     flow_steps: jdc.Static[int] = 1
-    timestep_embed_dim: jdc.Static[int] = 256
-    down_dims: jdc.Static[tuple[int, ...]] = (256, 512, 1024)
-    kernel_size: jdc.Static[int] = 5
-    n_groups: jdc.Static[int] = 8
+    timestep_embed_dim: jdc.Static[int] = 128
+    hidden_dim: jdc.Static[int] = 512
+    num_res_blocks: jdc.Static[int] = 4
+    mlp_expansion: jdc.Static[int] = 2
     condition_type: jdc.Static[str] = "film"
-    use_down_condition: jdc.Static[bool] = True
-    use_mid_condition: jdc.Static[bool] = True
-    use_up_condition: jdc.Static[bool] = True
 
     policy_output_scale: float = 1.0
     learning_rate: float = 1e-4
@@ -246,7 +162,8 @@ class Decoder1StepFMConfig:
     adaptive_loss_gamma: float = 0.5
     adaptive_loss_c: float = 1e-3
     guidance_scale: float = 2.0
-    dispersive_loss_weight: float = 0.5
+    dispersive_loss_weight: float = 0
+    bifm_loss_weight: float = 0.05
     dispersive_tau: float = 1.0
     dispersive_chunk_size: jdc.Static[int] = 512
     use_lbifm: jdc.Static[bool] = False
@@ -322,16 +239,18 @@ class Decoder1StepFMState:
         config: Decoder1StepFMConfig,
     ) -> "Decoder1StepFMState":
         if config.condition_type != "film":
-            raise ValueError("The MP1-compatible JAX decoder supports FiLM.")
-        if len(config.down_dims) < 2:
-            raise ValueError("ConditionalUnet1D requires at least two down_dims.")
+            raise ValueError("ConditionalResidualMLP supports FiLM conditioning.")
         if config.timestep_embed_dim < 4 or config.timestep_embed_dim % 2:
             raise ValueError("timestep_embed_dim must be even and at least 4.")
-        if any(dim % config.n_groups for dim in config.down_dims):
-            raise ValueError("Every down_dim must be divisible by n_groups.")
+        if config.hidden_dim < 1 or config.num_res_blocks < 1:
+            raise ValueError("hidden_dim and num_res_blocks must be positive.")
+        if config.num_res_blocks % 2:
+            raise ValueError("num_res_blocks must be even.")
+        if config.mlp_expansion < 1:
+            raise ValueError("mlp_expansion must be positive.")
         model = Decoder1StepFMState._make_model(config, obs_dim, action_dim)
         prng_params, prng_state = jax.random.split(prng)
-        dummy_sample = jnp.zeros((1, 1, action_dim))
+        dummy_sample = jnp.zeros((1, action_dim))
         dummy_time = jnp.zeros((1,))
         dummy_obs = jnp.zeros((1, obs_dim))
         params = model.init(
@@ -370,17 +289,14 @@ class Decoder1StepFMState:
     @staticmethod
     def _make_model(
         config: Decoder1StepFMConfig, obs_dim: int, action_dim: int
-    ) -> ConditionalUnet1D:
-        return ConditionalUnet1D(
+    ) -> ConditionalResidualMLP:
+        return ConditionalResidualMLP(
             input_dim=action_dim,
             global_cond_dim=obs_dim,
-            diffusion_step_embed_dim=config.timestep_embed_dim,
-            down_dims=config.down_dims,
-            kernel_size=config.kernel_size,
-            n_groups=config.n_groups,
-            use_down_condition=config.use_down_condition,
-            use_mid_condition=config.use_mid_condition,
-            use_up_condition=config.use_up_condition,
+            time_embed_dim=config.timestep_embed_dim,
+            hidden_dim=config.hidden_dim,
+            num_res_blocks=config.num_res_blocks,
+            mlp_expansion=config.mlp_expansion,
         )
 
     def _forward(
@@ -394,12 +310,12 @@ class Decoder1StepFMState:
         model = self._make_model(self.config, self.obs_dim, self.action_dim)
         velocity, features = model.apply(
             {"params": params},
-            x_t[:, None, :],
+            x_t,
             t[:, 0],
             r[:, 0],
             obs_norm,
         )
-        return velocity[:, 0, :] * self.config.policy_output_scale, features
+        return velocity * self.config.policy_output_scale, features
 
     def meanflow_forward(
         self, obs_norm: Array, x_t: Array, t: Array, r: Array
@@ -634,7 +550,7 @@ class Decoder1StepFMState:
         loss = (
             meanflow_loss
             + self.config.dispersive_loss_weight * dis_loss
-            + 2*bifm_loss
+            + self.config.bifm_loss_weight * bifm_loss
         )
         return loss, meanflow_loss, dis_loss, bifm_loss
 

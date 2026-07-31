@@ -47,7 +47,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from d4rl_envs.mjx_envs import make_d4rl_env, normalize_task
 from flow_policy import encoder_ppo, math_utils, networks
-from flow_policy.decoder_1step_fm import Decoder1StepFMConfig, Decoder1StepFMState
+from flow_policy.decoder_1step_fm_residualMLP import (
+    Decoder1StepFMConfig,
+    Decoder1StepFMState,
+)
 
 
 PyTree = Any
@@ -74,10 +77,10 @@ class FrozenOfflineConfig:
 
     # Decoder: train once to convergence, then freeze permanently.
     decoder_learning_rate: float = 1e-4
-    decoder_timestep_embed_dim: int = 256
-    decoder_down_dims: tuple[int, ...] = (256, 512, 1024)
-    decoder_kernel_size: int = 5
-    decoder_n_groups: int = 8
+    decoder_timestep_embed_dim: int = 128
+    decoder_hidden_dim: int = 512
+    decoder_num_res_blocks: int = 4
+    decoder_mlp_expansion: int = 2
     decoder_batch_size: int = 8192
     decoder_max_epochs: int = 200
     decoder_min_epochs: int = 20
@@ -955,13 +958,10 @@ def main(config: FrozenOfflineConfig) -> None:
         decoder_config = Decoder1StepFMConfig(
             flow_steps=config.flow_steps,
             timestep_embed_dim=config.decoder_timestep_embed_dim,
-            down_dims=config.decoder_down_dims,
-            kernel_size=config.decoder_kernel_size,
-            n_groups=config.decoder_n_groups,
+            hidden_dim=config.decoder_hidden_dim,
+            num_res_blocks=config.decoder_num_res_blocks,
+            mlp_expansion=config.decoder_mlp_expansion,
             condition_type="film",
-            use_down_condition=True,
-            use_mid_condition=True,
-            use_up_condition=True,
             policy_output_scale=1.0,
             learning_rate=config.decoder_learning_rate,
             batch_size=config.decoder_batch_size,

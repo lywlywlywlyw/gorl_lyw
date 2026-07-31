@@ -13,7 +13,10 @@ from tqdm import tqdm
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-from flow_policy.decoder_1step_fm import Decoder1StepFMConfig, Decoder1StepFMState
+from flow_policy.decoder_1step_fm_residualMLP import (
+    Decoder1StepFMConfig,
+    Decoder1StepFMState,
+)
 
 
 def train_fm(
@@ -31,10 +34,10 @@ def train_fm(
     high_quality_percentile: float = 0.5,
     output_dir: str = "fm_models",
     seed: int = 42,
-    timestep_embed_dim: int = 256,
-    down_dims: tuple[int, ...] = (256, 512, 1024),
-    kernel_size: int = 5,
-    n_groups: int = 8,
+    timestep_embed_dim: int = 128,
+    hidden_dim: int = 512,
+    num_res_blocks: int = 4,
+    mlp_expansion: int = 2,
 ) -> None:
     """Train one-step MeanFlow decoder on collected PPO data."""
 
@@ -141,13 +144,10 @@ def train_fm(
     config = Decoder1StepFMConfig(
         flow_steps=1,
         timestep_embed_dim=timestep_embed_dim,
-        down_dims=down_dims,
-        kernel_size=kernel_size,
-        n_groups=n_groups,
+        hidden_dim=hidden_dim,
+        num_res_blocks=num_res_blocks,
+        mlp_expansion=mlp_expansion,
         condition_type="film",
-        use_down_condition=True,
-        use_mid_condition=True,
-        use_up_condition=True,
         policy_output_scale=1.0,
         learning_rate=learning_rate,
         batch_size=batch_size,

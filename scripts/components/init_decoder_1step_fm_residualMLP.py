@@ -6,14 +6,15 @@ from pathlib import Path
 from typing import Annotated
 
 import jax
-import jax_dataclasses as jdc
 import tyro
-from jax import numpy as jnp
 from mujoco_playground import dm_control_suite, locomotion, registry
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-from flow_policy.decoder_1step_fm import Decoder1StepFMConfig, Decoder1StepFMState
+from flow_policy.decoder_1step_fm_residualMLP import (
+    Decoder1StepFMConfig,
+    Decoder1StepFMState,
+)
 
 
 def main(
@@ -38,14 +39,11 @@ def main(
 
     config = Decoder1StepFMConfig(
         flow_steps=1,
-        timestep_embed_dim=256,
-        down_dims=(256, 512, 1024),
-        kernel_size=5,
-        n_groups=8,
+        timestep_embed_dim=128,
+        hidden_dim=512,
+        num_res_blocks=4,
+        mlp_expansion=2,
         condition_type="film",
-        use_down_condition=True,
-        use_mid_condition=True,
-        use_up_condition=True,
         policy_output_scale=1.0,
         learning_rate=1e-4,
         batch_size=128,
@@ -58,9 +56,6 @@ def main(
 
     prng = jax.random.PRNGKey(seed)
     fm_state = Decoder1StepFMState.init(prng, obs_dim, action_dim, config)
-
-    with jdc.copy_and_mutate(fm_state) as fm_state:
-        fm_state.params = jax.tree.map(jnp.zeros_like, fm_state.params)
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
