@@ -164,6 +164,7 @@ class Decoder1StepFMConfig:
     guidance_scale: float = 2.0
     dispersive_loss_weight: float = 0
     bifm_loss_weight: float = 0.05
+    warm_up_epoch = 20
     dispersive_tau: float = 1.0
     dispersive_chunk_size: jdc.Static[int] = 512
     use_lbifm: jdc.Static[bool] = False
@@ -491,20 +492,32 @@ class Decoder1StepFMState:
 
     def compute_meanflow_loss(
         self,
+        epoch,
         obs_norm: Array,
         action: Array,
         eps: Array,
         t: Array,
         r: Array,
-        params: Any | None = None,
+        params: Any | None = None
     ) -> tuple[Array, Array, Array]:
         loss, meanflow_loss, dis_loss, _ = self._compute_training_losses(
-            obs_norm, action, eps, t, r, params=params
+            epoch, obs_norm, action, eps, t, r, params=params
         )
         return loss, meanflow_loss, dis_loss
 
+    def compute_warm_up_bifm_weight(self, epoch):
+        warm_up_epoch = self.config.warm_up_epoch
+        # 使用 lax.cond 进行条件分支，两个分支都必须是函数
+        weight = jax.lax.cond(
+            epoch < warm_up_epoch,
+            lambda: 0.0, 
+            lambda: self.config.bifm_loss_weight                    
+        )
+        return weight
+    
     def _compute_training_losses(
         self,
+        epoch,
         obs_norm: Array,
         action: Array,
         eps: Array,
@@ -550,13 +563,13 @@ class Decoder1StepFMState:
         loss = (
             meanflow_loss
             + self.config.dispersive_loss_weight * dis_loss
-            + self.config.bifm_loss_weight * bifm_loss
+            + self.compute_warm_up_bifm_weight(epoch) * bifm_loss
         )
         return loss, meanflow_loss, dis_loss, bifm_loss
 
     @jax.jit
     def train_step(
-        self, batch_obs: Array, batch_actions: Array
+        self, epoch, batch_obs: Array, batch_actions: Array
     ) -> tuple["Decoder1StepFMState", dict[str, Array]]:
         batch_size = batch_obs.shape[0]
         obs_norm = self._normalize_obs(batch_obs)
@@ -567,7 +580,7 @@ class Decoder1StepFMState:
         def loss_fn(params: Any):
             loss, meanflow_loss, dis_loss, bifm_loss = (
                 self._compute_training_losses(
-                    obs_norm, batch_actions, eps, t, r, params=params
+                    epoch, obs_norm, batch_actions, eps, t, r, params=params
                 )
             )
             return loss, {

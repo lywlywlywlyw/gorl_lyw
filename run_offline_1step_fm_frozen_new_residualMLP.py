@@ -78,7 +78,7 @@ class FrozenOfflineConfig:
     # Decoder: train once to convergence, then freeze permanently.
     decoder_learning_rate: float = 1e-4
     decoder_timestep_embed_dim: int = 128
-    decoder_hidden_dim: int = 512
+    decoder_hidden_dim: int = 256
     decoder_num_res_blocks: int = 4
     decoder_mlp_expansion: int = 2
     decoder_batch_size: int = 8192
@@ -592,6 +592,7 @@ def build_latent_targets(
 
 
 def decoder_validation_loss(
+    epoch,
     decoder: Decoder1StepFMState,
     buffer: ReplayBuffer,
     indices: np.ndarray,
@@ -612,7 +613,7 @@ def decoder_validation_loss(
         eps = jax.random.normal(eps_key, actions.shape)
         times, starts = decoder.sample_t_r(time_key, len(batch))
         total_loss, _, _ = decoder.compute_meanflow_loss(
-            obs_norm, actions, eps, times, starts
+            epoch, obs_norm, actions, eps, times, starts
         )
         losses.append(
             float(total_loss)
@@ -1028,7 +1029,7 @@ def main(config: FrozenOfflineConfig) -> None:
             permutation = rng.permutation(train_indices)
             for start in range(0, len(permutation), config.decoder_batch_size):
                 batch = permutation[start : start + config.decoder_batch_size]
-                decoder, metrics = decoder.train_step(
+                decoder, metrics = decoder.train_step(epoch,
                     jnp.asarray(buffer.observations[batch]),
                     jnp.asarray(buffer.actions[batch]),
                 )
@@ -1038,6 +1039,7 @@ def main(config: FrozenOfflineConfig) -> None:
                 dis_loss.append(float(metrics["dis_loss"]))
                 global_step += 1
             validation_loss, key = decoder_validation_loss(
+                epoch, 
                 decoder,
                 buffer,
                 validation_indices,
