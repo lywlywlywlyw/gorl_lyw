@@ -12,22 +12,16 @@ from typing import Annotated
 import jax
 import tyro
 from jax import numpy as jnp
-from mujoco_playground import dm_control_suite, locomotion, registry
+# from mujoco_playground import dm_control_suite, locomotion, registry
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from flow_policy.decoder_fm import DecoderFMConfig, DecoderFMState
-
+from envs.robomimic import RobomimicEnv
 
 def main(
-    env_name: Annotated[
-        str,
-        tyro.conf.arg(
-            constructor=tyro.extras.literal_type_from_choices(
-                dm_control_suite.ALL_ENVS + locomotion.ALL_ENVS
-            )
-        ),
-    ] = "CheetahRun",
+    env_name: str = "Lift",
+    dataset_path: str = "/root/GoRL/datasets/robomimic/low_dim.hdf5",
     output_dir: str = "fm_models",
     seed: int = 42,
 ) -> None:
@@ -40,8 +34,7 @@ def main(
     """
 
     # Load environment to get dimensions
-    env_config = registry.get_default_config(env_name)
-    env = registry.load(env_name, config=env_config)
+    env = RobomimicEnv(dataset_path=dataset_path)
 
     obs_dim = env.observation_size
     action_dim = env.action_size

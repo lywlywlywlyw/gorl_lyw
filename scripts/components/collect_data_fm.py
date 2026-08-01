@@ -11,8 +11,8 @@ import jax_dataclasses as jdc
 import numpy as onp
 import tyro
 from jax import numpy as jnp
-from mujoco_playground import dm_control_suite, locomotion, registry
-from mujoco_playground.config import dm_control_suite_params
+# from mujoco_playground import dm_control_suite, locomotion, registry
+# from mujoco_playground.config import dm_control_suite_params
 from tqdm import tqdm
 
 import sys
@@ -24,17 +24,38 @@ from flow_policy.rollout_encoder import (
     BatchedRolloutStateEncoderFM,
     eval_policy_encoder_fm
 )
+from dataclasses import dataclass, asdict
+from envs.robomimic import RobomimicEnv
+@dataclass
+class PPOConfig:
+    # Environment
+    action_repeat: int = 1
+    episode_length: int = 1000
+    num_envs: int = 2048
 
+    # PPO
+    batch_size: int = 1024
+    num_minibatches: int = 32
+    num_updates_per_batch: int = 16
+    unroll_length: int = 30
+    learning_rate: float = 1e-3
+    entropy_cost: float = 1e-2
+    discounting: float = 0.995
 
+    # Training
+    num_timesteps: int = 60_000_000
+    num_evals: int = 10
+
+    # Normalization & Reward
+    normalize_observations: bool = True
+    reward_scaling: float = 10.0
+
+    def to_dict(self):
+        return asdict(self)
+    
 def main(
-    env_name: Annotated[
-        str,
-        tyro.conf.arg(
-            constructor=tyro.extras.literal_type_from_choices(
-                dm_control_suite.ALL_ENVS + locomotion.ALL_ENVS
-            )
-        ),
-    ] = "CheetahRun",
+    env_name: str = "Lift",
+    dataset_path: str = "/root/GoRL/datasets/robomimic/low_dim.hdf5",
     ppo_z_checkpoint_path: str | None = None,
     fm_model_path: str | None = None,
     num_iterations: int = 5,  # Number of data collection iterations
@@ -75,15 +96,14 @@ def main(
         fm_config_source = pickle.load(f)
 
     # Setup environment
-    env_config = registry.get_default_config(env_name)
-    env = registry.load(env_name, config=env_config)
+    env = RobomimicEnv(dataset_path=dataset_path)
 
     # Get config from checkpoint or create new one
     if "config" in ppo_z_checkpoint:
         config = ppo_z_checkpoint["config"]
     else:
         # Create config with z_dim
-        ppo_params = dm_control_suite_params.brax_ppo_config(env_name)
+        ppo_params = PPOConfig()
         ppo_params['z_dim'] = ppo_z_checkpoint.get("z_dim", 6)
         config = encoder_ppo.EncoderConfig(**ppo_params)
 

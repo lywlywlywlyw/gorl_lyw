@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Annotated
 
 import tyro
-from envs.robomimic import RobomimicEnv
+from mujoco_playground import registry
+
 
 def run_command(cmd: str, description: str) -> int:
     """Run a shell command and handle errors."""
@@ -26,8 +27,7 @@ def run_command(cmd: str, description: str) -> int:
 
 
 def main(
-    env_name: str = "Lift",
-    dataset_path: str = "/root/GoRL/datasets/robomimic/low_dim.hdf5",
+    env_name: Annotated[str, tyro.conf.arg(help="Environment name (e.g., CheetahRun)")] = "CheetahRun",
     num_stages: Annotated[int, tyro.conf.arg(help="Number of training stages")] = 4,
     encoder_num_timesteps: Annotated[int, tyro.conf.arg(help="Default encoder training timesteps per stage")] = 100000000,
     encoder_timesteps_per_stage: Annotated[str | None, tyro.conf.arg(help="Comma-separated timesteps for each stage (e.g., '60000000,60000000,30000000,30000000')")] = "60000000,60000000,30000000,30000000",
@@ -85,9 +85,10 @@ def main(
     print(f"Stages: {num_stages}, Timesteps: {timesteps_list}")
 
     # Auto-detect action_dim (z_dim) from environment
-    env = RobomimicEnv(dataset_path=dataset_path)
-    z_dim = env.action_size
-    del env
+    env_config = registry.get_default_config(env_name)
+    temp_env = registry.load(env_name, config=env_config)
+    z_dim = temp_env.action_size
+    del temp_env
 
     # Save pipeline config
     config_file = run_dir / "pipeline_config.txt"
@@ -125,7 +126,6 @@ def main(
             cmd = (
                 f"python scripts/components/init_decoder_fm.py "
                 f"--env_name {env_name} "
-                f"--dataset_path {dataset_path} "
                 f"--output_dir {stage_dir} "
                 f"--seed {seed}"
             )
@@ -163,7 +163,6 @@ def main(
         cmd = " ".join([
             f"python scripts/components/train_encoder_ppo.py",
             f"--env_name {env_name}",
-            f"--dataset_path {dataset_path}",
             f"--decoder_type fm",
             f"--decoder_model_path {fm_checkpoint}",
             f"--z_dim {z_dim}",
@@ -218,7 +217,6 @@ def main(
         cmd = (
             f"python scripts/components/collect_data_fm.py "
             f"--env_name {env_name} "
-            f"--dataset_path {dataset_path} "
             f"--ppo_z_checkpoint_path {encoder_checkpoint} "
             f"--fm_model_path {fm_checkpoint} "
             f"--num_iterations {data_collection_iterations} "

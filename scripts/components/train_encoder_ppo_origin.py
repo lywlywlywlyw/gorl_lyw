@@ -15,45 +15,22 @@ import jax_dataclasses as jdc
 import numpy as onp
 import tyro
 from jax import numpy as jnp
-# from mujoco_playground import dm_control_suite, locomotion, registry
-# from mujoco_playground.config import dm_control_suite_params
+from mujoco_playground import dm_control_suite, locomotion, registry
+from mujoco_playground.config import dm_control_suite_params
 from tqdm import tqdm
 
 from flow_policy import encoder_ppo
 
-from dataclasses import dataclass, asdict
-
-from envs.robomimic import RobomimicEnv
-@dataclass
-class PPOConfig:
-    # Environment
-    action_repeat: int = 1
-    episode_length: int = 1000
-    num_envs: int = 2048
-
-    # PPO
-    batch_size: int = 1024
-    num_minibatches: int = 32
-    num_updates_per_batch: int = 16
-    unroll_length: int = 30
-    learning_rate: float = 1e-3
-    entropy_cost: float = 1e-2
-    discounting: float = 0.995
-
-    # Training
-    num_timesteps: int = 60_000_000
-    num_evals: int = 10
-
-    # Normalization & Reward
-    normalize_observations: bool = True
-    reward_scaling: float = 10.0
-
-    def to_dict(self):
-        return asdict(self)
 
 def main(
-    env_name: str = "Lift",
-    dataset_path: str = "/root/GoRL/datasets/robomimic/low_dim.hdf5",
+    env_name: Annotated[
+        str,
+        tyro.conf.arg(
+            constructor=tyro.extras.literal_type_from_choices(
+                dm_control_suite.ALL_ENVS + locomotion.ALL_ENVS
+            )
+        ),
+    ] = "WalkerWalk",
     decoder_type: Literal["fm", "diffusion"] = "fm",
     decoder_model_path: str | None = None,
     exp_name: str = "encoder",
@@ -100,9 +77,9 @@ def main(
         decoder_fallback = None
 
     # Load environment config
-    # env_config = registry.get_default_config(env_name)
-    # ppo_params = dm_control_suite_params.brax_ppo_config(env_name)
-    ppo_params = PPOConfig()
+    env_config = registry.get_default_config(env_name)
+    ppo_params = dm_control_suite_params.brax_ppo_config(env_name)
+
     if learning_rate is not None:
         ppo_params.learning_rate = learning_rate
     if clipping_epsilon is not None:
@@ -130,8 +107,7 @@ def main(
         decoder_checkpoint = pickle.load(f)
 
     # Initialize environment
-    # env = registry.load(env_name, config=env_config)
-    env = RobomimicEnv(dataset_path=dataset_path)
+    env = registry.load(env_name, config=env_config)
 
     if z_dim is None:
         z_dim = env.action_size
