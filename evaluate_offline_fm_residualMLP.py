@@ -51,9 +51,9 @@ class Config:
     """Command-line configuration for offline checkpoint evaluation."""
 
     checkpoint: str
-    d4rl_dataset: str | None = None
+    d4rl_dataset: str | None = "walker2d-medium-expert-v2"
     env_name: str | None = None
-    num_episodes: int = 10
+    num_episodes: int = 50
     episode_length: int | None = None
     seed: int = 0
     deterministic: bool = True

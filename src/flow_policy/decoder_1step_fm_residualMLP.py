@@ -162,9 +162,9 @@ class Decoder1StepFMConfig:
     adaptive_loss_gamma: float = 0.5
     adaptive_loss_c: float = 1e-3
     guidance_scale: float = 2.0
-    dispersive_loss_weight: float = 0
+    dispersive_loss_weight: float = 0.5
     bifm_loss_weight: float = 0.05
-    warm_up_epoch = 20
+    warm_up_epoch = 2000
     dispersive_tau: float = 1.0
     dispersive_chunk_size: jdc.Static[int] = 512
     use_lbifm: jdc.Static[bool] = False
