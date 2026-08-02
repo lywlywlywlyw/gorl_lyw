@@ -21,66 +21,15 @@ from tqdm import tqdm
 
 from flow_policy import encoder_ppo
 
-from dataclasses import dataclass, asdict
-
 from envs.robomimic.RobomimicEnv import RobomimicEnv
-@dataclass
-class PPOConfig:
-    # Environment
-    action_repeat: int = 1
-    episode_length: int = 1000
-    num_envs: int = 16
+from envs.robomimic.config.training_config import TrainingConfig
+from envs.robomimic.config.env_config import EnvConfig
 
-    # PPO
-    batch_size: int = 1024
-    num_minibatches: int = 32
-    num_updates_per_batch: int = 16
-    unroll_length: int = 30
-    learning_rate: float = 1e-3
-    entropy_cost: float = 1e-2
-    discounting: float = 0.995
-
-    # Training
-    num_timesteps: int = 60_000_000
-    num_evals: int = 10
-
-    # Normalization & Reward
-    normalize_observations: bool = True
-    reward_scaling: float = 10.0
-
-    def to_dict(self):
-        return asdict(self)
-
-def main(
-    env_name: str = "Lift",
-    dataset_path: str = "/root/GoRL/datasets/robomimic/low_dim.hdf5",
-    decoder_type: Literal["fm", "diffusion"] = "fm",
-    decoder_model_path: str | None = None,
-    exp_name: str = "encoder",
-    learning_rate: float | None = None,
-    clipping_epsilon: float | None = None,
-    num_timesteps: int | None = None,
-    z_dim: int | None = None,
-    seed: int = 42,
-    apply_tanh_in_rollout: bool = True,
-    z_regularization: float = 0.0,
-    max_grad_norm: float = 0.5,
-    use_tanh_jacobian_for_z: bool = False,
-
-    # Early stopping parameters
-    eval_frequency: int = 1000000,
-    min_steps: int = 0,
-    improvement_threshold: float | None = 15.0,
-    improvement_ratio_threshold: float | None = None,
-    improvement_window: int = 5,
-    reward_drop_threshold: float | None = 100.0,
-    reward_drop_ratio: float | None = None,
-    early_stopping: bool = False,
-) -> None:
+def main(exp_name, decoder_model_path, num_timesteps: int | None = None,) -> None:
     """Train encoder with generative decoder (FM or Diffusion)."""
-
+    config = TrainingConfig().to_dict() | EnvConfig().to_dict()
     # Dynamic imports based on decoder type
-    if decoder_type == "fm":
+    if config['decoder_type'] == "fm":
         from flow_policy.decoder_fm import DecoderFMState as DecoderState
         from flow_policy.agent import EncoderFMAgent as Agent
         from flow_policy.rollout_encoder import (
@@ -102,23 +51,17 @@ def main(
     # Load environment config
     # env_config = registry.get_default_config(env_name)
     # ppo_params = dm_control_suite_params.brax_ppo_config(env_name)
-    ppo_params = PPOConfig().to_dict()
+    
     # if learning_rate is not None:
     #     ppo_params.learning_rate = learning_rate
     # if clipping_epsilon is not None:
     #     ppo_params.clipping_epsilon = clipping_epsilon
     # if num_timesteps is not None:
     #     ppo_params.num_timesteps = num_timesteps
-    if learning_rate is not None:
-        ppo_params['learning_rate'] = learning_rate
-    if clipping_epsilon is not None:
-        ppo_params['clipping_epsilon'] = clipping_epsilon
-    if num_timesteps is not None:
-        ppo_params['num_timesteps'] = num_timesteps
 
     # Create results directory
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_dir = Path("results") / f"encoder_{decoder_type}_{env_name}_{exp_name}_{timestamp}"
+    results_dir = Path("results") / f"encoder_{config['decoder_type']}_{config['env_name']}_{exp_name}_{timestamp}"
     results_dir.mkdir(parents=True, exist_ok=True)
 
     # Load decoder model
@@ -130,34 +73,50 @@ def main(
         elif decoder_fallback:
             decoder_model_path = decoder_fallback
         else:
-            raise ValueError(f"No {decoder_type} model found. Please specify --decoder_model_path")
+            raise ValueError(f"No {config['decoder_type']} model found. Please specify --decoder_model_path")
 
     with open(decoder_model_path, "rb") as f:
         decoder_checkpoint = pickle.load(f)
 
     # Initialize environment
     # env = registry.load(env_name, config=env_config)
-    env = RobomimicEnv(dataset_path=dataset_path)
+    env = RobomimicEnv(dataset_path=config['dataset_path'])
 
-    if z_dim is None:
-        z_dim = env.action_size
+    z_dim = env.action_size
 
     # Create encoder config
-    ppo_params['z_dim'] = z_dim
-    ppo_params['z_regularization'] = z_regularization
-    ppo_params['max_grad_norm'] = max_grad_norm
-    ppo_params['use_tanh_jacobian_for_z'] = use_tanh_jacobian_for_z
-    config = encoder_ppo.EncoderConfig(**ppo_params)
+    encoder_config = encoder_ppo.EncoderConfig(action_repeat=config['action_repeat'],
+        batch_size=config['ppo_batch_size'],
+        discounting=config['ppo_discounting'],
+        entropy_cost=config['ppo_entropy_cost'],
+        episode_length=config['episode_length'],
+        learning_rate=config['ppo_learning_rate'],
+        normalize_observations=config['ppo_normalize_observations'],
+        num_envs=config['num_envs'],
+        num_evals=config['ppo_num_evals'],
+        num_minibatches=config['ppo_num_minibatches'],
+        num_timesteps=num_timesteps,
+        num_updates_per_batch=config['ppo_num_updates_per_batch'],
+        reward_scaling=config['ppo_reward_scaling'],
+        unroll_length=config['ppo_unroll_length'],
+        z_dim=z_dim,
+        gae_lambda=config['ppo_gae_lambda'],
+        normalize_advantage=config['ppo_normalize_advantage'],
+        clipping_epsilon=config['ppo_clipping_epsilon'],
+        value_loss_coeff=config['ppo_value_loss_coeff'],
+        z_regularization=config['ppo_z_regularization'],
+        max_grad_norm=config['ppo_max_grad_norm'],
+        use_tanh_jacobian_for_z=config['ppo_use_tanh_jacobian_for_z'],)
 
     # Initialize encoder state
     encoder_state = encoder_ppo.EncoderState.init(
-        prng=jax.random.key(seed),
+        prng=jax.random.key(config['seed']),
         env=env,
-        config=config
+        config=encoder_config
     )
 
     # Create decoder state from checkpoint
-    decoder_prng = jax.random.PRNGKey(seed + 1000)
+    decoder_prng = jax.random.PRNGKey(config['seed'] + 1000)
     decoder_state = DecoderState.init(
         decoder_prng,
         decoder_checkpoint['obs_dim'],
@@ -171,7 +130,7 @@ def main(
         decoder_state.obs_stats = decoder_checkpoint["obs_stats"]
 
     # Create combined agent
-    if decoder_type == "fm":
+    if config['decoder_type'] == "fm":
         agent = Agent(
             ppo_z_state=encoder_state,
             fm_state=decoder_state,
@@ -185,21 +144,21 @@ def main(
     # Initialize rollout state
     rollout_state = BatchedRolloutState.init(
         env,
-        prng=jax.random.key(seed + 1),
-        num_envs=config.num_envs,
+        prng=jax.random.key(config['seed'] + 1),
+        num_envs=config['num_envs'],
     )
 
     # Save configuration
     config_file = results_dir / "config.txt"
     with open(config_file, "w") as f:
-        f.write(f"Algorithm: Encoder + {decoder_type.upper()}\n")
-        f.write(f"Environment: {env_name}\n")
+        f.write(f"Algorithm: Encoder + {config['decoder_type'].upper()}\n")
+        f.write(f"Environment: {config['env_name']}\n")
         f.write(f"z_dim: {z_dim}\n")
         f.write(f"Decoder model: {decoder_model_path}\n")
         f.write(f"Timestamp: {timestamp}\n")
-        f.write(f"Seed: {seed}\n")
+        f.write(f"Seed: {config['seed']}\n")
         f.write(f"\nEncoder Parameters:\n")
-        for key, value in vars(config).items():
+        for key, value in vars(encoder_config).items():
             f.write(f"  {key}: {value}\n")
 
     # Create metrics file
@@ -209,22 +168,23 @@ def main(
         f.write(f"{'='*60}\n")
 
     # Training loop
-    outer_iters = config.num_timesteps // (config.iterations_per_env * config.num_envs)
+    config['ppo_iterations_per_env'] = (config['ppo_num_minibatches'] * config['ppo_batch_size'] * config['ppo_unroll_length']) // config['num_envs']
+    outer_iters = num_timesteps // (config['ppo_iterations_per_env'] * config['num_envs'])
 
     # Early stopping setup
-    steps_per_iter = config.iterations_per_env * config.num_envs
-    if early_stopping:
-        if improvement_window < 2:
+    steps_per_iter = config['ppo_iterations_per_env'] * config['num_envs']
+    if config['ppo_early_stopping']:
+        if config['ppo_improvement_window'] < 2:
             raise ValueError("improvement_window must be at least 2 when early_stopping is enabled.")
 
-        eval_step_interval = max(1, eval_frequency // steps_per_iter)
+        eval_step_interval = max(1, config['ppo_eval_frequency'] // steps_per_iter)
         eval_iters = set(range(0, outer_iters, eval_step_interval))
         eval_iters.add(max(outer_iters - 1, 0))
 
         recent_rewards: list[tuple[int, float]] = []
-        min_steps_iters = max(0, min_steps // steps_per_iter)
+        min_steps_iters = max(0, config['ppo_min_steps'] // steps_per_iter)
     else:
-        eval_iters = set(onp.linspace(0, outer_iters - 1, config.num_evals, dtype=int))
+        eval_iters = set(onp.linspace(0, outer_iters - 1, config['ppo_num_evals'], dtype=int))
         recent_rewards = []
         min_steps_iters = 0
 
@@ -240,9 +200,9 @@ def main(
             eval_outputs = eval_policy(
                 agent,
                 prng=jax.random.fold_in(agent.ppo_z_state.prng, i),
-                num_envs=16,
-                max_episode_length=config.episode_length,
-                apply_tanh_in_rollout=apply_tanh_in_rollout,
+                num_envs=config['eval_num_envs'],
+                max_episode_length=config['episode_length'],
+                apply_tanh_in_rollout=config['ppo_apply_tanh_in_rollout'],
             )
 
             s_np = {k: onp.array(v) for k, v in eval_outputs.scalar_metrics.items()}
@@ -265,7 +225,7 @@ def main(
             if current_reward >= best_reward - 1e-6:
                 best_reward = current_reward
 
-                if early_stopping:
+                if config['ppo_early_stopping']:
                     recent_rewards.clear()
                     recent_rewards.append((i, current_reward))
 
@@ -273,15 +233,15 @@ def main(
                 checkpoint = {
                     "ppo_z_params": agent.ppo_z_state.params,
                     "ppo_z_obs_stats": agent.ppo_z_state.obs_stats,
-                    "config": config,
-                    "env_name": env_name,
-                    "decoder_type": decoder_type,
+                    "config": encoder_config,
+                    "env_name": config['env_name'],
+                    "decoder_type": config['decoder_type'],
                     "iteration": i,
                     "reward": current_reward,
                     "z_dim": z_dim,
                 }
                 # Add decoder params with appropriate key names
-                if decoder_type == "fm":
+                if config['decoder_type'] == "fm":
                     checkpoint["fm_params"] = decoder_state.params
                     checkpoint["fm_obs_stats"] = decoder_state.obs_stats
                 else:
@@ -290,46 +250,46 @@ def main(
                 best_checkpoint_file = results_dir / "best_checkpoint.pkl"
                 with open(best_checkpoint_file, "wb") as f:
                     pickle.dump(checkpoint, f)
-            elif early_stopping:
+            elif config['ppo_early_stopping']:
                 recent_rewards.append((i, current_reward))
-                if len(recent_rewards) > improvement_window:
+                if len(recent_rewards) > config['ppo_improvement_window']:
                     recent_rewards.pop(0)
 
             # Early stopping check
-            if early_stopping and i >= min_steps_iters and best_reward > -float("inf"):
+            if config['ppo_early_stopping'] and i >= min_steps_iters and best_reward > -float("inf"):
                 stop_reason = None
                 reward_delta = best_reward - current_reward
 
-                if reward_drop_threshold is not None and reward_delta >= reward_drop_threshold:
+                if config['ppo_reward_drop_threshold'] is not None and reward_delta >= config['ppo_reward_drop_threshold']:
                     stop_reason = (
-                        f"Reward dropped by {reward_delta:.2f} (>= {reward_drop_threshold}) "
+                        f"Reward dropped by {reward_delta:.2f} (>= {config['ppo_reward_drop_threshold']}) "
                         f"from best {best_reward:.2f}"
                     )
-                elif reward_drop_ratio is not None and best_reward != 0:
+                elif config['ppo_reward_drop_ratio'] is not None and best_reward != 0:
                     best_abs = max(abs(best_reward), 1e-6)
                     drop_ratio = reward_delta / best_abs
-                    if drop_ratio >= reward_drop_ratio:
+                    if drop_ratio >= config['ppo_reward_drop_ratio']:
                         stop_reason = (
-                            f"Reward dropped by {drop_ratio*100:.2f}% (>= {reward_drop_ratio*100:.2f}%) "
+                            f"Reward dropped by {drop_ratio*100:.2f}% (>= {config['ppo_reward_drop_ratio']*100:.2f}%) "
                             f"from best {best_reward:.2f}"
                         )
 
-                if stop_reason is None and len(recent_rewards) >= improvement_window:
+                if stop_reason is None and len(recent_rewards) >= config['ppo_improvement_window']:
                     window_improvement = recent_rewards[-1][1] - recent_rewards[0][1]
 
-                    if improvement_threshold is not None and window_improvement <= improvement_threshold:
+                    if config['ppo_improvement_threshold'] is not None and window_improvement <= config['ppo_improvement_threshold']:
                         stop_reason = (
                             f"Reward improvement {window_improvement:.2f} over "
-                            f"{improvement_window} evals <= threshold {improvement_threshold:.2f}"
+                            f"{config['ppo_improvement_window']} evals <= threshold {config['ppo_improvement_threshold']:.2f}"
                         )
-                    elif improvement_ratio_threshold is not None and best_reward != 0:
+                    elif config['ppo_improvement_ratio_threshold'] is not None and best_reward != 0:
                         best_abs = max(abs(best_reward), 1e-6)
                         window_ratio = window_improvement / best_abs
-                        if window_ratio <= improvement_ratio_threshold:
+                        if window_ratio <= config['ppo_improvement_ratio_threshold']:
                             stop_reason = (
                                 f"Relative improvement {window_ratio*100:.2f}% over "
-                                f"{improvement_window} evals <= "
-                                f"{improvement_ratio_threshold*100:.2f}% threshold"
+                                f"{config['ppo_improvement_window']} evals <= "
+                                f"{config['ppo_improvement_ratio_threshold']*100:.2f}% threshold"
                             )
 
                 if stop_reason is not None:
@@ -342,9 +302,9 @@ def main(
         # Training step
         rollout_state, transitions = rollout_state.rollout(
             agent,
-            episode_length=config.episode_length,
-            iterations_per_env=config.iterations_per_env,
-            apply_tanh_in_rollout=apply_tanh_in_rollout,
+            episode_length=config['episode_length'],
+            iterations_per_env=config['ppo_iterations_per_env'],
+            apply_tanh_in_rollout=config['ppo_apply_tanh_in_rollout'],
         )
 
         agent, metrics = agent.training_step(transitions)
@@ -381,14 +341,14 @@ def main(
     final_checkpoint = {
         "ppo_z_params": agent.ppo_z_state.params,
         "ppo_z_obs_stats": agent.ppo_z_state.obs_stats,
-        "config": config,
-        "env_name": env_name,
-        "decoder_type": decoder_type,
+        "config": encoder_config,
+        "env_name": config['env_name'],
+        "decoder_type": config['decoder_type'],
         "final_iteration": last_iteration + 1,
         "best_reward": best_reward,
         "z_dim": z_dim,
     }
-    if decoder_type == "fm":
+    if config['decoder_type'] == "fm":
         final_checkpoint["fm_params"] = decoder_state.params
         final_checkpoint["fm_obs_stats"] = decoder_state.obs_stats
     else:

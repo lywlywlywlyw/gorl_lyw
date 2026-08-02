@@ -18,6 +18,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from flow_policy.decoder_fm import DecoderFMConfig, DecoderFMState
 from envs.robomimic.RobomimicEnv import RobomimicEnv
+from envs.robomimic.config.decoder_configs.fm_config import FlowMatchingConfig
 
 def main(
     env_name: str = "Lift",
@@ -32,7 +33,7 @@ def main(
         output_dir: Directory to save the checkpoint
         seed: Random seed for initialization
     """
-
+    fm_configs = FlowMatchingConfig().to_dict()
     # Load environment to get dimensions
     env = RobomimicEnv(dataset_path=dataset_path)
 
@@ -42,17 +43,17 @@ def main(
     # Create FM config
     # Use minimal network since we want identity mapping
     config = DecoderFMConfig(
-        flow_steps=10,
-        timestep_embed_dim=8,
-        hidden_dims=(64, 64, 64, 64),  # Standard architecture
-        policy_output_scale=1.0,
-        learning_rate=3e-4,
-        batch_size=2048,
-        num_epochs=1,  # Not used for identity
-        n_samples_per_action=8,
-        normalize_observations=True,
-        sde_sigma=0.0,
-        feather_std=0.0,
+        flow_steps=fm_configs["fm_flow_steps"],
+        timestep_embed_dim=fm_configs["fm_timestep_embed_dim"],
+        hidden_dims=fm_configs["fm_hidden_dims"],
+        policy_output_scale=fm_configs["fm_policy_output_scale"],
+        learning_rate=fm_configs["fm_learning_rate"],
+        batch_size=fm_configs["fm_batch_size"],
+        num_epochs=fm_configs["fm_num_epochs"],  # Not used for identity
+        n_samples_per_action=fm_configs["fm_n_samples_per_action"],
+        normalize_observations=fm_configs["fm_normalize_observations"],
+        sde_sigma=fm_configs["fm_sde_sigma"],
+        feather_std=fm_configs["fm_feather_std"],
     )
 
     # Initialize FM state

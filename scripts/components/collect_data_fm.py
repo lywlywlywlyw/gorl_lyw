@@ -24,45 +24,15 @@ from flow_policy.rollout_encoder import (
     BatchedRolloutStateEncoderFM,
     eval_policy_encoder_fm
 )
-from dataclasses import dataclass, asdict
 from envs.robomimic.RobomimicEnv import RobomimicEnv
-@dataclass
-class PPOConfig:
-    # Environment
-    action_repeat: int = 1
-    episode_length: int = 1000
-    num_envs: int = 16
-
-    # PPO
-    batch_size: int = 1024
-    num_minibatches: int = 32
-    num_updates_per_batch: int = 16
-    unroll_length: int = 30
-    learning_rate: float = 1e-3
-    entropy_cost: float = 1e-2
-    discounting: float = 0.995
-
-    # Training
-    num_timesteps: int = 60_000_000
-    num_evals: int = 10
-
-    # Normalization & Reward
-    normalize_observations: bool = True
-    reward_scaling: float = 10.0
-
-
-    def to_dict(self):
-        return asdict(self)
-    
+from envs.robomimic.config.training_config import TrainingConfig
+from envs.robomimic.config.env_config import EnvConfig
 def main(
-    env_name: str = "Lift",
-    dataset_path: str = "/root/GoRL/datasets/robomimic/low_dim.hdf5",
     ppo_z_checkpoint_path: str | None = None,
     fm_model_path: str | None = None,
-    num_iterations: int = 5,  # Number of data collection iterations
-    output_dir: str = "data",
-    seed: int = 42,
+    output_dir: str = "data"
 ) -> None:
+    config = TrainingConfig().to_dict() | EnvConfig().to_dict()
     """Collect data from PPO_z + FM combined policy."""
 
     # Create output directory
@@ -73,11 +43,11 @@ def main(
     if ppo_z_checkpoint_path is None:
         # Find the latest best checkpoint from PPO_z training for this specific environment
         import glob
-        checkpoints = glob.glob(f"results/ppo_z_fm_v2_{env_name}_*/best_checkpoint.pkl")
+        checkpoints = glob.glob(f"results/ppo_z_fm_v2_{config['env_name']}_*/best_checkpoint.pkl")
         if checkpoints:
             ppo_z_checkpoint_path = sorted(checkpoints)[-1]
         else:
-            raise ValueError(f"No PPO_z checkpoint found for {env_name}. Please specify --ppo_z_checkpoint_path")
+            raise ValueError(f"No PPO_z checkpoint found for {config['env_name']}. Please specify --ppo_z_checkpoint_path")
 
     if fm_model_path is None:
         # Find the latest FM model
@@ -97,22 +67,41 @@ def main(
         fm_config_source = pickle.load(f)
 
     # Setup environment
-    env = RobomimicEnv(dataset_path=dataset_path)
-
+    env = RobomimicEnv(dataset_path=config['dataset_path'])
+    z_dim = env.action_size 
     # Get config from checkpoint or create new one
     if "config" in ppo_z_checkpoint:
         config = ppo_z_checkpoint["config"]
     else:
         # Create config with z_dim
-        ppo_params = PPOConfig().to_dict()
-        ppo_params['z_dim'] = ppo_z_checkpoint.get("z_dim", 6)
-        config = encoder_ppo.EncoderConfig(**ppo_params)
+        encoder_config = encoder_ppo.EncoderConfig(action_repeat=config['action_repeat'],
+        batch_size=config['ppo_batch_size'],
+        discounting=config['ppo_discounting'],
+        entropy_cost=config['ppo_entropy_cost'],
+        episode_length=config['episode_length'],
+        learning_rate=config['ppo_learning_rate'],
+        normalize_observations=config['ppo_normalize_observations'],
+        num_envs=config['num_envs'],
+        num_evals=config['ppo_num_evals'],
+        num_minibatches=config['ppo_num_minibatches'],
+        num_timesteps=config['ppo_num_timesteps'],
+        num_updates_per_batch=config['ppo_num_updates_per_batch'],
+        reward_scaling=config['ppo_reward_scaling'],
+        unroll_length=config['ppo_unroll_length'],
+        z_dim=z_dim,
+        gae_lambda=config['ppo_gae_lambda'],
+        normalize_advantage=config['ppo_normalize_advantage'],
+        clipping_epsilon=config['ppo_clipping_epsilon'],
+        value_loss_coeff=config['ppo_value_loss_coeff'],
+        z_regularization=config['ppo_z_regularization'],
+        max_grad_norm=config['ppo_max_grad_norm'],
+        use_tanh_jacobian_for_z=config['ppo_use_tanh_jacobian_for_z'],)
 
     # Initialize PPO_z state
     ppo_z_state = encoder_ppo.EncoderState.init(
-        prng=jax.random.key(seed),
+        prng=jax.random.key(config['seed']),
         env=env,
-        config=config
+        config=encoder_config
     )
 
     # Load PPO_z parameters
@@ -121,7 +110,7 @@ def main(
         ppo_z_state.obs_stats = ppo_z_checkpoint["ppo_z_obs_stats"]
 
     # Initialize FM state
-    fm_prng = jax.random.PRNGKey(seed + 1000)
+    fm_prng = jax.random.PRNGKey(config['seed'] + 1000)
     fm_state = DecoderFMState.init(
         fm_prng,
         fm_config_source['obs_dim'],
@@ -149,16 +138,16 @@ def main(
     # Initialize rollout state
     rollout_state = BatchedRolloutStateEncoderFM.init(
         env,
-        prng=jax.random.key(seed + 1),
-        num_envs=config.num_envs,
+        prng=jax.random.key(config['seed'] + 1),
+        num_envs=config['num_envs'],
     )
 
     # Validate first
     eval_outputs = eval_policy_encoder_fm(
         agent,
         prng=jax.random.fold_in(agent.ppo_z_state.prng, 0),
-        num_envs=16,
-        max_episode_length=config.episode_length,
+        num_envs=config['eval_num_envs'],
+        max_episode_length=config['episode_length'],
     )
     s_np = {k: onp.array(v) for k, v in eval_outputs.scalar_metrics.items()}
 
@@ -167,12 +156,12 @@ def main(
     all_actions = []
     all_rewards = []
 
-    for i in tqdm(range(num_iterations), desc="Collecting"):
+    for i in tqdm(range(config['data_collection_iterations']), desc="Collecting"):
         # Custom rollout that saves actual actions (not z values)
         rollout_state, states, actions, rewards = rollout_state.rollout_with_actions(
             agent,
-            episode_length=config.episode_length,
-            iterations_per_env=config.iterations_per_env,
+            episode_length=config['episode_length'],
+            iterations_per_env=config['iterations_per_env'],
         )
 
         all_states.append(onp.array(states))
@@ -193,18 +182,18 @@ def main(
 
     # Save data
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    data_file = output_path / f"ppo_z_fm_data_{env_name}_{timestamp}.pkl"
+    data_file = output_path / f"ppo_z_fm_data_{config['env_name']}_{timestamp}.pkl"
 
     data = {
         "states": all_states,
         "actions": all_actions,
         "rewards": all_rewards,
-        "env_name": env_name,
-        "config": config,
+        "env_name": config['env_name'],
+        "config": encoder_config,
         "collection_method": "ppo_z_fm_rollout",
         "ppo_z_checkpoint": ppo_z_checkpoint_path,
         "fm_model": fm_model_path,
-        "num_iterations": num_iterations,
+        "num_iterations": config['data_collection_iterations'],
         "total_samples": len(all_states),
         "expected_episode_reward": s_np['reward_mean'],
     }

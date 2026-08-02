@@ -14,25 +14,12 @@ from tqdm import tqdm
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from flow_policy.decoder_fm import DecoderFMConfig, DecoderFMState
-
+from envs.robomimic.config.training_config import TrainingConfig
+from envs.robomimic.config.env_config import EnvConfig
 
 def train_fm(
     data_path: str = "data/ppo_training_data_WalkerWalk_20250928_212057.pkl",
-    num_epochs: int = 80,  # Match pipeline default
-    batch_size: int = 8192,  # Match pipeline default
-    learning_rate: float = 3e-4,
-    validation_split: float = 0.1,
-    max_samples: int | None = 10000000,  # Match pipeline default (10M)
-    episode_length: int = 1000,  # Episode length for reward-based filtering
-    reward_percentile: float = 0.0,  # Keep episodes above this percentile (0-1)
-    min_episode_reward: float | None = None,  # Minimum episode reward threshold
-    hybrid_sampling: bool = False,  # Enable hybrid sampling strategy
-    high_quality_ratio: float = 0.8,  # Ratio of high-quality samples in hybrid mode
-    high_quality_percentile: float = 0.5,  # Percentile threshold for high-quality episodes
     output_dir: str = "fm_models",
-    seed: int = 42,
-    hidden_size: int = 128,  # Match pipeline default
-    num_layers: int = 4,  # Number of hidden layers
 ) -> None:
     """Train Flow Matching model on collected PPO data.
 
@@ -54,7 +41,7 @@ def train_fm(
         hidden_size: Size of hidden layers (default: 64)
         num_layers: Number of hidden layers (default: 4)
     """
-
+    config = TrainingConfig().to_dict() | EnvConfig().to_dict()
     # Create output directory
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -67,21 +54,21 @@ def train_fm(
     actions = data["actions"]
 
     # Episode-based filtering using rewards
-    if "rewards" in data and (reward_percentile > 0 or min_episode_reward is not None or hybrid_sampling):
+    if "rewards" in data and (config['fm_reward_percentile'] > 0 or config['fm_min_episode_reward'] is not None or config['fm_hybrid_sampling']):
         rewards = data["rewards"]
 
         # Group data by episodes
-        n_episodes = len(states) // episode_length
-        if len(states) % episode_length != 0:
-            trim_to = n_episodes * episode_length
+        n_episodes = len(states) // config['episode_length']
+        if len(states) % config['episode_length'] != 0:
+            trim_to = n_episodes * config['episode_length']
             states = states[:trim_to]
             actions = actions[:trim_to]
             rewards = rewards[:trim_to]
 
         episodes = []
         for i in range(n_episodes):
-            start = i * episode_length
-            end = start + episode_length
+            start = i * config['episode_length']
+            end = start + config['episode_length']
             episode_total_reward = rewards[start:end].sum()
             episodes.append({
                 'idx': i,
@@ -93,11 +80,11 @@ def train_fm(
         episode_rewards = np.array([ep['total_reward'] for ep in episodes])
 
         # Apply filtering or hybrid sampling
-        if hybrid_sampling:
-            hq_threshold = np.percentile(episode_rewards, high_quality_percentile * 100)
+        if config['fm_hybrid_sampling']:
+            hq_threshold = np.percentile(episode_rewards, [config['fm_high_quality_percentile']] * 100)
             high_quality_episodes = [ep for ep in episodes if ep['total_reward'] >= hq_threshold]
 
-            n_high_quality = int(len(episodes) * high_quality_ratio)
+            n_high_quality = int(len(episodes) * config['fm_high_quality_ratio'])
             n_coverage = len(episodes) - n_high_quality
 
             if len(high_quality_episodes) >= n_high_quality:
@@ -112,10 +99,10 @@ def train_fm(
 
             keep_episodes = selected_hq_episodes + selected_coverage_episodes
 
-        elif min_episode_reward is not None:
-            keep_episodes = [ep for ep in episodes if ep['total_reward'] >= min_episode_reward]
+        elif config['fm_min_episode_reward'] is not None:
+            keep_episodes = [ep for ep in episodes if ep['total_reward'] >= config['fm_min_episode_reward']]
         else:
-            threshold = np.percentile(episode_rewards, reward_percentile * 100)
+            threshold = np.percentile(episode_rewards, config['fm_reward_percentile'] * 100)
             keep_episodes = [ep for ep in episodes if ep['total_reward'] >= threshold]
 
         # Rebuild data from kept episodes
@@ -131,8 +118,8 @@ def train_fm(
             rewards = data["rewards"]
 
     # Optionally subsample data for faster training
-    if max_samples is not None and len(states) > max_samples:
-        sample_indices = np.random.choice(len(states), max_samples, replace=False)
+    if config['fm_max_samples'] is not None and len(states) > config['fm_max_samples']:
+        sample_indices = np.random.choice(len(states), config['fm_max_samples'], replace=False)
         states = states[sample_indices]
         actions = actions[sample_indices]
         if "rewards" in data:
@@ -140,7 +127,7 @@ def train_fm(
 
     # Split data
     n_samples = len(states)
-    n_train = int(n_samples * (1 - validation_split))
+    n_train = int(n_samples * (1 - config['fm_validation_split']))
     indices = np.random.permutation(n_samples)
 
     train_states = states[indices[:n_train]]
@@ -153,23 +140,23 @@ def train_fm(
     action_dim = actions.shape[1]
 
     # Build hidden dims from parameters
-    hidden_dims = tuple([hidden_size] * num_layers)
+    hidden_dims = tuple([config['fm_hidden_size']] * config['fm_num_layers'])
 
     config = DecoderFMConfig(
         flow_steps=10,
         timestep_embed_dim=8,  # FPO uses 8
         hidden_dims=hidden_dims,  # Configurable network size
         policy_output_scale=1.0,  # Changed to 1.0 for supervised learning
-        learning_rate=learning_rate,
-        batch_size=batch_size,
-        num_epochs=num_epochs,
-        n_samples_per_action=8,  # FPO's actual default
+        learning_rate=config['fm_learning_rate'],
+        batch_size=config['fm_batch_size'],
+        num_epochs=config['fm_num_epochs'],
+        n_samples_per_action=config['fm_n_samples_per_action'],  # FPO's actual default
         normalize_observations=True,
         sde_sigma=0.0,
         feather_std=0.0,
     )
 
-    prng = jax.random.PRNGKey(seed)
+    prng = jax.random.PRNGKey(config['seed'])
     fm_state = DecoderFMState.init(prng, obs_dim, action_dim, config)
 
     # Update statistics
@@ -177,14 +164,14 @@ def train_fm(
         fm_state.obs_stats = fm_state.obs_stats.update(jnp.array(train_states))
 
     # Training loop
-    n_batches = n_train // batch_size
+    n_batches = n_train // config['fm_batch_size']
     best_val_loss = float('inf')
     train_losses = []
     val_losses = []
     patience_counter = 0
     patience = 20  # Early stopping patience
 
-    for epoch in range(num_epochs):
+    for epoch in range(config['fm_num_epochs']):
         # Training
         epoch_losses = []
         epoch_metrics = []
@@ -192,10 +179,10 @@ def train_fm(
         # Shuffle training data
         perm = np.random.permutation(n_train)
 
-        for batch_idx in tqdm(range(n_batches), desc=f"Epoch {epoch+1}/{num_epochs}"):
+        for batch_idx in tqdm(range(n_batches), desc=f"Epoch {epoch+1}/{config['fm_num_epochs']}"):
             # Get batch
-            start_idx = batch_idx * batch_size
-            end_idx = start_idx + batch_size
+            start_idx = batch_idx * config['fm_batch_size']
+            end_idx = start_idx + config['fm_batch_size']
             batch_indices = perm[start_idx:end_idx]
 
             batch_obs = jnp.array(train_states[batch_indices])
@@ -213,11 +200,11 @@ def train_fm(
 
         # Validation
         val_batch_losses = []
-        n_val_batches = min(50, len(val_states) // batch_size)  # Increased validation coverage
+        n_val_batches = min(50, len(val_states) // config['fm_batch_size'])  # Increased validation coverage
 
         for i in range(n_val_batches):
-            start_idx = i * batch_size
-            end_idx = start_idx + batch_size
+            start_idx = i * config['fm_batch_size']
+            end_idx = start_idx + config['fm_batch_size']
             batch_obs = jnp.array(val_states[start_idx:end_idx])
             batch_actions = jnp.array(val_actions[start_idx:end_idx])
 
@@ -232,11 +219,11 @@ def train_fm(
             prng_val_eps, prng_val_t, prng = jax.random.split(fm_state.prng, 3)
             val_eps = jax.random.normal(
                 prng_val_eps,
-                (batch_size, fm_state.config.n_samples_per_action, action_dim)
+                (config['fm_batch_size'], fm_state.config.n_samples_per_action, action_dim)
             )
             val_t = jax.random.uniform(
                 prng_val_t,
-                (batch_size, fm_state.config.n_samples_per_action, 1)
+                (config['fm_batch_size'], fm_state.config.n_samples_per_action, 1)
             )
 
             # Compute CFM loss
@@ -288,7 +275,7 @@ def train_fm(
         "params": fm_state.params,  # Only save parameters
         "obs_stats": fm_state.obs_stats,
         "config": config,
-        "epoch": num_epochs,
+        "epoch": config['fm_num_epochs'],
         "train_loss": train_losses[-1],
         "val_loss": val_losses[-1],
         "train_history": train_losses,
