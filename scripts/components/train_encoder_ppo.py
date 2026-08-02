@@ -23,13 +23,13 @@ from flow_policy import encoder_ppo
 
 from dataclasses import dataclass, asdict
 
-from envs.robomimic import RobomimicEnv
+from envs.robomimic.RobomimicEnv import RobomimicEnv
 @dataclass
 class PPOConfig:
     # Environment
     action_repeat: int = 1
     episode_length: int = 1000
-    num_envs: int = 2048
+    num_envs: int = 16
 
     # PPO
     batch_size: int = 1024
@@ -102,13 +102,19 @@ def main(
     # Load environment config
     # env_config = registry.get_default_config(env_name)
     # ppo_params = dm_control_suite_params.brax_ppo_config(env_name)
-    ppo_params = PPOConfig()
+    ppo_params = PPOConfig().to_dict()
+    # if learning_rate is not None:
+    #     ppo_params.learning_rate = learning_rate
+    # if clipping_epsilon is not None:
+    #     ppo_params.clipping_epsilon = clipping_epsilon
+    # if num_timesteps is not None:
+    #     ppo_params.num_timesteps = num_timesteps
     if learning_rate is not None:
-        ppo_params.learning_rate = learning_rate
+        ppo_params['learning_rate'] = learning_rate
     if clipping_epsilon is not None:
-        ppo_params.clipping_epsilon = clipping_epsilon
+        ppo_params['clipping_epsilon'] = clipping_epsilon
     if num_timesteps is not None:
-        ppo_params.num_timesteps = num_timesteps
+        ppo_params['num_timesteps'] = num_timesteps
 
     # Create results directory
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -234,7 +240,7 @@ def main(
             eval_outputs = eval_policy(
                 agent,
                 prng=jax.random.fold_in(agent.ppo_z_state.prng, i),
-                num_envs=128,
+                num_envs=16,
                 max_episode_length=config.episode_length,
                 apply_tanh_in_rollout=apply_tanh_in_rollout,
             )

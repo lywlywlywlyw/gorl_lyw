@@ -10,7 +10,7 @@ from jax import numpy as jnp
 from flow_policy.networks import MlpWeights
 
 from . import math_utils, networks, rollouts
-from envs.robomimic.RobomimicEnv import RobomimicEnv
+
 
 @jdc.pytree_dataclass
 class EncoderConfig:
@@ -80,7 +80,7 @@ PpoZTransition = rollouts.TransitionStruct[EncoderActionInfo]
 class EncoderState:
     """PPO-Z agent state that outputs latent z instead of actions."""
 
-    env: jdc.Static[RobomimicEnv]
+    env: jdc.Static[mjp.MjxEnv]
     config: EncoderConfig
     params: ActorCriticParams
     obs_stats: math_utils.RunningStats
@@ -91,7 +91,7 @@ class EncoderState:
 
     @staticmethod
     @jdc.jit
-    def init(prng: Array, env: jdc.Static[RobomimicEnv], config: EncoderConfig) -> EncoderState:
+    def init(prng: Array, env: jdc.Static[mjp.MjxEnv], config: EncoderConfig) -> EncoderState:
         obs_size = env.observation_size
         z_dim = config.z_dim  # Use z_dim instead of action_size
         assert isinstance(obs_size, int)

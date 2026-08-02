@@ -25,13 +25,13 @@ from flow_policy.rollout_encoder import (
     eval_policy_encoder_fm
 )
 from dataclasses import dataclass, asdict
-from envs.robomimic import RobomimicEnv
+from envs.robomimic.RobomimicEnv import RobomimicEnv
 @dataclass
 class PPOConfig:
     # Environment
     action_repeat: int = 1
     episode_length: int = 1000
-    num_envs: int = 2048
+    num_envs: int = 16
 
     # PPO
     batch_size: int = 1024
@@ -49,6 +49,7 @@ class PPOConfig:
     # Normalization & Reward
     normalize_observations: bool = True
     reward_scaling: float = 10.0
+
 
     def to_dict(self):
         return asdict(self)
@@ -103,7 +104,7 @@ def main(
         config = ppo_z_checkpoint["config"]
     else:
         # Create config with z_dim
-        ppo_params = PPOConfig()
+        ppo_params = PPOConfig().to_dict()
         ppo_params['z_dim'] = ppo_z_checkpoint.get("z_dim", 6)
         config = encoder_ppo.EncoderConfig(**ppo_params)
 
@@ -156,7 +157,7 @@ def main(
     eval_outputs = eval_policy_encoder_fm(
         agent,
         prng=jax.random.fold_in(agent.ppo_z_state.prng, 0),
-        num_envs=128,
+        num_envs=16,
         max_episode_length=config.episode_length,
     )
     s_np = {k: onp.array(v) for k, v in eval_outputs.scalar_metrics.items()}

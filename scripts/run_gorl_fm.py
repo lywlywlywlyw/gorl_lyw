@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Annotated
 
 import tyro
-from envs.robomimic import RobomimicEnv
+from envs.robomimic.RobomimicEnv import RobomimicEnv
 
 def run_command(cmd: str, description: str) -> int:
     """Run a shell command and handle errors."""

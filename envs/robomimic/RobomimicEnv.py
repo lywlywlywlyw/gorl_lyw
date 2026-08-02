@@ -1,7 +1,10 @@
 from ..base_env import BaseEnv, ObservationSize, State
-import utils.file_utils as FileUtils
-import utils.obs_utils as ObsUtils
-import utils.env_utils as EnvUtils
+# import utils.file_utils as FileUtils
+# import utils.obs_utils as ObsUtils
+# import utils.env_utils as EnvUtils
+import robomimic.utils.file_utils as FileUtils
+import robomimic.utils.obs_utils as ObsUtils
+import robomimic.utils.env_utils as EnvUtils
 import h5py
 from jax import numpy as jnp
 import jax

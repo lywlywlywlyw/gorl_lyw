@@ -17,7 +17,7 @@ from jax import numpy as jnp
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from flow_policy.decoder_fm import DecoderFMConfig, DecoderFMState
-from envs.robomimic import RobomimicEnv
+from envs.robomimic.RobomimicEnv import RobomimicEnv
 
 def main(
     env_name: str = "Lift",
