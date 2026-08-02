@@ -121,6 +121,7 @@ def main() -> None:
 
         encoder_exp_name = f"pipeline_{run_id}_stage{stage}"
         stage_timesteps = timesteps_list[stage]
+        stage_step_offset = sum(timesteps_list[:stage])
 
         # Adaptive parameters
         if stage == 0:
@@ -136,10 +137,14 @@ def main() -> None:
             stage_z_regularization = config['z_regularization'] if config['z_regularization'] is not None else 0.001
 
         cmd = " ".join([
-            f"python scripts/components/train_encoder_ppo.py",
+            f"MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python scripts/components/train_encoder_ppo.py",
             f"--decoder_model_path {fm_checkpoint}",
             f"--exp_name {encoder_exp_name}",
             f"--num_timesteps {stage_timesteps}",
+            f"--stage {stage}",
+            f"--global_step_offset {stage_step_offset}",
+            f"--wandb_run_id {run_id}",
+            f"--wandb_run_name {run_id}",
         ])
 
         run_command(cmd, f"Stage {stage}: Encoder update")

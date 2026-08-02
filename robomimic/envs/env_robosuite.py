@@ -100,10 +100,14 @@ class EnvRobosuite(EB.EnvBase):
             if kwargs["has_offscreen_renderer"]:
                 # ensure that we select the correct GPU device for rendering by testing for EGL rendering
                 # NOTE: this package should be installed from this link (https://github.com/StanfordVL/egl_probe)
-                import egl_probe
-                valid_gpu_devices = egl_probe.get_available_devices()
-                if len(valid_gpu_devices) > 0:
-                    kwargs["render_gpu_device_id"] = valid_gpu_devices[0]
+                try:
+                    import egl_probe
+                except ImportError:
+                    egl_probe = None
+                if egl_probe is not None:
+                    valid_gpu_devices = egl_probe.get_available_devices()
+                    if len(valid_gpu_devices) > 0:
+                        kwargs["render_gpu_device_id"] = valid_gpu_devices[0]
         else:
             # make sure gripper visualization is turned off (we almost always want this for learning)
             kwargs["gripper_visualization"] = False

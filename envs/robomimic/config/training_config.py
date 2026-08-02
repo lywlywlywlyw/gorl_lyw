@@ -20,6 +20,19 @@ class TrainingConfig:
     # decoder training config
     decoder_type: str = "fm"
 
+    # Weights & Biases logging
+    wandb_enabled: bool = True
+    wandb_project: str = "GoRL-robomimic"
+    wandb_entity: str | None = None
+    wandb_mode: str = "online"
+    wandb_group: str | None = None
+    wandb_tags: tuple[str, ...] = ("gorl", "fm", "robomimic")
+    wandb_video_interval_evals: int = 1
+    wandb_video_fps: int = 20
+    wandb_video_width: int = 256
+    wandb_video_height: int = 256
+    wandb_video_frame_skip: int = 2
+
     def to_dict(self):
         if self.encoder_type == "ppo":
             encoder_config = PPOConfig().to_dict()

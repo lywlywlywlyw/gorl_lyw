@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 import jax
 import jax_dataclasses as jdc
 import numpy as onp
+import cv2
 import tyro
 from jax import numpy as jnp
 # from mujoco_playground import dm_control_suite, locomotion, registry
@@ -25,10 +26,72 @@ from envs.robomimic.RobomimicEnv import RobomimicEnv
 from envs.robomimic.config.training_config import TrainingConfig
 from envs.robomimic.config.env_config import EnvConfig
 
+def _record_eval_video(
+    agent,
+    dataset_path: str,
+    seed: int,
+    episode_length: int,
+    width: int,
+    height: int,
+    frame_skip: int,
+    fps: int,
+    apply_tanh_in_rollout: bool,
+    output_path: Path,
+):
+    """Record one deterministic offscreen evaluation episode."""
+    video_env = RobomimicEnv(dataset_path=dataset_path, render_offscreen=True)
+    frames = []
+    prng = jax.random.key(seed)
+    state = video_env.reset(prng)
+    try:
+        for step in range(episode_length):
+            if step % max(1, frame_skip) == 0:
+                frame = video_env.render(
+                    mode="rgb_array", height=height, width=width
+                )
+                frames.append(onp.asarray(frame, dtype=onp.uint8))
+            prng, sample_prng = jax.random.split(prng)
+            obs = jnp.expand_dims(state.obs, axis=0)
+            z, _ = agent.sample_z(obs, sample_prng, deterministic=True)
+            action = agent.map_z_to_action(obs, z)[0]
+            if apply_tanh_in_rollout:
+                action = jnp.tanh(action)
+            state = video_env.step(state, action)
+            if bool(onp.asarray(state.done)):
+                break
+        frame = video_env.render(mode="rgb_array", height=height, width=width)
+        frames.append(onp.asarray(frame, dtype=onp.uint8))
+    finally:
+        close = getattr(video_env.env, "close", None)
+        if callable(close):
+            close()
+    if not frames:
+        raise RuntimeError("Evaluation video contained no frames.")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(
+        str(output_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        max(1, fps),
+        (width, height),
+    )
+    if not writer.isOpened():
+        raise RuntimeError("OpenCV could not initialize the MP4 video writer.")
+    try:
+        for frame in frames:
+            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
+    return output_path
+
+
 def main(
     exp_name: str,
     decoder_model_path: str | None = None,
     num_timesteps: int | None = None,
+    stage: int = 0,
+    global_step_offset: int = 0,
+    wandb_run_id: str | None = None,
+    wandb_run_name: str | None = None,
 ) -> None:
     """Train encoder with generative decoder (FM or Diffusion)."""
     config = TrainingConfig().to_dict() | EnvConfig().to_dict()
@@ -67,6 +130,32 @@ def main(
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     results_dir = Path("results") / f"encoder_{config['decoder_type']}_{config['env_name']}_{exp_name}_{timestamp}"
     results_dir.mkdir(parents=True, exist_ok=True)
+
+    wandb_run = None
+    wandb = None
+    if config["wandb_enabled"]:
+        try:
+            import wandb as wandb_module
+        except ImportError as error:
+            raise RuntimeError(
+                "wandb is required when wandb_enabled=True."
+            ) from error
+        wandb = wandb_module
+        wandb_run = wandb.init(
+            project=config["wandb_project"],
+            entity=config["wandb_entity"],
+            name=wandb_run_name or exp_name,
+            id=wandb_run_id,
+            resume="allow" if wandb_run_id else None,
+            group=config["wandb_group"] or wandb_run_id,
+            tags=list(config["wandb_tags"]),
+            mode=config["wandb_mode"],
+            config={**config, "pipeline_run_id": wandb_run_id},
+        )
+        wandb_run.define_metric("pipeline/env_step")
+        wandb_run.define_metric("train/*", step_metric="pipeline/env_step")
+        wandb_run.define_metric("eval/*", step_metric="pipeline/env_step")
+        wandb_run.define_metric("video/*", step_metric="pipeline/env_step")
 
     # Load decoder model
     if decoder_model_path is None:
@@ -200,6 +289,7 @@ def main(
     best_reward = -float('inf')
     stop_training = False
     last_iteration = -1
+    eval_count = 0
 
     for i in tqdm(range(outer_iters)):
         last_iteration = i
@@ -228,6 +318,44 @@ def main(
             )
 
             eval_outputs.log_to_file(results_dir, step=i)
+
+            global_env_step = global_step_offset + i * steps_per_iter
+            if wandb_run is not None:
+                eval_log = {
+                    "pipeline/env_step": global_env_step,
+                    "pipeline/stage": stage,
+                    "eval/reward_mean": float(s_np["reward_mean"]),
+                    "eval/reward_min": float(s_np["reward_min"]),
+                    "eval/reward_max": float(s_np["reward_max"]),
+                    "eval/reward_std": float(s_np["reward_std"]),
+                    "eval/steps_mean": float(s_np["steps_mean"]),
+                    "eval/steps_min": float(s_np["steps_min"]),
+                    "eval/steps_max": float(s_np["steps_max"]),
+                    "eval/steps_std": float(s_np["steps_std"]),
+                }
+                video_interval = config["wandb_video_interval_evals"]
+                if video_interval > 0 and eval_count % video_interval == 0:
+                    try:
+                        video = _record_eval_video(
+                            agent=agent,
+                            dataset_path=config["dataset_path"],
+                            seed=config["seed"] + stage * 10000 + i,
+                            episode_length=config["episode_length"],
+                            width=config["wandb_video_width"],
+                            height=config["wandb_video_height"],
+                            frame_skip=config["wandb_video_frame_skip"],
+                            fps=config["wandb_video_fps"],
+                            apply_tanh_in_rollout=config["ppo_apply_tanh_in_rollout"],
+                            output_path=(
+                                results_dir / "videos" /
+                                f"stage_{stage}_eval_{eval_count:03d}.mp4"
+                            ),
+                        )
+                        eval_log["video/evaluation"] = wandb.Video(str(video))
+                    except Exception as error:
+                        print(f"WARNING: Failed to record evaluation video: {error}")
+                wandb_run.log(eval_log)
+            eval_count += 1
 
             # Save best model
             if current_reward >= best_reward - 1e-6:
@@ -338,7 +466,26 @@ def main(
             for k, v in metrics.items():
                 f.write(f"  {k}: {float(onp.mean(v)):.6f}\n")
 
-        times.append(time.time())
+        iteration_end_time = time.time()
+        if wandb_run is not None:
+            iteration_seconds = iteration_end_time - times[-1]
+            train_log = {
+                "pipeline/env_step": global_step_offset + (i + 1) * steps_per_iter,
+                "pipeline/stage": stage,
+                "train/iteration": i,
+                "train/mean_reward": mean_reward,
+                "train/z_mean": z_mean,
+                "train/z_std": z_std,
+                "train/z_min": z_min,
+                "train/z_max": z_max,
+                "train/z_abs_max": z_abs_max,
+                "train/iteration_seconds": iteration_seconds,
+                "train/env_steps_per_second": steps_per_iter / max(iteration_seconds, 1e-9),
+            }
+            for key, value in metrics.items():
+                train_log["train/ppo_" + key] = float(onp.mean(value))
+            wandb_run.log(train_log)
+        times.append(iteration_end_time)
 
     # Final summary
     print("First train step time:", times[1] - times[0])
@@ -365,6 +512,15 @@ def main(
     final_checkpoint_file = results_dir / "final_checkpoint.pkl"
     with open(final_checkpoint_file, "wb") as f:
         pickle.dump(final_checkpoint, f)
+
+    if wandb_run is not None:
+        wandb_run.log({
+            "pipeline/env_step": global_step_offset + max(last_iteration + 1, 0) * steps_per_iter,
+            "pipeline/stage": stage,
+            "stage/best_reward": best_reward,
+            "stage/completed": 1,
+        })
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

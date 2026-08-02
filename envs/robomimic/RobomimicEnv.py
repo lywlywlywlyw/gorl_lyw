@@ -10,8 +10,9 @@ from jax import numpy as jnp
 import jax
 import numpy as np
 class RobomimicEnv(BaseEnv):
-    def __init__(self, dataset_path: str):
+    def __init__(self, dataset_path: str, render_offscreen: bool = False):
         self.dataset_path = dataset_path
+        self.render_offscreen = render_offscreen
         self.obs_keys = self.load_dataset()
         self.env = self.load_env()
         self.shape_meta = FileUtils.get_shape_metadata_from_dataset(
@@ -31,7 +32,7 @@ class RobomimicEnv(BaseEnv):
         env = EnvUtils.create_env_from_metadata(
             env_meta=env_meta,
             render=False,
-            render_offscreen=False,
+            render_offscreen=self.render_offscreen,
             use_image_obs=False,
             use_depth_obs=False,
         )
