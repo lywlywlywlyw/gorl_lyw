@@ -10,15 +10,15 @@ class TrainingConfig:
     seed: int = 1
     data_collection_iterations: int = 20
     z_regularization: float | None = None
-    max_grad_norm: float = 0.5,
+    max_grad_norm: float = 0.5
 
     # encoder training config
     encoder_num_timesteps: Annotated[int, tyro.conf.arg(help="Default encoder training timesteps per stage")] = 2400000#100000000
     encoder_timesteps_per_stage: Annotated[str | None, tyro.conf.arg(help="Comma-separated timesteps for each stage (e.g., '60000000,60000000,30000000,30000000')")] =  "4800000,4800000,2400000,2400000"#"60000000,60000000,30000000,30000000"
-    encoder_type = "ppo"
+    encoder_type: str = "ppo"
 
     # decoder training config
-    decoder_type = "fm"
+    decoder_type: str = "fm"
 
     def to_dict(self):
         if self.encoder_type == "ppo":

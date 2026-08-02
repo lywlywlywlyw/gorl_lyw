@@ -25,7 +25,11 @@ from envs.robomimic.RobomimicEnv import RobomimicEnv
 from envs.robomimic.config.training_config import TrainingConfig
 from envs.robomimic.config.env_config import EnvConfig
 
-def main(exp_name, decoder_model_path, num_timesteps: int | None = None,) -> None:
+def main(
+    exp_name: str,
+    decoder_model_path: str | None = None,
+    num_timesteps: int | None = None,
+) -> None:
     """Train encoder with generative decoder (FM or Diffusion)."""
     config = TrainingConfig().to_dict() | EnvConfig().to_dict()
     # Dynamic imports based on decoder type
@@ -95,7 +99,11 @@ def main(exp_name, decoder_model_path, num_timesteps: int | None = None,) -> Non
         num_envs=config['num_envs'],
         num_evals=config['ppo_num_evals'],
         num_minibatches=config['ppo_num_minibatches'],
-        num_timesteps=num_timesteps,
+        num_timesteps=(
+            config['ppo_num_timesteps']
+            if num_timesteps is None
+            else num_timesteps
+        ),
         num_updates_per_batch=config['ppo_num_updates_per_batch'],
         reward_scaling=config['ppo_reward_scaling'],
         unroll_length=config['ppo_unroll_length'],
