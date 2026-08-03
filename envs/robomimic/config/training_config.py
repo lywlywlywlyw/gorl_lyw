@@ -8,13 +8,13 @@ class TrainingConfig:
     # training overview config
     num_stages: Annotated[int, tyro.conf.arg(help="Number of training stages")] = 4
     seed: int = 1
-    data_collection_iterations: int = 20
+    data_collection_iterations: int = 8#20
     z_regularization: float | None = None
     max_grad_norm: float = 0.5
 
     # encoder training config
     encoder_num_timesteps: Annotated[int, tyro.conf.arg(help="Default encoder training timesteps per stage")] = 2400000#100000000
-    encoder_timesteps_per_stage: Annotated[str | None, tyro.conf.arg(help="Comma-separated timesteps for each stage (e.g., '60000000,60000000,30000000,30000000')")] =  "4800000,4800000,2400000,2400000"#"60000000,60000000,30000000,30000000"
+    encoder_timesteps_per_stage: Annotated[str | None, tyro.conf.arg(help="Comma-separated timesteps for each stage (e.g., '60000000,60000000,30000000,30000000')")] =  ",".join(["400000"] * 48)#"4800000,4800000,2400000,2400000"#"60000000,60000000,30000000,30000000"
     encoder_type: str = "ppo"
 
     # decoder training config
