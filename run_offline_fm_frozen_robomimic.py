@@ -25,11 +25,9 @@ Example:
 from __future__ import annotations
 
 import datetime
-import ast
 import json
 import pickle
 import sys
-import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -45,7 +43,9 @@ from tqdm import trange
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from d4rl_envs.mjx_envs import make_d4rl_env, normalize_task
+from envs.robomimic.RobomimicEnv import RobomimicEnv
+from envs.robomimic.config.env_config import EnvConfig
+from envs.robomimic.config.training_config import TrainingConfig
 from flow_policy import encoder_ppo, math_utils, networks
 from flow_policy.decoder_fm import DecoderFMConfig, DecoderFMState
 
@@ -53,49 +53,41 @@ from flow_policy.decoder_fm import DecoderFMConfig, DecoderFMState
 PyTree = Any
 
 
-@dataclass
-class FrozenOfflineConfig:
-    """Configuration for offline frozen-FM training."""
+class ConfigView(dict[str, Any]):
+    """Dictionary config with attribute access for the training implementation."""
 
-    env_name: str | None = None
-    data_path: str | None = None
-    d4rl_dataset: str | None = "walker2d-medium-expert-v2"
-    dataset_dir: str = "datasets/d4rl"
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError as error:
+            raise AttributeError(name) from error
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        self[name] = value
+
+
+@dataclass
+class OfflineIQLConfig:
+    """Parameters specific to frozen-decoder offline IQL training."""
+
     output_dir: str = (
-        "results/offline_fm_frozen_new_"
+        "results/offline_fm_frozen_robomimic_"
         + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     )
-    seed: int = 0
-    max_samples: int | None = None
-
-    # Legacy buffers containing only (s, a, r).
-    infer_transitions: bool = False
-    episode_length: int = 1000
 
     # Decoder: train once to convergence, then freeze permanently.
-    decoder_learning_rate: float = 3e-4
-    decoder_hidden_size: int = 64
-    decoder_num_layers: int = 4
-    decoder_batch_size: int = 8192
-    decoder_max_epochs: int = 200
     decoder_min_epochs: int = 20
     decoder_patience: int = 20
-    decoder_validation_fraction: float = 0.05
     decoder_min_delta: float = 1e-4
     decoder_eval_batches: int = 32
-    flow_steps: int = 10
     latent_inverse_steps: int = 10
-    n_fm_samples_per_action: int = 8
 
     # IQL encoder. The policy and value layouts are fixed by EncoderState.init.
     encoder_iql_steps: int = 500_000
-    batch_size: int = 256
-    discount: float = 0.99
     expectile: float = 0.8
     temperature: float = 0.1
     max_adv_weight: float = 100.0
     target_update_rate: float = 0.005
-    actor_learning_rate: float = 3e-4
     critic_learning_rate: float = 3e-4
     value_learning_rate: float = 3e-4
     q_hidden_size: int = 256
@@ -104,18 +96,33 @@ class FrozenOfflineConfig:
     comparison_samples: int = 4096
     checkpoint_interval: int = 100_000
 
-    # These become part of the exact online EncoderConfig saved in checkpoint.
-    online_num_timesteps: int = 100_000_000
-    online_clipping_epsilon: float = 0.15
-    online_z_regularization: float = 0.0005
-    online_max_grad_norm: float = 0.5
-    online_use_tanh_jacobian_for_z: bool = False
-
-    wandb_project: str = "offline-fm"
-    wandb_entity: str | None = None
-    wandb_group: str | None = "experiment-1"
     wandb_name: str | None = "frozen-seed-0_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    wandb_mode: str = "disabled"
+
+
+def build_config() -> ConfigView:
+    """Use the same shared config composition as ``scripts/run_gorl_fm.py``."""
+    config = ConfigView(
+        TrainingConfig().to_dict()
+        | EnvConfig().to_dict()
+        | asdict(OfflineIQLConfig())
+    )
+    # Internal aliases keep the offline algorithm readable while sourcing all
+    # overlapping environment, PPO, FM, and W&B values from shared configs.
+    config.update(
+        max_samples=config["fm_max_samples"],
+        decoder_learning_rate=config["fm_learning_rate"],
+        decoder_hidden_size=config["fm_hidden_size"],
+        decoder_num_layers=config["fm_num_layers"],
+        decoder_batch_size=config["fm_batch_size"],
+        decoder_max_epochs=config["fm_num_epochs"],
+        decoder_validation_fraction=config["fm_validation_split"],
+        flow_steps=config["fm_flow_steps"],
+        n_fm_samples_per_action=config["fm_n_samples_per_action"],
+        batch_size=config["ppo_batch_size"],
+        discount=config["ppo_discounting"],
+        actor_learning_rate=config["ppo_learning_rate"],
+    )
+    return config
 
 
 @dataclass
@@ -131,9 +138,9 @@ class ReplayBuffer:
 
 
 class WandbLogger:
-    def __init__(self, config: FrozenOfflineConfig):
+    def __init__(self, config: ConfigView):
         self.run = None
-        if config.wandb_mode == "disabled":
+        if not config.wandb_enabled or config.wandb_mode == "disabled":
             return
         try:
             import wandb
@@ -145,7 +152,7 @@ class WandbLogger:
             group=config.wandb_group,
             name=config.wandb_name,
             mode=config.wandb_mode,
-            config={**asdict(config), "method": "frozen_decoder"},
+            config={**dict(config), "method": "frozen_decoder"},
             tags=["frozen_decoder", "online_compatible"],
         )
 

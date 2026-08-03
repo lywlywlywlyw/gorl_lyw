@@ -71,7 +71,7 @@ def main(
     z_dim = env.action_size 
     # Get config from checkpoint or create new one
     if "config" in ppo_z_checkpoint:
-        config = ppo_z_checkpoint["config"]
+        encoder_config = ppo_z_checkpoint["config"]
     else:
         # Create config with z_dim
         encoder_config = encoder_ppo.EncoderConfig(action_repeat=config['action_repeat'],
@@ -155,13 +155,13 @@ def main(
     all_states = []
     all_actions = []
     all_rewards = []
-
+    config['ppo_iterations_per_env'] = (config['ppo_num_minibatches'] * config['ppo_batch_size'] * config['ppo_unroll_length']) // config['num_envs']
     for i in tqdm(range(config['data_collection_iterations']), desc="Collecting"):
         # Custom rollout that saves actual actions (not z values)
         rollout_state, states, actions, rewards = rollout_state.rollout_with_actions(
             agent,
             episode_length=config['episode_length'],
-            iterations_per_env=config['iterations_per_env'],
+            iterations_per_env=config['ppo_iterations_per_env'],
         )
 
         all_states.append(onp.array(states))

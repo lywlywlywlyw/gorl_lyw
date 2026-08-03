@@ -142,7 +142,7 @@ def train_fm(
     # Build hidden dims from parameters
     hidden_dims = tuple([config['fm_hidden_size']] * config['fm_num_layers'])
 
-    config = DecoderFMConfig(
+    decoder_config = DecoderFMConfig(
         flow_steps=10,
         timestep_embed_dim=8,  # FPO uses 8
         hidden_dims=hidden_dims,  # Configurable network size
@@ -157,7 +157,7 @@ def train_fm(
     )
 
     prng = jax.random.PRNGKey(config['seed'])
-    fm_state = DecoderFMState.init(prng, obs_dim, action_dim, config)
+    fm_state = DecoderFMState.init(prng, obs_dim, action_dim, decoder_config)
 
     # Update statistics
     with jdc.copy_and_mutate(fm_state) as fm_state:
@@ -252,7 +252,7 @@ def train_fm(
             checkpoint = {
                 "params": fm_state.params,  # Only save parameters
                 "obs_stats": fm_state.obs_stats,
-                "config": config,
+                "config": decoder_config,
                 "epoch": epoch + 1,
                 "train_loss": train_loss,
                 "val_loss": val_loss,
@@ -274,7 +274,7 @@ def train_fm(
     final_checkpoint = {
         "params": fm_state.params,  # Only save parameters
         "obs_stats": fm_state.obs_stats,
-        "config": config,
+        "config": decoder_config,
         "epoch": config['fm_num_epochs'],
         "train_loss": train_losses[-1],
         "val_loss": val_losses[-1],

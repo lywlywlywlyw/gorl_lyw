@@ -10,5 +10,5 @@ MUJOCO_GL=egl \
 PYOPENGL_PLATFORM=egl \
 CUDA_VISIBLE_DEVICES=1 \
 PYTHONPATH=/root/GoRL:/root/GoRL/envs/robomimic \
-python -u scripts/run_gorl_fm.py  
+python -u scripts/run_gorl_fm.py \
 > logs/gorl_origin-$(date +%Y%m%d_%H%M%S).log 2>&1 < /dev/null &
