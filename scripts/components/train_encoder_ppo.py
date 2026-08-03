@@ -88,6 +88,9 @@ def main(
     exp_name: str,
     decoder_model_path: str | None = None,
     num_timesteps: int | None = None,
+    clipping_epsilon: float | None = None,
+    z_regularization: float | None = None,
+    max_grad_norm: float | None = None,
     stage: int = 0,
     global_step_offset: int = 0,
     wandb_run_id: str | None = None,
@@ -177,6 +180,25 @@ def main(
 
     z_dim = env.action_size
 
+    # Resolve stage-specific PPO overrides. Clipping must be numeric in the loss.
+    resolved_clipping_epsilon = (
+        config["ppo_clipping_epsilon"]
+        if clipping_epsilon is None
+        else clipping_epsilon
+    )
+    if resolved_clipping_epsilon is None:
+        resolved_clipping_epsilon = 0.15
+    resolved_z_regularization = (
+        config["ppo_z_regularization"]
+        if z_regularization is None
+        else z_regularization
+    )
+    resolved_max_grad_norm = (
+        config["ppo_max_grad_norm"]
+        if max_grad_norm is None
+        else max_grad_norm
+    )
+
     # Create encoder config
     encoder_config = encoder_ppo.EncoderConfig(action_repeat=config['action_repeat'],
         batch_size=config['ppo_batch_size'],
@@ -199,10 +221,10 @@ def main(
         z_dim=z_dim,
         gae_lambda=config['ppo_gae_lambda'],
         normalize_advantage=config['ppo_normalize_advantage'],
-        clipping_epsilon=config['ppo_clipping_epsilon'],
+        clipping_epsilon=resolved_clipping_epsilon,
         value_loss_coeff=config['ppo_value_loss_coeff'],
-        z_regularization=config['ppo_z_regularization'],
-        max_grad_norm=config['ppo_max_grad_norm'],
+        z_regularization=resolved_z_regularization,
+        max_grad_norm=resolved_max_grad_norm,
         use_tanh_jacobian_for_z=config['ppo_use_tanh_jacobian_for_z'],)
 
     # Initialize encoder state
