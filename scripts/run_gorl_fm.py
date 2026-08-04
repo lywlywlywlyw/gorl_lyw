@@ -126,6 +126,8 @@ def _validate_offline_checkpoint(
 def main(
     use_offline_checkpoint: bool = False,
     offline_checkpoint_path: str | None = None,
+    stage_init_before_training: bool = True,
+
 ) -> None:
     """Run complete GoRL training pipeline (FM decoder).
 
@@ -324,6 +326,7 @@ def main(
             f"--stage {stage}",
             f"--global_step_offset {stage_step_offset}",
             f"--metrics_file {encoder_metrics_file}",
+            f"--stage_init_before_training {stage_init_before_training}",
         ])
 
         if wandb_run is not None:
@@ -399,6 +402,7 @@ def main(
             f"--stage {stage}",
             f"--global_epoch_offset {stage * config['fm_num_epochs']}",
             f"--metrics_file {decoder_metrics_file}",
+            f"--stage_init_before_training {stage_init_before_training}"
         ]
 
         cmd = " ".join(fm_cmd_parts)

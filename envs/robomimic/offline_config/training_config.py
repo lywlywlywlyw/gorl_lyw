@@ -28,14 +28,14 @@ class TrainingConfig:
     online_use_tanh_jacobian_for_z: bool = False
 
     # Weights & Biases logging
-    wandb_enabled: bool = False
+    wandb_enabled: bool = True
     wandb_project: str = "offline-fm"
     wandb_entity: str | None = None
-    wandb_group: str | None = "experiment-1"
+    wandb_group: str | None = None
     wandb_name: str | None = (
         "frozen-seed-0_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     )
-    wandb_mode: str = "disabled"
+    wandb_mode: str = "online"
 
     def to_dict(self) -> dict:
         return (

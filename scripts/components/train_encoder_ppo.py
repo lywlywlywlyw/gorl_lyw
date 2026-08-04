@@ -97,6 +97,7 @@ def main(
     wandb_run_id: str | None = None,
     wandb_run_name: str | None = None,
     metrics_file: str | None = None,
+    stage_init_before_training: bool = True,
 ) -> None:
     """Train encoder with generative decoder (FM or Diffusion)."""
     config = TrainingConfig().to_dict() | EnvConfig().to_dict()
@@ -175,6 +176,24 @@ def main(
 
     with open(decoder_model_path, "rb") as f:
         decoder_checkpoint = pickle.load(f)
+    if not isinstance(decoder_checkpoint, dict):
+        raise ValueError(
+            f"Decoder checkpoint must contain a dictionary: {decoder_model_path}"
+        )
+    required_decoder_fields = {"params", "obs_stats", "config", "obs_dim", "action_dim"}
+    missing_decoder_fields = sorted(
+        required_decoder_fields.difference(decoder_checkpoint)
+    )
+    if missing_decoder_fields:
+        raise ValueError(
+            f"Decoder checkpoint {decoder_model_path} is missing required fields: "
+            f"{missing_decoder_fields}"
+        )
+    if decoder_checkpoint.get("decoder_type", config['decoder_type']) != config['decoder_type']:
+        raise ValueError(
+            f"Checkpoint decoder_type={decoder_checkpoint.get('decoder_type')!r} "
+            f"does not match configured decoder_type={config['decoder_type']!r}."
+        )
 
     # Initialize environment
     # env = registry.load(env_name, config=env_config)
@@ -235,6 +254,35 @@ def main(
         env=env,
         config=encoder_config
     )
+
+    if not stage_init_before_training:
+        required_fields = {"ppo_z_params", "ppo_z_obs_stats"}
+        missing_fields = sorted(required_fields.difference(decoder_checkpoint))
+        if missing_fields:
+            raise ValueError(
+                "stage_init_before_training=False requires an offline or previous "
+                "stage checkpoint containing the encoder state; missing fields in "
+                f"{decoder_model_path}: {missing_fields}"
+            )
+        checkpoint_z_dim = decoder_checkpoint.get("z_dim")
+        if checkpoint_z_dim is not None and int(checkpoint_z_dim) != z_dim:
+            raise ValueError(
+                f"Resume checkpoint z_dim={checkpoint_z_dim} does not match "
+                f"environment z_dim={z_dim}."
+            )
+        with jdc.copy_and_mutate(encoder_state) as encoder_state:
+            encoder_state.params = decoder_checkpoint["ppo_z_params"]
+            encoder_state.obs_stats = decoder_checkpoint["ppo_z_obs_stats"]
+            # New online checkpoints contain the complete train state. Offline
+            # and older checkpoints remain supported by restarting only the
+            # optimizer/PRNG state while retaining learned params and statistics.
+            if "ppo_z_opt_state" in decoder_checkpoint:
+                encoder_state.opt_state = decoder_checkpoint["ppo_z_opt_state"]
+            if "ppo_z_prng" in decoder_checkpoint:
+                encoder_state.prng = decoder_checkpoint["ppo_z_prng"]
+            if "ppo_z_steps" in decoder_checkpoint:
+                encoder_state.steps = decoder_checkpoint["ppo_z_steps"]
+        print(f"Continuing encoder training from: {decoder_model_path}")
 
     # Create decoder state from checkpoint
     decoder_prng = jax.random.PRNGKey(config['seed'] + 1000)
@@ -399,6 +447,9 @@ def main(
                 checkpoint = {
                     "ppo_z_params": agent.ppo_z_state.params,
                     "ppo_z_obs_stats": agent.ppo_z_state.obs_stats,
+                    "ppo_z_opt_state": agent.ppo_z_state.opt_state,
+                    "ppo_z_prng": agent.ppo_z_state.prng,
+                    "ppo_z_steps": agent.ppo_z_state.steps,
                     "config": encoder_config,
                     "env_name": config['env_name'],
                     "decoder_type": config['decoder_type'],
@@ -529,6 +580,9 @@ def main(
     final_checkpoint = {
         "ppo_z_params": agent.ppo_z_state.params,
         "ppo_z_obs_stats": agent.ppo_z_state.obs_stats,
+        "ppo_z_opt_state": agent.ppo_z_state.opt_state,
+        "ppo_z_prng": agent.ppo_z_state.prng,
+        "ppo_z_steps": agent.ppo_z_state.steps,
         "config": encoder_config,
         "env_name": config['env_name'],
         "decoder_type": config['decoder_type'],

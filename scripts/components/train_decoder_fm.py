@@ -26,6 +26,7 @@ def train_fm(
     wandb_run_id: str | None = None,
     wandb_run_name: str | None = None,
     metrics_file: str | None = None,
+    stage_init_before_training: bool = True,
 ) -> None:
     """Train Flow Matching model on collected PPO data.
 
@@ -80,6 +81,32 @@ def train_fm(
     # Load data
     with open(data_path, "rb") as f:
         data = pickle.load(f)
+
+    resume_checkpoint = None
+    resume_checkpoint_path = None
+    if not stage_init_before_training:
+        resume_checkpoint_path = data.get("fm_model")
+        if not resume_checkpoint_path:
+            raise ValueError(
+                "stage_init_before_training=False requires collected data with "
+                "an 'fm_model' checkpoint path. This mode must start from an "
+                "offline checkpoint and continue from the decoder used to collect data."
+            )
+        resume_checkpoint_path = Path(resume_checkpoint_path).expanduser()
+        if not resume_checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"Decoder resume checkpoint not found: {resume_checkpoint_path}"
+            )
+        with resume_checkpoint_path.open("rb") as f:
+            resume_checkpoint = pickle.load(f)
+        required_fields = {"params", "obs_stats", "config", "obs_dim", "action_dim"}
+        missing_fields = sorted(required_fields.difference(resume_checkpoint))
+        if missing_fields:
+            raise ValueError(
+                f"Decoder resume checkpoint {resume_checkpoint_path} is missing "
+                f"required fields: {missing_fields}"
+            )
+        print(f"Continuing decoder training from: {resume_checkpoint_path}")
 
     states = data["states"]
     actions = data["actions"]
@@ -173,26 +200,88 @@ def train_fm(
     # Build hidden dims from parameters
     hidden_dims = tuple([config['fm_hidden_size']] * config['fm_num_layers'])
 
-    decoder_config = DecoderFMConfig(
-        flow_steps=10,
-        timestep_embed_dim=8,  # FPO uses 8
-        hidden_dims=hidden_dims,  # Configurable network size
-        policy_output_scale=1.0,  # Changed to 1.0 for supervised learning
-        learning_rate=config['fm_learning_rate'],
-        batch_size=config['fm_batch_size'],
-        num_epochs=config['fm_num_epochs'],
-        n_samples_per_action=config['fm_n_samples_per_action'],  # FPO's actual default
-        normalize_observations=True,
-        sde_sigma=0.0,
-        feather_std=0.0,
-    )
+    if resume_checkpoint is None:
+        decoder_config = DecoderFMConfig(
+            flow_steps=10,
+            timestep_embed_dim=8,  # FPO uses 8
+            hidden_dims=hidden_dims,  # Configurable network size
+            policy_output_scale=1.0,  # Changed to 1.0 for supervised learning
+            learning_rate=config['fm_learning_rate'],
+            batch_size=config['fm_batch_size'],
+            num_epochs=config['fm_num_epochs'],
+            n_samples_per_action=config['fm_n_samples_per_action'],  # FPO's actual default
+            normalize_observations=True,
+            sde_sigma=0.0,
+            feather_std=0.0,
+        )
+    else:
+        if int(resume_checkpoint["obs_dim"]) != obs_dim:
+            raise ValueError(
+                f"Resume checkpoint obs_dim={resume_checkpoint['obs_dim']} does not "
+                f"match collected data obs_dim={obs_dim}."
+            )
+        if int(resume_checkpoint["action_dim"]) != action_dim:
+            raise ValueError(
+                f"Resume checkpoint action_dim={resume_checkpoint['action_dim']} does "
+                f"not match collected data action_dim={action_dim}."
+            )
+        decoder_config = resume_checkpoint["config"]
+        if not isinstance(decoder_config, DecoderFMConfig):
+            raise TypeError(
+                f"Resume checkpoint {resume_checkpoint_path} has an invalid "
+                f"decoder config type: {type(decoder_config).__name__}."
+            )
 
     prng = jax.random.PRNGKey(config['seed'])
     fm_state = DecoderFMState.init(prng, obs_dim, action_dim, decoder_config)
 
-    # Update statistics
+    # Restore the previous train state when requested. Older offline checkpoints
+    # only contain model parameters and observation statistics, so optimizer,
+    # PRNG, and step restoration is optional for backward compatibility.
     with jdc.copy_and_mutate(fm_state) as fm_state:
+        if resume_checkpoint is not None:
+            fm_state.params = resume_checkpoint["params"]
+            fm_state.obs_stats = resume_checkpoint["obs_stats"]
+            if "fm_opt_state" in resume_checkpoint:
+                fm_state.opt_state = resume_checkpoint["fm_opt_state"]
+            if "fm_prng" in resume_checkpoint:
+                fm_state.prng = resume_checkpoint["fm_prng"]
+            if "fm_steps" in resume_checkpoint:
+                fm_state.steps = resume_checkpoint["fm_steps"]
         fm_state.obs_stats = fm_state.obs_stats.update(jnp.array(train_states))
+
+    # Preserve the encoder train state in decoder checkpoints. The pipeline only
+    # passes the latest decoder checkpoint into the next encoder stage, so these
+    # fields allow stage_init_before_training=False to resume PPO as well.
+    carried_encoder_fields = {}
+    encoder_checkpoint_path = data.get("ppo_z_checkpoint")
+    if encoder_checkpoint_path:
+        encoder_checkpoint_path = Path(encoder_checkpoint_path).expanduser()
+        if not encoder_checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"Encoder checkpoint referenced by collected data was not found: "
+                f"{encoder_checkpoint_path}"
+            )
+        with encoder_checkpoint_path.open("rb") as f:
+            encoder_checkpoint = pickle.load(f)
+        required_encoder_fields = {"ppo_z_params", "ppo_z_obs_stats"}
+        missing_encoder_fields = sorted(
+            required_encoder_fields.difference(encoder_checkpoint)
+        )
+        if missing_encoder_fields:
+            raise ValueError(
+                f"Encoder checkpoint {encoder_checkpoint_path} is missing required "
+                f"fields: {missing_encoder_fields}"
+            )
+        for key in (
+            "ppo_z_params",
+            "ppo_z_obs_stats",
+            "ppo_z_opt_state",
+            "ppo_z_prng",
+            "ppo_z_steps",
+        ):
+            if key in encoder_checkpoint:
+                carried_encoder_fields[key] = encoder_checkpoint[key]
 
     # Training loop
     n_batches = n_train // config['fm_batch_size']
@@ -283,12 +372,21 @@ def train_fm(
             checkpoint = {
                 "params": fm_state.params,  # Only save parameters
                 "obs_stats": fm_state.obs_stats,
+                "fm_opt_state": fm_state.opt_state,
+                "fm_prng": fm_state.prng,
+                "fm_steps": fm_state.steps,
                 "config": decoder_config,
                 "epoch": epoch + 1,
                 "train_loss": train_loss,
                 "val_loss": val_loss,
                 "obs_dim": obs_dim,
                 "action_dim": action_dim,
+                "resumed_from": (
+                    str(resume_checkpoint_path)
+                    if resume_checkpoint_path is not None
+                    else None
+                ),
+                **carried_encoder_fields,
             }
 
             with open(checkpoint_file, "wb") as f:
@@ -321,6 +419,9 @@ def train_fm(
     final_checkpoint = {
         "params": fm_state.params,  # Only save parameters
         "obs_stats": fm_state.obs_stats,
+        "fm_opt_state": fm_state.opt_state,
+        "fm_prng": fm_state.prng,
+        "fm_steps": fm_state.steps,
         "config": decoder_config,
         "epoch": config['fm_num_epochs'],
         "train_loss": train_losses[-1],
@@ -329,6 +430,12 @@ def train_fm(
         "val_history": val_losses,
         "obs_dim": obs_dim,
         "action_dim": action_dim,
+        "resumed_from": (
+            str(resume_checkpoint_path)
+            if resume_checkpoint_path is not None
+            else None
+        ),
+        **carried_encoder_fields,
     }
 
     with open(final_file, "wb") as f:
