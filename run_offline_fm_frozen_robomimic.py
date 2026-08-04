@@ -17,6 +17,10 @@ The final pickle has both:
 * ``ppo_z_params/ppo_z_obs_stats/config`` fields matching online encoder
   checkpoints and accepted by ``scripts/components/collect_data_fm.py``.
 
+The decoder checkpoints are marked with the stable ``gorl_fm_decoder`` format
+so they can be passed directly to ``scripts/run_gorl_fm.py`` via
+``--use-offline-checkpoint --offline-checkpoint-path ...``.
+
 Example:
     python run_offline_fm_frozen_robomimic.py
 
@@ -28,9 +32,14 @@ from __future__ import annotations
 
 import json
 import pickle
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+# Allow this root-level script to import the local ``src/flow_policy`` package
+# when invoked directly with ``python run_offline_fm_frozen_robomimic.py``.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 import jax
 import jax_dataclasses as jdc
@@ -607,6 +616,10 @@ def save_compatible_checkpoint(
     obs_dim = int(decoder.obs_stats.mean.shape[-1])
     action_dim = int(decoder.params[-1][0].shape[-1])
     checkpoint = {
+        # Stable schema marker consumed by scripts/run_gorl_fm.py. Keep the
+        # decoder fields below at the top level for train_encoder_ppo.py.
+        "checkpoint_format": "gorl_fm_decoder",
+        "checkpoint_version": 1,
         # Standalone FM schema loaded by train_encoder_ppo.py.
         "params": decoder.params,
         "obs_stats": decoder.obs_stats,
@@ -619,6 +632,7 @@ def save_compatible_checkpoint(
         "ppo_z_params": encoder_params,
         "ppo_z_obs_stats": encoder_obs_stats,
         "env_name": config.env_name,
+        "dataset_path": str(Path(config.dataset_path).expanduser().resolve()),
         "decoder_type": "fm",
         "z_dim": action_dim,
         "fm_params": decoder.params,
