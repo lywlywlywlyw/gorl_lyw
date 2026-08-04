@@ -1,215 +1,388 @@
-"""Evaluate checkpoints produced by ``run_offline_fm_frozen_new.py``.
+"""Evaluate offline-frozen and online GoRL FM checkpoints on Robomimic.
 
-The evaluator uses the same local D4RL MJX environment, latent Gaussian policy,
-observation normalizer, and multi-step FM decoder as offline training. Both
-``checkpoint_final.pkl`` and periodic ``checkpoint_step_*.pkl`` files work.
-
-Example:
-    python evaluate_offline_fm.py \
-        --checkpoint results/.../checkpoint_final.pkl \
-        --episodes 50 --deterministic
+Offline ``checkpoint_final.pkl`` files are self-contained. Online GoRL runs
+write encoder and decoder checkpoints separately, so pass one as
+``--checkpoint`` and the other through ``--decoder-checkpoint`` or
+``--encoder-checkpoint``. Evaluation executes encoder -> z -> decoder ->
+Robomimic action.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import pickle
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 import jax
 import jax_dataclasses as jdc
+import cv2
 import numpy as np
 import tyro
 from jax import numpy as jnp
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from d4rl_envs.mjx_envs import make_d4rl_env, normalize_task
-from flow_policy import networks
-from flow_policy.decoder_fm import DecoderFMState
-
-
-# D4RL v2 reference returns used by get_normalized_score().
-D4RL_SCORE_RANGES: dict[str, tuple[float, float]] = {
-    "halfcheetah": (-280.178953, 12135.0),
-    "hopper": (-20.272305, 3234.3),
-    "walker2d": (1.629008, 4592.3),
-    "ant": (-325.6, 3879.7),
-}
+# Importing ``robomimic.utils.file_utils`` also imports its language utilities,
+# which eagerly construct CLIP. Evaluation only needs dataset metadata, and a
+# missing internet route must not make startup hang while Hugging Face checks
+# for updates. Cached files remain available in offline mode.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 
 @dataclass
 class EvaluationConfig:
-    """Command-line configuration for frozen offline-FM evaluation."""
+    """CLI configuration for Robomimic policy evaluation."""
 
     checkpoint: str
-    env_name: str | None = None
-    d4rl_dataset: str | None = None
-    episodes: int = 50
+    encoder_checkpoint: str | None = None
+    decoder_checkpoint: str | None = None
+    dataset_path: str | None = None
+    episodes: int = 20
     episode_length: int | None = None
     seed: int = 0
     deterministic: bool = True
-    clip_actions: bool = True
+    apply_tanh: bool | None = None
+    reward_shaping: bool = True
+    render: bool = False
+    render_camera: str = "agentview"
+    video_dir: str | None = "evaluation_videos"
+    video_fps: int = 20
+    video_skip: int = 1
+    video_height: int = 512
+    video_width: int = 512
     output_json: str | None = None
 
 
 @dataclass(frozen=True)
 class LoadedPolicy:
+    checkpoint_path: Path
+    encoder_checkpoint_path: Path
+    decoder_checkpoint_path: Path
     env: Any
-    task: str
-    dataset_name: str
+    decoder: Any
     actor_params: Any
     actor_obs_stats: Any
-    decoder: DecoderFMState
     normalize_actor_observations: bool
+    apply_tanh: bool
     episode_length: int
+    checkpoint_kind: str
 
 
-def _load_checkpoint(path: str) -> tuple[Path, dict[str, Any]]:
+def _make_evaluation_env(
+    dataset_path: Path,
+    reward_shaping: bool,
+    render_offscreen: bool,
+) -> Any:
+    """Build a Robomimic env whose flat observations match dataset order.
+
+    ``RobomimicEnv.flatten_obs_dict`` follows the runtime dictionary insertion
+    order. Robosuite's runtime order is not guaranteed to match the HDF5
+    observation-key order used to train the checkpoints, even when both flatten
+    to the same total size. Keep this evaluation-only compatibility behavior in
+    this file instead of changing the shared environment implementation.
+    """
+    from envs.robomimic.RobomimicEnv import RobomimicEnv
+
+    class DatasetOrderedRobomimicEnv(RobomimicEnv):
+        def flatten_obs_dict(self, obs_dict: Mapping[str, Any]) -> jax.Array:
+            missing = [key for key in self.obs_keys if key not in obs_dict]
+            if missing:
+                raise KeyError(
+                    "Robomimic environment observation is missing dataset keys: "
+                    + ", ".join(missing)
+                )
+
+            values = []
+            for key in self.obs_keys:
+                value = jnp.ravel(jnp.asarray(obs_dict[key]))
+                expected_shape = tuple(self.shape_meta["all_shapes"][key])
+                expected_size = int(np.prod(expected_shape))
+                if value.size != expected_size:
+                    raise ValueError(
+                        f"Observation key {key!r} has {value.size} values at "
+                        f"runtime, but dataset shape {expected_shape} requires "
+                        f"{expected_size}."
+                    )
+                values.append(value)
+            return jnp.concatenate(values, axis=0)
+
+    return DatasetOrderedRobomimicEnv(
+        dataset_path=str(dataset_path),
+        render_offscreen=render_offscreen,
+        reward_shaping=reward_shaping,
+    )
+
+
+def _load_checkpoint(path: str) -> tuple[Path, Mapping[str, Any]]:
     checkpoint_path = Path(path).expanduser().resolve()
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
     with checkpoint_path.open("rb") as file:
         checkpoint = pickle.load(file)
-    if not isinstance(checkpoint, dict):
+    if not isinstance(checkpoint, Mapping):
         raise TypeError(
-            f"Expected a dictionary checkpoint, got {type(checkpoint).__name__}."
+            f"Expected a checkpoint mapping, got {type(checkpoint).__name__}."
         )
     return checkpoint_path, checkpoint
 
 
 def _config_dict(value: Any) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return value
+    if isinstance(value, Mapping):
+        return dict(value)
     try:
         return asdict(value)
     except (TypeError, ValueError):
         return vars(value) if hasattr(value, "__dict__") else {}
 
 
-def _resolve_environment(
-    checkpoint: dict[str, Any], config: EvaluationConfig
-) -> tuple[str, str]:
-    offline_config = _config_dict(checkpoint.get("offline_config", {}))
-    source = (
-        config.env_name
-        or config.d4rl_dataset
-        or checkpoint.get("env_name")
-        or checkpoint.get("d4rl_dataset")
-        or offline_config.get("env_name")
-        or offline_config.get("d4rl_dataset")
-    )
-    if source is None:
+def _resolve_dataset_path(
+    checkpoints: tuple[Mapping[str, Any], ...], config: EvaluationConfig
+) -> Path:
+    candidate: Any = config.dataset_path
+    for checkpoint in checkpoints:
+        offline_config = _config_dict(checkpoint.get("offline_config", {}))
+        candidate = (
+            candidate
+            or checkpoint.get("dataset_path")
+            or offline_config.get("dataset_path")
+        )
+    if candidate is None:
+        # Online encoder / decoder checkpoints predate embedded environment
+        # metadata. Use the same project-owned config as run_gorl_fm.py.
+        from envs.robomimic.online_config.env_config import EnvConfig
+
+        candidate = EnvConfig().dataset_path
+    if candidate is None:
         raise ValueError(
-            "Could not infer the environment from the checkpoint. Pass "
-            "--env-name or --d4rl-dataset."
+            "Could not infer the Robomimic dataset path from the checkpoint. "
+            "Pass --dataset-path explicitly."
         )
-    return normalize_task(str(source)), str(source)
-
-
-def _actor_policy_params(checkpoint: dict[str, Any]) -> Any:
-    params = checkpoint.get("ppo_z_params")
-    if params is None:
-        raise KeyError(
-            "Checkpoint is missing 'ppo_z_params'; expected a checkpoint from "
-            "run_offline_fm_frozen_new.py."
-        )
-    if hasattr(params, "policy"):
-        return params.policy
-    if isinstance(params, dict) and "policy" in params:
-        return params["policy"]
-    raise TypeError("'ppo_z_params' does not contain policy parameters.")
+    path = Path(str(candidate)).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Robomimic dataset does not exist: {path}")
+    return path
 
 
 def _decoder_fields(
-    checkpoint: dict[str, Any],
+    parameter_checkpoint: Mapping[str, Any],
+    config_checkpoint: Mapping[str, Any],
+    env: Any,
 ) -> tuple[Any, Any, Any, int, int]:
-    params = checkpoint.get("fm_params", checkpoint.get("params"))
-    obs_stats = checkpoint.get("fm_obs_stats", checkpoint.get("obs_stats"))
-    decoder_config = checkpoint.get("config")
-    obs_dim = checkpoint.get("obs_dim")
-    action_dim = checkpoint.get("action_dim", checkpoint.get("z_dim"))
+    from flow_policy.decoder_fm import DecoderFMConfig
 
+    params = parameter_checkpoint.get(
+        "fm_params", parameter_checkpoint.get("params")
+    )
+    obs_stats = parameter_checkpoint.get(
+        "fm_obs_stats", parameter_checkpoint.get("obs_stats")
+    )
+    decoder_config = config_checkpoint.get("config")
+    obs_dim = config_checkpoint.get(
+        "obs_dim", parameter_checkpoint.get("obs_dim", env.observation_size)
+    )
+    action_dim = config_checkpoint.get(
+        "action_dim",
+        parameter_checkpoint.get(
+            "action_dim", parameter_checkpoint.get("z_dim", env.action_size)
+        ),
+    )
     missing = [
         name
         for name, value in (
-            ("fm_params/params", params),
-            ("fm_obs_stats/obs_stats", obs_stats),
+            ("params/fm_params", params),
+            ("obs_stats/fm_obs_stats", obs_stats),
             ("config", decoder_config),
-            ("obs_dim", obs_dim),
-            ("action_dim/z_dim", action_dim),
         )
         if value is None
     ]
     if missing:
-        raise KeyError("Checkpoint is missing fields: " + ", ".join(missing))
-    if not hasattr(decoder_config, "flow_steps"):
+        raise KeyError("Checkpoint is missing decoder fields: " + ", ".join(missing))
+    if not isinstance(decoder_config, DecoderFMConfig):
         raise TypeError(
-            "Checkpoint 'config' is not a DecoderFMConfig. Evaluate "
-            "checkpoint_final.pkl or checkpoint_step_*.pkl, not the separate "
-            "encoder_checkpoint_*.pkl file."
+            "Decoder checkpoint 'config' is not DecoderFMConfig. For a GoRL "
+            "encoder final_checkpoint.pkl, also pass its stage fm_model_*.pkl "
+            "through --decoder-checkpoint."
         )
     return params, obs_stats, decoder_config, int(obs_dim), int(action_dim)
 
 
-def load_policy(config: EvaluationConfig) -> tuple[Path, LoadedPolicy]:
-    checkpoint_path, checkpoint = _load_checkpoint(config.checkpoint)
-    task, dataset_name = _resolve_environment(checkpoint, config)
-    env = make_d4rl_env(task)
-    decoder_params, decoder_obs_stats, decoder_config, obs_dim, action_dim = (
-        _decoder_fields(checkpoint)
-    )
-
-    if env.observation_size != obs_dim:
-        raise ValueError(
-            f"Checkpoint observation dimension {obs_dim} does not match "
-            f"{task} environment dimension {env.observation_size}."
+def _actor_params(checkpoint: Mapping[str, Any]) -> Any:
+    params = checkpoint.get("ppo_z_params")
+    if params is None:
+        raise KeyError(
+            "Checkpoint has no 'ppo_z_params'. Pass a GoRL best_checkpoint.pkl "
+            "or final_checkpoint.pkl through --encoder-checkpoint."
         )
-    if env.action_size != action_dim:
+    if hasattr(params, "policy"):
+        return params.policy
+    if isinstance(params, Mapping) and "policy" in params:
+        return params["policy"]
+    raise TypeError("Checkpoint 'ppo_z_params' does not contain policy parameters.")
+
+
+def _checkpoint_kind(checkpoint: Mapping[str, Any]) -> str:
+    if checkpoint.get("is_frozen_offline"):
+        return "offline-frozen"
+    if checkpoint.get("checkpoint_format") == "gorl_fm_decoder":
+        return "offline-frozen"
+    return "gorl-online"
+
+
+def _has_encoder(checkpoint: Mapping[str, Any]) -> bool:
+    return all(key in checkpoint for key in ("ppo_z_params", "ppo_z_obs_stats"))
+
+
+def _has_decoder_config(checkpoint: Mapping[str, Any]) -> bool:
+    from flow_policy.decoder_fm import DecoderFMConfig
+
+    return isinstance(checkpoint.get("config"), DecoderFMConfig)
+
+
+def _select_checkpoint_roles(
+    config: EvaluationConfig,
+) -> tuple[
+    Path,
+    Mapping[str, Any],
+    Path,
+    Mapping[str, Any],
+    Path,
+    Mapping[str, Any],
+]:
+    primary_path, primary = _load_checkpoint(config.checkpoint)
+    encoder_path, encoder = primary_path, primary
+    decoder_path, decoder = primary_path, primary
+    if config.encoder_checkpoint is not None:
+        encoder_path, encoder = _load_checkpoint(config.encoder_checkpoint)
+    if config.decoder_checkpoint is not None:
+        decoder_path, decoder = _load_checkpoint(config.decoder_checkpoint)
+
+    if not _has_encoder(encoder):
+        if _has_encoder(primary):
+            encoder_path, encoder = primary_path, primary
+        else:
+            raise KeyError(
+                "No encoder fields were found. If --checkpoint is a GoRL "
+                "fm_model_*.pkl, pass the matching best_checkpoint.pkl or "
+                "final_checkpoint.pkl through --encoder-checkpoint."
+            )
+    if not _has_decoder_config(decoder):
+        if _has_decoder_config(primary):
+            decoder_path, decoder = primary_path, primary
+        else:
+            raise TypeError(
+                "No DecoderFMConfig was found. If --checkpoint is a GoRL "
+                "encoder best/final_checkpoint.pkl, pass the matching stage "
+                "fm_model_*.pkl through --decoder-checkpoint."
+            )
+    return primary_path, primary, encoder_path, encoder, decoder_path, decoder
+
+
+def load_policy(config: EvaluationConfig) -> LoadedPolicy:
+    from flow_policy import networks
+    from flow_policy.decoder_fm import DecoderFMState
+
+    (
+        checkpoint_path,
+        checkpoint,
+        encoder_path,
+        encoder_checkpoint,
+        decoder_path,
+        decoder_checkpoint,
+    ) = _select_checkpoint_roles(config)
+    dataset_path = _resolve_dataset_path(
+        (checkpoint, encoder_checkpoint, decoder_checkpoint), config
+    )
+    env = _make_evaluation_env(
+        dataset_path,
+        config.reward_shaping,
+        render_offscreen=config.video_dir is not None,
+    )
+    # An online encoder checkpoint embeds the decoder that was used to train
+    # that encoder. A separately supplied stage decoder is newer and must take
+    # precedence when the caller explicitly requests it.
+    decoder_parameter_checkpoint = (
+        decoder_checkpoint
+        if config.decoder_checkpoint is not None
+        else encoder_checkpoint
+        if "fm_params" in encoder_checkpoint
+        else decoder_checkpoint
+    )
+    params, obs_stats, decoder_config, obs_dim, action_dim = _decoder_fields(
+        decoder_parameter_checkpoint, decoder_checkpoint, env
+    )
+    if (obs_dim, action_dim) != (env.observation_size, env.action_size):
         raise ValueError(
-            f"Checkpoint action dimension {action_dim} does not match "
-            f"{task} environment dimension {env.action_size}."
+            "Checkpoint dimensions do not match the Robomimic dataset: "
+            f"checkpoint=({obs_dim}, {action_dim}), "
+            f"environment=({env.observation_size}, {env.action_size})."
         )
 
     decoder = DecoderFMState.init(
         jax.random.key(config.seed + 1), obs_dim, action_dim, decoder_config
     )
     with jdc.copy_and_mutate(decoder) as decoder:
-        decoder.params = decoder_params
-        decoder.obs_stats = decoder_obs_stats
+        decoder.params = params
+        decoder.obs_stats = obs_stats
 
-    actor_obs_stats = checkpoint.get("ppo_z_obs_stats")
+    actor_obs_stats = encoder_checkpoint.get("ppo_z_obs_stats")
     if actor_obs_stats is None:
-        raise KeyError(
-            "Checkpoint is missing 'ppo_z_obs_stats', which is required to "
-            "reproduce the actor observation normalization used in training."
-        )
+        raise KeyError("Checkpoint is missing required field 'ppo_z_obs_stats'.")
 
-    offline_config = _config_dict(checkpoint.get("offline_config", {}))
-    online_config = checkpoint.get("online_encoder_config")
-    normalize_actor_observations = bool(
-        getattr(online_config, "normalize_observations", True)
+    encoder_config = encoder_checkpoint.get(
+        "online_encoder_config", encoder_checkpoint.get("config")
     )
-    episode_length = (
+    normalize_actor_observations = bool(
+        getattr(encoder_config, "normalize_observations", True)
+    )
+    checkpoint_config = _config_dict(
+        encoder_checkpoint.get("offline_config", {})
+    )
+    default_apply_tanh = bool(
+        checkpoint_config.get("ppo_apply_tanh_in_rollout", True)
+    )
+    apply_tanh = (
+        default_apply_tanh if config.apply_tanh is None else config.apply_tanh
+    )
+    offline_config = _config_dict(
+        encoder_checkpoint.get("offline_config", {})
+    )
+    episode_length = int(
         config.episode_length
         if config.episode_length is not None
-        else int(offline_config.get("episode_length", 1000))
+        else offline_config.get("episode_length", 300)
     )
-    if episode_length < 1:
-        raise ValueError("episode_length must be positive.")
+    if config.episodes < 1 or episode_length < 1:
+        raise ValueError("episodes and episode_length must be positive.")
 
-    return checkpoint_path, LoadedPolicy(
+    actor_params = _actor_params(encoder_checkpoint)
+    dummy_obs = jnp.zeros((obs_dim,))
+    if normalize_actor_observations:
+        dummy_obs = (dummy_obs - actor_obs_stats.mean) / actor_obs_stats.std
+    distribution = networks.gaussian_policy_fwd(actor_params, dummy_obs)
+    if distribution.loc.shape[-1] != action_dim:
+        raise ValueError(
+            f"Encoder latent dimension {distribution.loc.shape[-1]} does not "
+            f"match decoder action dimension {action_dim}."
+        )
+
+    return LoadedPolicy(
+        checkpoint_path=checkpoint_path,
+        encoder_checkpoint_path=encoder_path,
+        decoder_checkpoint_path=decoder_path,
         env=env,
-        task=task,
-        dataset_name=dataset_name,
-        actor_params=_actor_policy_params(checkpoint),
-        actor_obs_stats=actor_obs_stats,
         decoder=decoder,
+        actor_params=actor_params,
+        actor_obs_stats=actor_obs_stats,
         normalize_actor_observations=normalize_actor_observations,
+        apply_tanh=apply_tanh,
         episode_length=episode_length,
+        checkpoint_kind=_checkpoint_kind(encoder_checkpoint),
     )
 
 
@@ -218,13 +391,14 @@ def _policy_action(
     observation: jax.Array,
     key: jax.Array,
     deterministic: bool,
-    clip_actions: bool,
 ) -> jax.Array:
+    from flow_policy import networks
+
     actor_observation = observation
     if policy.normalize_actor_observations:
         actor_observation = (
             observation - policy.actor_obs_stats.mean
-        ) / (policy.actor_obs_stats.std + 1e-8)
+        ) / policy.actor_obs_stats.std
     distribution = networks.gaussian_policy_fwd(
         policy.actor_params, actor_observation
     )
@@ -232,111 +406,191 @@ def _policy_action(
     action = policy.decoder.sample_action_from_z(
         observation, latent, key, deterministic=True
     )
-    return jnp.clip(action, -1.0, 1.0) if clip_actions else action
+    return jnp.tanh(action) if policy.apply_tanh else action
 
 
-def _evaluate_rollouts(
-    policy: LoadedPolicy,
-    episodes: int,
-    seed: int,
-    deterministic: bool,
-    clip_actions: bool,
-) -> tuple[np.ndarray, np.ndarray]:
-    if episodes < 1:
-        raise ValueError("episodes must be positive.")
+def _success(info: Mapping[str, Any]) -> bool:
+    for key in ("success", "task_success", "is_success"):
+        if key in info:
+            value = info[key]
+            if isinstance(value, Mapping):
+                value = value.get("task", False)
+            return bool(np.asarray(value))
+    return False
 
-    reset_keys = jax.random.split(jax.random.key(seed), episodes)
-    states = jax.vmap(policy.env.reset)(reset_keys)
-    returns = jnp.zeros((episodes,), dtype=jnp.float32)
-    lengths = jnp.zeros((episodes,), dtype=jnp.int32)
-    active = jnp.ones((episodes,), dtype=bool)
 
-    @jax.jit
-    def step(
-        states: Any,
-        returns: jax.Array,
-        lengths: jax.Array,
-        active: jax.Array,
-        key: jax.Array,
-    ) -> tuple[Any, jax.Array, jax.Array, jax.Array]:
-        action_keys = jax.random.split(key, episodes)
-        actions = jax.vmap(
-            lambda obs, action_key: _policy_action(
-                policy, obs, action_key, deterministic, clip_actions
-            )
-        )(states.obs, action_keys)
-        stepped_states = jax.vmap(policy.env.step)(states, actions)
-        returns = returns + jnp.where(active, stepped_states.reward, 0.0)
-        lengths = lengths + active.astype(jnp.int32)
-        next_active = active & ~stepped_states.done.astype(bool)
-
-        def retain_old(old: jax.Array, new: jax.Array) -> jax.Array:
-            mask = next_active.reshape(
-                next_active.shape + (1,) * (new.ndim - next_active.ndim)
-            )
-            return jnp.where(mask, new, old)
-
-        states = jax.tree.map(retain_old, states, stepped_states)
-        return states, returns, lengths, next_active
-
-    rollout_key = jax.random.key(seed + 10_000)
-    for _ in range(policy.episode_length):
-        rollout_key, step_key = jax.random.split(rollout_key)
-        states, returns, lengths, active = step(
-            states, returns, lengths, active, step_key
+def _render_video_frame(policy: LoadedPolicy, config: EvaluationConfig) -> np.ndarray:
+    frame = policy.env.render(
+        mode="rgb_array",
+        height=config.video_height,
+        width=config.video_width,
+        camera_name=config.render_camera,
+    )
+    frame_array = np.asarray(frame)
+    if frame_array.ndim != 3 or frame_array.shape[-1] not in (3, 4):
+        raise ValueError(
+            "Expected an RGB or RGBA video frame, got shape "
+            f"{frame_array.shape}."
         )
-        if not bool(np.asarray(jnp.any(active))):
-            break
-    return np.asarray(returns), np.asarray(lengths)
+    if frame_array.shape[-1] == 4:
+        frame_array = frame_array[..., :3]
+    return np.ascontiguousarray(frame_array, dtype=np.uint8)
 
 
-def _summary(values: np.ndarray) -> dict[str, float]:
-    return {
-        "mean": float(np.mean(values)),
-        "std": float(np.std(values)),
-        "min": float(np.min(values)),
-        "max": float(np.max(values)),
-        "median": float(np.median(values)),
-    }
-
-
-def main(config: EvaluationConfig) -> None:
-    checkpoint_path, policy = load_policy(config)
-    returns, lengths = _evaluate_rollouts(
-        policy,
-        episodes=config.episodes,
-        seed=config.seed,
-        deterministic=config.deterministic,
-        clip_actions=config.clip_actions,
+def _open_video_writer(
+    output_path: Path, config: EvaluationConfig
+) -> cv2.VideoWriter:
+    """Create the same MP4V writer used by run_gorl_fm evaluation videos."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(
+        str(output_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        config.video_fps,
+        (config.video_width, config.video_height),
     )
-    random_score, expert_score = D4RL_SCORE_RANGES[policy.task]
-    normalized_scores = (
-        100.0 * (returns - random_score) / (expert_score - random_score)
+    if not writer.isOpened():
+        writer.release()
+        raise RuntimeError(
+            f"OpenCV could not initialize the MP4 video writer: {output_path}"
+        )
+    return writer
+
+
+def _write_video_frame(
+    writer: cv2.VideoWriter,
+    policy: LoadedPolicy,
+    config: EvaluationConfig,
+) -> None:
+    frame = _render_video_frame(policy, config)
+    writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+
+
+def evaluate(config: EvaluationConfig) -> dict[str, Any]:
+    if config.video_fps < 1:
+        raise ValueError("video_fps must be positive.")
+    if config.video_skip < 1:
+        raise ValueError("video_skip must be positive.")
+    if config.video_height < 1 or config.video_width < 1:
+        raise ValueError("video_height and video_width must be positive.")
+    if config.render and config.video_dir is not None:
+        raise ValueError(
+            "On-screen rendering and off-screen video recording cannot be "
+            "enabled together. Use --no-render when passing --video-dir."
+        )
+
+    policy = load_policy(config)
+    print(
+        f"Loaded {policy.checkpoint_kind} checkpoint: {policy.checkpoint_path}\n"
+        f"Encoder checkpoint: {policy.encoder_checkpoint_path}\n"
+        f"Decoder checkpoint: {policy.decoder_checkpoint_path}\n"
+        f"Robomimic dimensions: obs={policy.env.observation_size}, "
+        f"action={policy.env.action_size}; apply_tanh={policy.apply_tanh}"
     )
+    key = jax.random.key(config.seed)
+    returns: list[float] = []
+    lengths: list[int] = []
+    successes: list[float] = []
+    video_paths: list[str] = []
+    video_dir = (
+        Path(config.video_dir).expanduser().resolve()
+        if config.video_dir is not None
+        else None
+    )
+    if video_dir is not None:
+        video_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Recording every episode to: {video_dir}")
+    try:
+        for episode in range(config.episodes):
+            key, reset_key = jax.random.split(key)
+            state = policy.env.reset(reset_key)
+            episode_return = 0.0
+            success = False
+            length = 0
+            video_writer = None
+            episode_video_path = None
+            last_recorded_step = -1
+            try:
+                if video_dir is not None:
+                    episode_video_path = video_dir / f"episode_{episode + 1:04d}.mp4"
+                    video_writer = _open_video_writer(episode_video_path, config)
+                    _write_video_frame(video_writer, policy, config)
+                    last_recorded_step = 0
+
+                for step in range(policy.episode_length):
+                    key, action_key = jax.random.split(key)
+                    action = _policy_action(
+                        policy, state.obs, action_key, config.deterministic
+                    )
+                    state = policy.env.step(state, action)
+                    episode_return += float(np.asarray(state.reward))
+                    length = step + 1
+                    success = success or _success(state.info)
+                    if config.render:
+                        policy.env.render(
+                            mode="human", camera_name=config.render_camera
+                        )
+                    if video_writer is not None and length % config.video_skip == 0:
+                        _write_video_frame(video_writer, policy, config)
+                        last_recorded_step = length
+                    if bool(np.asarray(state.done)):
+                        break
+
+                # Match run_gorl_fm's recorder by always preserving the terminal
+                # frame, including when frame skipping omitted the final step.
+                if video_writer is not None and last_recorded_step != length:
+                    _write_video_frame(video_writer, policy, config)
+            finally:
+                if video_writer is not None:
+                    video_writer.release()
+                    assert episode_video_path is not None
+                    video_paths.append(str(episode_video_path))
+            returns.append(episode_return)
+            lengths.append(length)
+            successes.append(float(success))
+            print(
+                f"Episode {episode + 1:>3}/{config.episodes}: "
+                f"return={episode_return:9.3f}, length={length:4d}, "
+                f"success={success}"
+                + (
+                    f", video={episode_video_path}"
+                    if episode_video_path is not None
+                    else ""
+                )
+            )
+    finally:
+        close = getattr(policy.env.env, "close", None)
+        if callable(close):
+            close()
+
     result = {
-        "checkpoint": str(checkpoint_path),
-        "environment": policy.task,
-        "d4rl_dataset": policy.dataset_name,
+        "checkpoint": str(policy.checkpoint_path),
+        "encoder_checkpoint": str(policy.encoder_checkpoint_path),
+        "decoder_checkpoint": str(policy.decoder_checkpoint_path),
+        "checkpoint_kind": policy.checkpoint_kind,
+        "dataset_path": policy.env.dataset_path,
         "episodes": config.episodes,
         "episode_length_limit": policy.episode_length,
         "deterministic": config.deterministic,
-        "clip_actions": config.clip_actions,
-        "return": _summary(returns),
-        "d4rl_normalized_score": _summary(normalized_scores),
-        "episode_length": _summary(lengths.astype(np.float32)),
-        "episode_returns": returns.tolist(),
-        "episode_normalized_scores": normalized_scores.tolist(),
-        "episode_lengths": lengths.tolist(),
+        "apply_tanh": policy.apply_tanh,
+        "return_mean": float(np.mean(returns)),
+        "return_std": float(np.std(returns)),
+        "length_mean": float(np.mean(lengths)),
+        "success_rate": float(np.mean(successes)),
+        "episode_returns": returns,
+        "episode_lengths": lengths,
+        "episode_successes": successes,
+        "video_dir": str(video_dir) if video_dir is not None else None,
+        "episode_videos": video_paths,
     }
-    print(json.dumps(result, indent=2))
-
+    print("\n" + json.dumps(result, indent=2))
     if config.output_json is not None:
         output_path = Path(config.output_json).expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with output_path.open("w") as file:
             json.dump(result, file, indent=2)
         print(f"Saved evaluation results to {output_path}")
+    return result
 
 
 if __name__ == "__main__":
-    main(tyro.cli(EvaluationConfig))
+    evaluate(tyro.cli(EvaluationConfig))
