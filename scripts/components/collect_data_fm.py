@@ -25,8 +25,8 @@ from flow_policy.rollout_encoder import (
     eval_policy_encoder_fm
 )
 from envs.robomimic.RobomimicEnv import RobomimicEnv
-from envs.robomimic.config.training_config import TrainingConfig
-from envs.robomimic.config.env_config import EnvConfig
+from envs.robomimic.online_config.training_config import TrainingConfig
+from envs.robomimic.online_config.env_config import EnvConfig
 def main(
     ppo_z_checkpoint_path: str | None = None,
     fm_model_path: str | None = None,

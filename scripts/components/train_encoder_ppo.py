@@ -23,8 +23,9 @@ from tqdm import tqdm
 from flow_policy import encoder_ppo
 
 from envs.robomimic.RobomimicEnv import RobomimicEnv
-from envs.robomimic.config.training_config import TrainingConfig
-from envs.robomimic.config.env_config import EnvConfig
+from envs.robomimic.online_config.training_config import TrainingConfig
+from envs.robomimic.online_config.env_config import EnvConfig
+from metrics_ipc import append_metrics
 
 def _record_eval_video(
     agent,
@@ -95,6 +96,7 @@ def main(
     global_step_offset: int = 0,
     wandb_run_id: str | None = None,
     wandb_run_name: str | None = None,
+    metrics_file: str | None = None,
 ) -> None:
     """Train encoder with generative decoder (FM or Diffusion)."""
     config = TrainingConfig().to_dict() | EnvConfig().to_dict()
@@ -136,7 +138,7 @@ def main(
 
     wandb_run = None
     wandb = None
-    if config["wandb_enabled"]:
+    if config["wandb_enabled"] and metrics_file is None:
         try:
             import wandb as wandb_module
         except ImportError as error:
@@ -342,7 +344,7 @@ def main(
             eval_outputs.log_to_file(results_dir, step=i)
 
             global_env_step = global_step_offset + i * steps_per_iter
-            if wandb_run is not None:
+            if wandb_run is not None or metrics_file is not None:
                 eval_log = {
                     "pipeline/env_step": global_env_step,
                     "pipeline/stage": stage,
@@ -373,10 +375,16 @@ def main(
                                 f"stage_{stage}_eval_{eval_count:03d}.mp4"
                             ),
                         )
-                        eval_log["video/evaluation"] = wandb.Video(str(video))
+                        if wandb_run is not None:
+                            eval_log["video/evaluation"] = wandb.Video(str(video))
+                        else:
+                            eval_log["_video_path"] = str(video)
                     except Exception as error:
                         print(f"WARNING: Failed to record evaluation video: {error}")
-                wandb_run.log(eval_log)
+                if wandb_run is not None:
+                    wandb_run.log(eval_log)
+                else:
+                    append_metrics(metrics_file, eval_log)
             eval_count += 1
 
             # Save best model
@@ -489,7 +497,7 @@ def main(
                 f.write(f"  {k}: {float(onp.mean(v)):.6f}\n")
 
         iteration_end_time = time.time()
-        if wandb_run is not None:
+        if wandb_run is not None or metrics_file is not None:
             iteration_seconds = iteration_end_time - times[-1]
             train_log = {
                 "pipeline/env_step": global_step_offset + (i + 1) * steps_per_iter,
@@ -506,7 +514,10 @@ def main(
             }
             for key, value in metrics.items():
                 train_log["train/ppo_" + key] = float(onp.mean(value))
-            wandb_run.log(train_log)
+            if wandb_run is not None:
+                wandb_run.log(train_log)
+            else:
+                append_metrics(metrics_file, train_log)
         times.append(iteration_end_time)
 
     # Final summary
@@ -535,14 +546,18 @@ def main(
     with open(final_checkpoint_file, "wb") as f:
         pickle.dump(final_checkpoint, f)
 
-    if wandb_run is not None:
-        wandb_run.log({
+    completion_log = {
             "pipeline/env_step": global_step_offset + max(last_iteration + 1, 0) * steps_per_iter,
             "pipeline/stage": stage,
             "stage/best_reward": best_reward,
-            "stage/completed": 1,
-        })
+            "stage/encoder_completed": 1,
+            f"stage_{stage}/encoder_completed": 1,
+    }
+    if wandb_run is not None:
+        wandb_run.log(completion_log)
         wandb_run.finish()
+    elif metrics_file is not None:
+        append_metrics(metrics_file, completion_log)
 
 
 if __name__ == "__main__":

@@ -6,25 +6,66 @@ Stage 1+: Encoder update → Collect data → Decoder update → Repeat
 """
 
 import datetime
+import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Annotated
 
 import tyro
 from envs.robomimic.RobomimicEnv import RobomimicEnv
-from envs.robomimic.config.training_config import TrainingConfig
-from envs.robomimic.config.env_config import EnvConfig
+from envs.robomimic.online_config.training_config import TrainingConfig
+from envs.robomimic.online_config.env_config import EnvConfig
 
-def run_command(cmd: str, description: str) -> int:
-    """Run a shell command and handle errors."""
-    result = subprocess.run(cmd, shell=True)
+def _forward_metrics(metrics_file: Path, wandb_run, offset: int) -> int:
+    """Forward complete JSONL events written since offset to the parent W&B run."""
+    if not metrics_file.exists():
+        return offset
 
-    if result.returncode != 0:
+    with metrics_file.open("r", encoding="utf-8") as file:
+        file.seek(offset)
+        while True:
+            line_start = file.tell()
+            line = file.readline()
+            if not line:
+                return file.tell()
+            if not line.endswith("\n"):
+                return line_start
+
+            metrics = json.loads(line)
+            video_path = metrics.pop("_video_path", None)
+            if video_path is not None:
+                import wandb
+                metrics["video/evaluation"] = wandb.Video(video_path)
+            wandb_run.log(metrics)
+
+
+def run_command(
+    cmd: str,
+    description: str,
+    metrics_file: Path | None = None,
+    wandb_run=None,
+) -> int:
+    """Run a command, continuously forwarding child metrics to the parent run."""
+    process = subprocess.Popen(cmd, shell=True)
+    metrics_offset = 0
+    while process.poll() is None:
+        if metrics_file is not None and wandb_run is not None:
+            metrics_offset = _forward_metrics(metrics_file, wandb_run, metrics_offset)
+        time.sleep(0.5)
+
+    if metrics_file is not None and wandb_run is not None:
+        _forward_metrics(metrics_file, wandb_run, metrics_offset)
+
+    if process.returncode != 0:
         print(f"ERROR: {description} failed")
-        sys.exit(result.returncode)
+        if wandb_run is not None:
+            wandb_run.log({"pipeline/failed": 1, "pipeline/failed_step": description})
+            wandb_run.finish(exit_code=process.returncode)
+        sys.exit(process.returncode)
 
-    return result.returncode
+    return process.returncode
 
 
 def main() -> None:
@@ -55,6 +96,31 @@ def main() -> None:
     # Create run directory
     run_dir = Path("results") / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    # The pipeline parent is the only process that owns a W&B object. Training
+    # subprocesses stream JSONL metrics back to this process.
+    wandb_run = None
+    if config["wandb_enabled"]:
+        try:
+            import wandb
+        except ImportError as error:
+            raise RuntimeError("wandb is required when wandb_enabled=True.") from error
+        wandb_run = wandb.init(
+            project=config["wandb_project"],
+            entity=config["wandb_entity"],
+            name=run_id,
+            id=run_id,
+            group=config["wandb_group"] or run_id,
+            tags=list(config["wandb_tags"]),
+            mode=config["wandb_mode"],
+            config={**config, "pipeline_run_id": run_id},
+        )
+        wandb_run.define_metric("pipeline/env_step")
+        wandb_run.define_metric("train/*", step_metric="pipeline/env_step")
+        wandb_run.define_metric("eval/*", step_metric="pipeline/env_step")
+        wandb_run.define_metric("video/*", step_metric="pipeline/env_step")
+        wandb_run.define_metric("pipeline/decoder_step")
+        wandb_run.define_metric("decoder/*", step_metric="pipeline/decoder_step")
 
     print(f"\nGoRL (FM) - {config['env_name']}")
     print(f"Stages: {config['num_stages']}, Timesteps: {timesteps_list}")
@@ -92,11 +158,21 @@ def main() -> None:
 
         stage_dir = run_dir / f"stage_{stage}"
         stage_dir.mkdir(parents=True, exist_ok=True)
+        encoder_metrics_file = stage_dir / "encoder_wandb_metrics.jsonl"
+        decoder_metrics_file = stage_dir / "decoder_wandb_metrics.jsonl"
+        if wandb_run is not None:
+            wandb_run.log({
+                "pipeline/stage": stage,
+                "stage/started": 1,
+                f"stage_{stage}/started": 1,
+            })
 
         # =====================================================================
         # STEP 1: Init decoder (only for stage 0)
         # =====================================================================
         if stage == 0:
+            if wandb_run is not None:
+                wandb_run.log({"pipeline/stage": stage, "pipeline/phase": "init_decoder"})
             cmd = (
                 f"python scripts/components/init_decoder_fm.py "
                 f"--env_name {config['env_name']} "
@@ -104,7 +180,7 @@ def main() -> None:
                 f"--output_dir {stage_dir} "
                 f"--seed {config['seed']}"
             )
-            run_command(cmd, f"Stage {stage}: Init decoder")
+            run_command(cmd, f"Stage {stage}: Init decoder", wandb_run=wandb_run)
 
             fm_files = list(stage_dir.glob(f"fm_identity_{config['env_name']}_*.pkl"))
             if not fm_files:
@@ -146,11 +222,17 @@ def main() -> None:
             f"--max_grad_norm {stage_max_grad_norm}",
             f"--stage {stage}",
             f"--global_step_offset {stage_step_offset}",
-            f"--wandb_run_id {run_id}",
-            f"--wandb_run_name {run_id}",
+            f"--metrics_file {encoder_metrics_file}",
         ])
 
-        run_command(cmd, f"Stage {stage}: Encoder update")
+        if wandb_run is not None:
+            wandb_run.log({"pipeline/stage": stage, "pipeline/phase": "train_encoder"})
+        run_command(
+            cmd,
+            f"Stage {stage}: Encoder update",
+            encoder_metrics_file,
+            wandb_run,
+        )
 
         # Find encoder checkpoint
         encoder_pattern = f"encoder_fm_{config['env_name']}_{encoder_exp_name}_*"
@@ -196,7 +278,9 @@ def main() -> None:
             f"--fm_model_path {fm_checkpoint} "
             f"--output_dir {stage_dir} "
         )
-        run_command(cmd, f"Stage {stage}: Collect data")
+        if wandb_run is not None:
+            wandb_run.log({"pipeline/stage": stage, "pipeline/phase": "collect_data"})
+        run_command(cmd, f"Stage {stage}: Collect data", wandb_run=wandb_run)
 
         data_files = list(stage_dir.glob(f"ppo_z_fm_data_{config['env_name']}_*.pkl"))
         if not data_files:
@@ -211,10 +295,20 @@ def main() -> None:
             f"python scripts/components/train_decoder_fm.py",
             f"--data_path {data_file}",
             f"--output_dir {stage_dir}",
+            f"--stage {stage}",
+            f"--global_epoch_offset {stage * config['fm_num_epochs']}",
+            f"--metrics_file {decoder_metrics_file}",
         ]
 
         cmd = " ".join(fm_cmd_parts)
-        run_command(cmd, f"Stage {stage}: Decoder update")
+        if wandb_run is not None:
+            wandb_run.log({"pipeline/stage": stage, "pipeline/phase": "train_decoder"})
+        run_command(
+            cmd,
+            f"Stage {stage}: Decoder update",
+            decoder_metrics_file,
+            wandb_run,
+        )
 
         fm_best_files = list(stage_dir.glob(f"fm_model_best_*.pkl"))
         if not fm_best_files:
@@ -244,6 +338,13 @@ def main() -> None:
         f.write(f"Stages: {config['num_stages']}\n")
         f.write(f"Final decoder: {fm_checkpoint}\n")
         f.write(f"Final encoder: {encoder_checkpoint}\n")
+
+    if wandb_run is not None:
+        wandb_run.log({
+            "pipeline/completed": 1,
+            "pipeline/completed_stages": config["num_stages"],
+        })
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

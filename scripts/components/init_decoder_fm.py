@@ -18,7 +18,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from flow_policy.decoder_fm import DecoderFMConfig, DecoderFMState
 from envs.robomimic.RobomimicEnv import RobomimicEnv
-from envs.robomimic.config.decoder_configs.fm_config import FlowMatchingConfig
+from envs.robomimic.online_config.decoder_configs.fm_config import FlowMatchingConfig
 
 def main(
     env_name: str = "Lift",

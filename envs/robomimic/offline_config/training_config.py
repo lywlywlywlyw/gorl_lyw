@@ -1,6 +1,6 @@
 from dataclasses import dataclass, asdict
-from envs.robomimic.config.decoder_configs.fm_config import FlowMatchingConfig
-from envs.robomimic.config.encoder_configs.ppo_config import PPOConfig
+from envs.robomimic.online_config.decoder_configs.fm_config import FlowMatchingConfig
+from envs.robomimic.online_config.encoder_configs.ppo_config import PPOConfig
 from typing import Annotated
 import tyro
 @dataclass

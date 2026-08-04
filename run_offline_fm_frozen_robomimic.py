@@ -43,8 +43,8 @@ from jax import numpy as jnp
 from tqdm import trange
 
 from envs.robomimic.RobomimicEnv import RobomimicEnv
-from envs.robomimic.config.env_config import EnvConfig
-from envs.robomimic.config.training_config import TrainingConfig
+from envs.robomimic.online_config.env_config import EnvConfig
+from envs.robomimic.online_config.training_config import TrainingConfig
 from flow_policy import encoder_ppo, math_utils, networks
 from flow_policy.decoder_fm import DecoderFMConfig, DecoderFMState
 

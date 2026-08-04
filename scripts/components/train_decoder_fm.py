@@ -14,12 +14,18 @@ from tqdm import tqdm
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from flow_policy.decoder_fm import DecoderFMConfig, DecoderFMState
-from envs.robomimic.config.training_config import TrainingConfig
-from envs.robomimic.config.env_config import EnvConfig
+from envs.robomimic.online_config.training_config import TrainingConfig
+from envs.robomimic.online_config.env_config import EnvConfig
+from metrics_ipc import append_metrics
 
 def train_fm(
     data_path: str = "data/ppo_training_data_WalkerWalk_20250928_212057.pkl",
     output_dir: str = "fm_models",
+    stage: int = 0,
+    global_epoch_offset: int = 0,
+    wandb_run_id: str | None = None,
+    wandb_run_name: str | None = None,
+    metrics_file: str | None = None,
 ) -> None:
     """Train Flow Matching model on collected PPO data.
 
@@ -45,6 +51,31 @@ def train_fm(
     # Create output directory
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+
+    # When metrics_file is provided by the pipeline, only the parent process
+    # owns W&B and this process emits JSONL events. Standalone execution keeps
+    # direct W&B logging for backward compatibility.
+    wandb_run = None
+    if config["wandb_enabled"] and metrics_file is None:
+        try:
+            import wandb
+        except ImportError as error:
+            raise RuntimeError(
+                "wandb is required when wandb_enabled=True."
+            ) from error
+        wandb_run = wandb.init(
+            project=config["wandb_project"],
+            entity=config["wandb_entity"],
+            name=wandb_run_name or f"decoder_fm_stage_{stage}",
+            id=wandb_run_id,
+            resume="allow" if wandb_run_id else None,
+            group=config["wandb_group"] or wandb_run_id,
+            tags=list(config["wandb_tags"]),
+            mode=config["wandb_mode"],
+            config={**config, "pipeline_run_id": wandb_run_id},
+        )
+        wandb_run.define_metric("pipeline/decoder_step")
+        wandb_run.define_metric("decoder/*", step_metric="pipeline/decoder_step")
 
     # Load data
     with open(data_path, "rb") as f:
@@ -239,9 +270,9 @@ def train_fm(
         val_loss = np.mean(val_batch_losses)
         val_losses.append(val_loss)
 
-
         # Save best model
-        if val_loss < best_val_loss:
+        improved = val_loss < best_val_loss
+        if improved:
             best_val_loss = val_loss
             best_epoch = epoch + 1
 
@@ -266,8 +297,24 @@ def train_fm(
             patience_counter = 0
         else:
             patience_counter += 1
-            if patience_counter >= patience:
-                break
+
+        epoch_log = {
+                "pipeline/decoder_step": global_epoch_offset + epoch + 1,
+                "pipeline/stage": stage,
+                "decoder/epoch": epoch + 1,
+                "decoder/train_loss": float(train_loss),
+                "decoder/val_loss": float(val_loss),
+                "decoder/best_val_loss": float(best_val_loss),
+                "decoder/patience_counter": patience_counter,
+                "decoder/improved": int(improved),
+        }
+        if wandb_run is not None:
+            wandb_run.log(epoch_log)
+        elif metrics_file is not None:
+            append_metrics(metrics_file, epoch_log)
+
+        if patience_counter >= patience:
+            break
 
     # Save final model
     final_file = output_path / f"fm_model_final_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl"
@@ -286,6 +333,25 @@ def train_fm(
 
     with open(final_file, "wb") as f:
         pickle.dump(final_checkpoint, f)
+
+    completed_epoch = len(train_losses)
+    completion_log = {
+            "pipeline/decoder_step": global_epoch_offset + completed_epoch,
+            "pipeline/stage": stage,
+            "decoder/completed": 1,
+            "decoder/completed_epochs": completed_epoch,
+            "decoder/final_train_loss": float(train_losses[-1]),
+            "decoder/final_val_loss": float(val_losses[-1]),
+            "decoder/final_best_val_loss": float(best_val_loss),
+            "stage/completed": 1,
+            f"stage_{stage}/decoder_completed": 1,
+            f"stage_{stage}/completed": 1,
+    }
+    if wandb_run is not None:
+        wandb_run.log(completion_log)
+        wandb_run.finish()
+    elif metrics_file is not None:
+        append_metrics(metrics_file, completion_log)
 
     print(f"Decoder (FM) done: loss={best_val_loss:.4f}, output={checkpoint_file}")
 
