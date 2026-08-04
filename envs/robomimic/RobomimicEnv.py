@@ -10,9 +10,15 @@ from jax import numpy as jnp
 import jax
 import numpy as np
 class RobomimicEnv(BaseEnv):
-    def __init__(self, dataset_path: str, render_offscreen: bool = False):
+    def __init__(
+        self,
+        dataset_path: str,
+        render_offscreen: bool = False,
+        reward_shaping: bool = True,
+    ):
         self.dataset_path = dataset_path
         self.render_offscreen = render_offscreen
+        self.reward_shaping = reward_shaping
         self.obs_keys = self.load_dataset()
         self.env = self.load_env()
         self.shape_meta = FileUtils.get_shape_metadata_from_dataset(
@@ -29,6 +35,9 @@ class RobomimicEnv(BaseEnv):
             }
         )
         env_meta = FileUtils.get_env_metadata_from_dataset(self.dataset_path)
+        # Override the dataset setting before robomimic constructs robosuite.
+        # This is forwarded by create_env_from_metadata -> robosuite.make.
+        env_meta.setdefault("env_kwargs", {})["reward_shaping"] = self.reward_shaping
         env = EnvUtils.create_env_from_metadata(
             env_meta=env_meta,
             render=False,

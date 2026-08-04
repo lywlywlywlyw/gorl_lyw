@@ -2,16 +2,16 @@ from dataclasses import dataclass, asdict
 @dataclass
 class PPOConfig:
     ppo_batch_size: int = 256#1000#1024
-    ppo_num_minibatches: int = 2#2#32
+    ppo_num_minibatches: int = 3#2#32
     ppo_num_updates_per_batch: int = 4#10#16
-    ppo_unroll_length: int = 24#30
+    ppo_unroll_length: int = 16#30
     ppo_learning_rate: float = 1e-3
     ppo_entropy_cost: float = 1e-2
     ppo_discounting: float = 0.995
 
     # Training
-    ppo_num_timesteps: int = 400000#60_000_000
-    ppo_num_evals: int = 2#9#10
+    ppo_num_timesteps: int = 393216#60_000_000
+    ppo_num_evals: int = 4#9#10
 
     # Normalization & Reward
     ppo_normalize_observations: bool = True
