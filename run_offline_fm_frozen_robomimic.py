@@ -18,8 +18,11 @@ The final pickle has both:
   checkpoints and accepted by ``scripts/components/collect_data_fm.py``.
 
 Example:
-    python run_offline_fm_frozen_new.py \
-      --env-name WalkerWalk --data-path /path/to/offline_buffer.pkl
+    python run_offline_fm_frozen_robomimic.py
+
+Environment, dataset, PPO, and FM parameters are sourced from
+``EnvConfig`` and ``TrainingConfig`` exactly as in ``scripts/run_gorl_fm.py``.
+Offline-IQL-only parameters live in ``OfflineIQLConfig`` below.
 """
 
 from __future__ import annotations
@@ -27,7 +30,6 @@ from __future__ import annotations
 import datetime
 import json
 import pickle
-import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -36,12 +38,9 @@ import jax
 import jax_dataclasses as jdc
 import numpy as np
 import optax
-import tyro
 from jax import Array
 from jax import numpy as jnp
 from tqdm import trange
-
-sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from envs.robomimic.RobomimicEnv import RobomimicEnv
 from envs.robomimic.config.env_config import EnvConfig
@@ -117,6 +116,7 @@ def build_config() -> ConfigView:
         decoder_max_epochs=config["fm_num_epochs"],
         decoder_validation_fraction=config["fm_validation_split"],
         flow_steps=config["fm_flow_steps"],
+        timestep_embed_dim=config["fm_timestep_embed_dim"],
         n_fm_samples_per_action=config["fm_n_samples_per_action"],
         batch_size=config["ppo_batch_size"],
         discount=config["ppo_discounting"],
@@ -165,298 +165,91 @@ class WandbLogger:
             self.run.finish()
 
 
-def first_present(data: dict[str, Any], *keys: str) -> Any | None:
-    for key in keys:
-        if key in data:
-            return data[key]
-    return None
+def flatten_robomimic_observations(
+    obs_group: Any, obs_keys: list[str]
+) -> np.ndarray:
+    """Flatten low-dimensional robomimic observations in environment key order."""
+    arrays = [np.asarray(obs_group[key], dtype=np.float32) for key in obs_keys]
+    lengths = {len(array) for array in arrays}
+    if len(lengths) != 1:
+        raise ValueError("Robomimic observation arrays have inconsistent lengths.")
+    return np.concatenate(
+        [array.reshape(len(array), -1) for array in arrays], axis=-1
+    )
 
 
-def load_exorl_directory(path: Path) -> dict[str, np.ndarray]:
-    episode_files = sorted(path.glob("episode_*.npz"))
-    if not episode_files:
-        candidates = sorted(path.glob("**/episode_*.npz"))
-        parents = {candidate.parent for candidate in candidates}
-        if len(parents) != 1:
-            raise ValueError(
-                f"{path} must resolve to exactly one ExORL buffer; "
-                f"found {len(parents)}."
-            )
-        episode_files = candidates
+def load_replay_buffer(
+    config: ConfigView, environment: RobomimicEnv
+) -> ReplayBuffer:
+    """Load transitions from the robomimic HDF5 dataset used by the env."""
+    try:
+        import h5py
+    except ImportError as error:
+        raise ImportError("Loading robomimic datasets requires h5py.") from error
 
     observations: list[np.ndarray] = []
     actions: list[np.ndarray] = []
     rewards: list[np.ndarray] = []
     next_observations: list[np.ndarray] = []
     masks: list[np.ndarray] = []
-    for episode_path in episode_files:
-        with np.load(episode_path) as episode:
-            required = {"observation", "action", "reward", "discount"}
-            missing = required.difference(episode.files)
-            if missing:
-                raise KeyError(f"{episode_path} is missing {sorted(missing)}.")
-            obs = np.asarray(episode["observation"], dtype=np.float32)
-            action = np.asarray(episode["action"], dtype=np.float32)
-            reward = np.asarray(episode["reward"], dtype=np.float32).reshape(-1)
-            discount = np.asarray(episode["discount"], dtype=np.float32).reshape(-1)
-            if not (len(obs) == len(action) == len(reward) == len(discount)):
-                raise ValueError(f"Inconsistent lengths in {episode_path}.")
-            if len(obs) < 2:
-                continue
-            observations.append(obs[:-1])
-            actions.append(action[1:])
-            rewards.append(reward[1:])
-            next_observations.append(obs[1:])
-            masks.append(discount[1:])
-    if not observations:
-        raise ValueError(f"No non-empty ExORL episodes found under {path}.")
-    return {
-        "observations": np.concatenate(observations),
-        "actions": np.concatenate(actions),
-        "rewards": np.concatenate(rewards),
-        "next_observations": np.concatenate(next_observations),
-        "masks": np.concatenate(masks),
-    }
-
-
-def load_hdf5(path: Path) -> dict[str, np.ndarray]:
-    try:
-        import h5py
-    except ImportError as error:
-        raise ImportError("Loading HDF5 datasets requires h5py.") from error
-
-    data: dict[str, np.ndarray] = {}
-    with h5py.File(path, "r") as file:
-        def collect(name: str, item: Any) -> None:
-            if isinstance(item, h5py.Dataset):
-                data[name] = item[()]
-
-        file.visititems(collect)
-
-    required = {"observations", "actions", "rewards", "terminals"}
-    if required.issubset(data) and "next_observations" not in data:
-        observations = np.asarray(data["observations"], dtype=np.float32)
-        actions = np.asarray(data["actions"], dtype=np.float32)
-        rewards = np.asarray(data["rewards"], dtype=np.float32).reshape(-1)
-        terminals = np.asarray(data["terminals"], dtype=bool).reshape(-1)
-        if not (
-            len(observations) == len(actions) == len(rewards) == len(terminals)
-        ):
-            raise ValueError(f"Inconsistent D4RL array lengths in {path}.")
-        if len(observations) < 2:
-            raise ValueError(f"D4RL dataset {path} has fewer than two rows.")
-        timeouts = data.get("timeouts")
-        if timeouts is None:
-            timeouts = np.zeros(len(observations), dtype=bool)
-            episode_step = 0
-            for index in range(len(observations)):
-                final_timestep = episode_step == 999
-                timeouts[index] = final_timestep
-                if terminals[index] or final_timestep:
-                    episode_step = 0
-                else:
-                    episode_step += 1
-        else:
-            timeouts = np.asarray(timeouts, dtype=bool).reshape(-1)
-            if len(timeouts) != len(observations):
-                raise ValueError(f"D4RL timeouts length does not match {path}.")
-        keep = ~timeouts[:-1]
-        return {
-            "observations": observations[:-1][keep],
-            "actions": actions[:-1][keep],
-            "rewards": rewards[:-1][keep],
-            "next_observations": observations[1:][keep],
-            "terminals": terminals[:-1][keep].astype(np.float32),
-        }
-    return data
-
-
-_D4RL_INFOS_URL = (
-    "https://raw.githubusercontent.com/Farama-Foundation/D4RL/master/"
-    "d4rl/infos.py"
-)
-
-
-def official_d4rl_urls() -> dict[str, str]:
-    try:
-        with urllib.request.urlopen(_D4RL_INFOS_URL, timeout=30) as response:
-            source = response.read().decode("utf-8")
-    except Exception as error:
-        raise RuntimeError(
-            "Could not fetch the official D4RL dataset catalog. Check network "
-            f"access to {_D4RL_INFOS_URL}."
-        ) from error
-    tree = ast.parse(source, filename=_D4RL_INFOS_URL)
-    urls: dict[str, str] | None = None
-    for node in tree.body:
-        if not isinstance(node, ast.Assign):
-            continue
-        if any(
-            isinstance(target, ast.Name) and target.id == "DATASET_URLS"
-            for target in node.targets
-        ):
-            value = ast.literal_eval(node.value)
-            if not isinstance(value, dict):
-                raise RuntimeError("D4RL DATASET_URLS is not a dictionary.")
-            urls = {str(key): str(url) for key, url in value.items()}
-            break
-    if urls is None:
-        raise RuntimeError("Could not find DATASET_URLS in the D4RL catalog.")
-    locomotion = ("halfcheetah", "hopper", "walker2d", "ant")
-    qualities = (
-        "random", "medium", "expert", "medium-replay", "full-replay",
-        "medium-expert",
-    )
-    for environment in locomotion:
-        for quality in qualities:
-            quality_file = quality.replace("-", "_")
-            for version in (1, 2):
-                dataset_id = f"{environment}-{quality}-v{version}"
-                filename = f"{environment}_{quality_file}-v{version}.hdf5"
-                urls[dataset_id] = (
-                    "http://rail.eecs.berkeley.edu/datasets/offline_rl/"
-                    f"gym_mujoco_v{version}/{filename}"
-                )
-    return urls
-
-
-def download_d4rl_dataset(dataset_id: str, dataset_dir: Path) -> Path:
-    if not dataset_id or Path(dataset_id).name != dataset_id:
-        raise ValueError("d4rl_dataset must be a D4RL task ID, not a path.")
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-    destination = dataset_dir / f"{dataset_id}.hdf5"
-    if destination.is_file() and destination.stat().st_size > 0:
-        print(f"Using cached D4RL dataset: {destination}")
-        return destination
-    urls = official_d4rl_urls()
-    if dataset_id not in urls:
-        raise ValueError(f"Unknown D4RL dataset {dataset_id!r}.")
-    url = urls[dataset_id].replace("http://", "https://", 1)
-    temporary = destination.with_suffix(destination.suffix + ".part")
-    print(f"Downloading {dataset_id} from {url}")
-
-    def report(blocks: int, block_size: int, total_size: int) -> None:
-        downloaded = blocks * block_size
-        if total_size > 0:
-            percent = min(100.0, downloaded * 100.0 / total_size)
-            print(
-                f"\r  {min(downloaded, total_size) / 2**20:.1f}/"
-                f"{total_size / 2**20:.1f} MiB ({percent:.1f}%)",
-                end="",
-                flush=True,
-            )
-
-    try:
-        urllib.request.urlretrieve(url, temporary, reporthook=report)
-        print()
-        if temporary.stat().st_size == 0:
-            raise RuntimeError("downloaded file is empty")
-        temporary.replace(destination)
-    except Exception as error:
-        if temporary.exists():
-            temporary.unlink()
-        raise RuntimeError(
-            f"Failed to download {dataset_id} from {url}."
-        ) from error
-    print(f"Saved D4RL dataset to {destination}")
-    return destination
-
-
-def resolve_data_path(config: FrozenOfflineConfig) -> Path:
-    if config.data_path is not None and config.d4rl_dataset is not None:
-        raise ValueError("Use either --data-path or --d4rl-dataset, not both.")
-    if config.d4rl_dataset is not None:
-        dataset_dir = Path(config.dataset_dir).expanduser()
-        if not dataset_dir.is_absolute():
-            dataset_dir = Path(__file__).resolve().parent / dataset_dir
-        return download_d4rl_dataset(config.d4rl_dataset, dataset_dir)
-    if config.data_path is None:
-        raise ValueError("Provide --data-path or --d4rl-dataset.")
-    return Path(config.data_path).expanduser()
-
-
-def load_replay_buffer(config: FrozenOfflineConfig) -> ReplayBuffer:
-    path = resolve_data_path(config)
-    if path.is_dir():
-        data = load_exorl_directory(path)
-    elif path.suffix.lower() in {".h5", ".hdf5"}:
-        data = load_hdf5(path)
-    else:
-        with open(path, "rb") as file:
-            data = pickle.load(file)
-    if not isinstance(data, dict):
-        raise TypeError("Offline dataset must be a dictionary.")
-
-    observations = first_present(data, "observations", "states", "obs")
-    actions = first_present(data, "actions", "action")
-    rewards = first_present(data, "rewards", "reward")
-    next_observations = first_present(
-        data, "next_observations", "next_states", "next_obs"
-    )
-    masks = first_present(data, "masks", "discounts")
-    terminals = first_present(data, "terminals", "dones", "done")
-    timeouts = first_present(data, "timeouts", "truncations", "truncated")
-    if observations is None or actions is None or rewards is None:
-        raise KeyError("Dataset needs observations/states, actions, and rewards.")
-
-    observations = np.asarray(observations, dtype=np.float32)
-    actions = np.asarray(actions, dtype=np.float32)
-    rewards = np.asarray(rewards, dtype=np.float32).reshape(-1)
-    if observations.ndim != 2 or actions.ndim != 2:
-        raise ValueError("Observations and actions must be rank-2 arrays.")
-
-    if next_observations is None:
-        if not config.infer_transitions:
-            raise KeyError(
-                "Dataset lacks next observations; enable --infer-transitions "
-                "only for fixed-length, episode-ordered data."
-            )
-        usable = (len(observations) // config.episode_length) * config.episode_length
-        if config.episode_length < 2 or usable == 0:
-            raise ValueError("Cannot infer transitions with this episode length.")
-        observations = observations[:usable]
-        actions = actions[:usable]
-        rewards = rewards[:usable]
-        next_observations = np.roll(observations, -1, axis=0)
-        inferred_terminal = np.zeros(usable, dtype=np.float32)
-        inferred_terminal[config.episode_length - 1 :: config.episode_length] = 1
-        terminal_rows = inferred_terminal.astype(bool)
-        next_observations[terminal_rows] = observations[terminal_rows]
-        terminals = inferred_terminal
-    else:
-        next_observations = np.asarray(next_observations, dtype=np.float32)
-
-    size = len(observations)
-    if not all(len(array) == size for array in (actions, rewards, next_observations)):
-        raise ValueError("All transition arrays must have equal lengths.")
-    if masks is not None:
-        masks = np.asarray(masks, dtype=np.float32).reshape(-1)
-    elif terminals is not None:
-        terminal_array = np.asarray(terminals, dtype=np.float32).reshape(-1)
-        if timeouts is not None:
-            terminal_array *= 1.0 - np.asarray(
-                timeouts, dtype=np.float32
+    dataset_path = Path(config.dataset_path).expanduser()
+    with h5py.File(dataset_path, "r") as dataset:
+        if "data" not in dataset:
+            raise KeyError(f"{dataset_path} does not contain a robomimic data group.")
+        for demo_key in sorted(dataset["data"].keys()):
+            demo = dataset[f"data/{demo_key}"]
+            if "obs" not in demo or "actions" not in demo:
+                raise KeyError(f"Demo {demo_key} is missing obs or actions.")
+            obs = flatten_robomimic_observations(demo["obs"], environment.obs_keys)
+            action = np.asarray(demo["actions"], dtype=np.float32)
+            reward = np.asarray(
+                demo["rewards"] if "rewards" in demo else np.zeros(len(action)),
+                dtype=np.float32,
             ).reshape(-1)
-        masks = 1.0 - terminal_array
-    else:
-        masks = np.ones(size, dtype=np.float32)
-    if len(masks) != size:
-        raise ValueError("Masks/terminals must match transition count.")
+            done = np.asarray(
+                demo["dones"] if "dones" in demo else np.zeros(len(action)),
+                dtype=np.float32,
+            ).reshape(-1)
+            if "next_obs" in demo:
+                next_obs = flatten_robomimic_observations(
+                    demo["next_obs"], environment.obs_keys
+                )
+            else:
+                if len(obs) < 2:
+                    continue
+                next_obs = np.concatenate([obs[1:], obs[-1:]], axis=0)
+                done[-1] = 1.0
+            if not (len(obs) == len(action) == len(reward) == len(next_obs) == len(done)):
+                raise ValueError(f"Demo {demo_key} has inconsistent transition lengths.")
+            observations.append(obs)
+            actions.append(action)
+            rewards.append(reward)
+            next_observations.append(next_obs)
+            masks.append(1.0 - done)
 
-    if config.max_samples is not None and size > config.max_samples:
-        rng = np.random.default_rng(config.seed)
-        indices = rng.choice(size, config.max_samples, replace=False)
-        observations = observations[indices]
-        actions = actions[indices]
-        rewards = rewards[indices]
-        next_observations = next_observations[indices]
-        masks = masks[indices]
-    return ReplayBuffer(
-        observations, actions, rewards, next_observations, masks
+    if not observations:
+        raise ValueError(f"No usable robomimic demos found in {dataset_path}.")
+    buffer = ReplayBuffer(
+        np.concatenate(observations),
+        np.concatenate(actions),
+        np.concatenate(rewards),
+        np.concatenate(next_observations),
+        np.concatenate(masks),
     )
+    if config.max_samples is not None and len(buffer) > config.max_samples:
+        rng = np.random.default_rng(config.seed)
+        indices = rng.choice(len(buffer), config.max_samples, replace=False)
+        buffer = ReplayBuffer(
+            buffer.observations[indices],
+            buffer.actions[indices],
+            buffer.rewards[indices],
+            buffer.next_observations[indices],
+            buffer.masks[indices],
+        )
+    return buffer
 
 
-def validate_config(config: FrozenOfflineConfig) -> None:
+def validate_config(config: ConfigView) -> None:
     if config.decoder_max_epochs < 1:
         raise ValueError("decoder_max_epochs must be positive.")
     if not 1 <= config.decoder_min_epochs <= config.decoder_max_epochs:
@@ -479,54 +272,46 @@ def validate_config(config: FrozenOfflineConfig) -> None:
 
 
 def make_dataset_environment(
-    config: FrozenOfflineConfig,
-) -> tuple[Any, str]:
-    """Create the environment corresponding to the selected offline dataset."""
-    if config.env_name is not None:
-        environment_source = config.env_name
-    elif config.d4rl_dataset is not None:
-        environment_source = config.d4rl_dataset
-    else:
-        raise ValueError(
-            "--env-name is required when loading a custom --data-path."
-        )
-    try:
-        environment = make_d4rl_env(environment_source)
-        environment_id = normalize_task(environment_source)
-    except Exception as error:
-        raise RuntimeError(
-            f"Could not create D4RL-compatible MJX environment "
-            f"{environment_source!r} for the offline dataset."
-        ) from error
-    return environment, environment_id
+    config: ConfigView,
+) -> tuple[RobomimicEnv, str]:
+    """Create robomimic exactly as in ``scripts/run_gorl_fm.py``."""
+    environment = RobomimicEnv(dataset_path=config.dataset_path)
+    return environment, config.env_name
 
 
 def make_encoder_config(
-    config: FrozenOfflineConfig,
+    config: ConfigView,
     action_dim: int,
     episode_length: int,
 ) -> encoder_ppo.EncoderConfig:
-    """Build checkpoint metadata for the shared Playground/MJX environment."""
+    """Build checkpoint metadata using the shared robomimic PPO config."""
     return encoder_ppo.EncoderConfig(
-        action_repeat=1,
+        action_repeat=config.action_repeat,
         batch_size=config.batch_size,
         discounting=config.discount,
-        entropy_cost=0.0,
+        entropy_cost=config.ppo_entropy_cost,
         episode_length=episode_length,
         learning_rate=config.actor_learning_rate,
-        normalize_observations=True,
-        num_envs=1,
-        num_evals=1,
-        num_minibatches=1,
-        num_timesteps=config.online_num_timesteps,
-        num_updates_per_batch=1,
-        reward_scaling=1.0,
-        unroll_length=1,
+        normalize_observations=config.ppo_normalize_observations,
+        num_envs=config.num_envs,
+        num_evals=config.ppo_num_evals,
+        num_minibatches=config.ppo_num_minibatches,
+        num_timesteps=config.ppo_num_timesteps,
+        num_updates_per_batch=config.ppo_num_updates_per_batch,
+        reward_scaling=config.ppo_reward_scaling,
+        unroll_length=config.ppo_unroll_length,
         z_dim=action_dim,
-        clipping_epsilon=config.online_clipping_epsilon,
-        z_regularization=config.online_z_regularization,
-        max_grad_norm=config.online_max_grad_norm,
-        use_tanh_jacobian_for_z=config.online_use_tanh_jacobian_for_z,
+        gae_lambda=config.ppo_gae_lambda,
+        normalize_advantage=config.ppo_normalize_advantage,
+        clipping_epsilon=(
+            config.ppo_clipping_epsilon
+            if config.ppo_clipping_epsilon is not None
+            else 0.15
+        ),
+        value_loss_coeff=config.ppo_value_loss_coeff,
+        z_regularization=config.ppo_z_regularization,
+        max_grad_norm=config.ppo_max_grad_norm,
+        use_tanh_jacobian_for_z=config.ppo_use_tanh_jacobian_for_z,
     )
 
 
@@ -686,7 +471,7 @@ def polyak_update(params: PyTree, targets: PyTree, tau: float) -> PyTree:
 
 
 def make_iql_update(
-    config: FrozenOfflineConfig,
+    config: ConfigView,
     actor_optimizer: optax.GradientTransformation,
     critic_optimizer: optax.GradientTransformation,
     value_optimizer: optax.GradientTransformation,
@@ -854,7 +639,7 @@ def append_metrics(path: Path, record: dict[str, Any]) -> None:
 
 def save_compatible_checkpoint(
     path: Path,
-    config: FrozenOfflineConfig,
+    config: ConfigView,
     online_config: encoder_ppo.EncoderConfig,
     decoder: DecoderFMState,
     encoder_params: encoder_ppo.ActorCriticParams,
@@ -884,7 +669,7 @@ def save_compatible_checkpoint(
         "fm_obs_stats": decoder.obs_stats,
         "online_encoder_config": online_config,
         # Offline-only training state/metadata.
-        "offline_config": asdict(config),
+        "offline_config": dict(config),
         "q1_params": q1_params,
         "q2_params": q2_params,
         "value_params": value_params,
@@ -900,7 +685,7 @@ def save_compatible_checkpoint(
 
 def save_encoder_checkpoint(
     path: Path,
-    config: FrozenOfflineConfig,
+    config: ConfigView,
     online_config: encoder_ppo.EncoderConfig,
     decoder: DecoderFMState,
     encoder_params: encoder_ppo.ActorCriticParams,
@@ -922,14 +707,14 @@ def save_encoder_checkpoint(
         pickle.dump(checkpoint, file)
 
 
-def main(config: FrozenOfflineConfig) -> None:
+def main(config: ConfigView) -> None:
     validate_config(config)
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = output_dir / "metrics.jsonl"
     with open(output_dir / "config.json", "w") as file:
         json.dump(
-            {**asdict(config), "method": "frozen_decoder"},
+            {**dict(config), "method": "frozen_decoder"},
             file,
             indent=2,
         )
@@ -937,21 +722,21 @@ def main(config: FrozenOfflineConfig) -> None:
     logger = WandbLogger(config)
     rng = np.random.default_rng(config.seed)
     try:
-        buffer = load_replay_buffer(config)
         env, environment_id = make_dataset_environment(config)
+        buffer = load_replay_buffer(config, env)
         config.env_name = environment_id
         obs_dim = buffer.observations.shape[-1]
         action_dim = buffer.actions.shape[-1]
         if env.observation_size != obs_dim:
             raise ValueError(
                 f"Dataset observation dim {obs_dim} does not match "
-                f"{environment_id} MJX observation size "
+                f"{environment_id} robomimic observation size "
                 f"{env.observation_size}."
             )
         if env.action_size != action_dim:
             raise ValueError(
                 f"Dataset action dim {action_dim} does not match "
-                f"{environment_id} MJX action size {env.action_size}."
+                f"{environment_id} robomimic action size {env.action_size}."
             )
         episode_length = int(config.episode_length)
         online_config = make_encoder_config(
@@ -960,7 +745,7 @@ def main(config: FrozenOfflineConfig) -> None:
         with open(output_dir / "config.json", "w") as file:
             json.dump(
                 {
-                    **asdict(config),
+                    **dict(config),
                     "method": "frozen_decoder",
                     "resolved_environment": environment_id,
                 },
@@ -974,17 +759,17 @@ def main(config: FrozenOfflineConfig) -> None:
         )
         decoder_config = DecoderFMConfig(
             flow_steps=config.flow_steps,
-            timestep_embed_dim=8,
+            timestep_embed_dim=config.timestep_embed_dim,
             hidden_dims=(config.decoder_hidden_size,)
             * config.decoder_num_layers,
-            policy_output_scale=1.0,
+            policy_output_scale=config.fm_policy_output_scale,
             learning_rate=config.decoder_learning_rate,
             batch_size=config.decoder_batch_size,
             num_epochs=config.decoder_max_epochs,
             n_samples_per_action=config.n_fm_samples_per_action,
-            normalize_observations=True,
-            sde_sigma=0.0,
-            feather_std=0.0,
+            normalize_observations=config.fm_normalize_observations,
+            sde_sigma=config.fm_sde_sigma,
+            feather_std=config.fm_feather_std,
         )
         decoder = DecoderFMState.init(
             decoder_key, obs_dim, action_dim, decoder_config
@@ -995,7 +780,7 @@ def main(config: FrozenOfflineConfig) -> None:
             )
 
         # Keep the same policy/value layer layouts used by EncoderState.init,
-        # but size their inputs from the matching D4RL/Gym environment.
+        # sized from the matching robomimic environment.
         actor_params = networks.mlp_init(
             actor_key, (obs_dim, 32, 32, 32, 32, action_dim * 2)
         )
@@ -1283,4 +1068,4 @@ def main(config: FrozenOfflineConfig) -> None:
 
 
 if __name__ == "__main__":
-    main(tyro.cli(FrozenOfflineConfig))
+    main(build_config())
