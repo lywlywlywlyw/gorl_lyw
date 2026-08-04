@@ -20,17 +20,15 @@ The final pickle has both:
 Example:
     python run_offline_fm_frozen_robomimic.py
 
-Environment, dataset, PPO, and FM parameters are sourced from
-``EnvConfig`` and ``TrainingConfig`` exactly as in ``scripts/run_gorl_fm.py``.
-Offline-IQL-only parameters live in ``OfflineIQLConfig`` below.
+All environment, frozen-FM, IQL, checkpoint-metadata, and logging parameters
+are sourced from ``envs.robomimic.offline_config``.
 """
 
 from __future__ import annotations
 
-import datetime
 import json
 import pickle
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -43,8 +41,8 @@ from jax import numpy as jnp
 from tqdm import trange
 
 from envs.robomimic.RobomimicEnv import RobomimicEnv
-from envs.robomimic.online_config.env_config import EnvConfig
-from envs.robomimic.online_config.training_config import TrainingConfig
+from envs.robomimic.offline_config.env_config import EnvConfig
+from envs.robomimic.offline_config.training_config import TrainingConfig
 from flow_policy import encoder_ppo, math_utils, networks
 from flow_policy.decoder_fm import DecoderFMConfig, DecoderFMState
 
@@ -65,48 +63,11 @@ class ConfigView(dict[str, Any]):
         self[name] = value
 
 
-@dataclass
-class OfflineIQLConfig:
-    """Parameters specific to frozen-decoder offline IQL training."""
-
-    output_dir: str = (
-        "results/offline_fm_frozen_robomimic_"
-        + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    )
-
-    # Decoder: train once to convergence, then freeze permanently.
-    decoder_min_epochs: int = 20
-    decoder_patience: int = 20
-    decoder_min_delta: float = 1e-4
-    decoder_eval_batches: int = 32
-    latent_inverse_steps: int = 10
-
-    # IQL encoder. The policy and value layouts are fixed by EncoderState.init.
-    encoder_iql_steps: int = 500_000
-    expectile: float = 0.8
-    temperature: float = 0.1
-    max_adv_weight: float = 100.0
-    target_update_rate: float = 0.005
-    critic_learning_rate: float = 3e-4
-    value_learning_rate: float = 3e-4
-    q_hidden_size: int = 256
-    q_hidden_layers: int = 2
-    log_interval: int = 1000
-    comparison_samples: int = 4096
-    checkpoint_interval: int = 100_000
-
-    wandb_name: str | None = "frozen-seed-0_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-
-
 def build_config() -> ConfigView:
-    """Use the same shared config composition as ``scripts/run_gorl_fm.py``."""
-    config = ConfigView(
-        TrainingConfig().to_dict()
-        | EnvConfig().to_dict()
-        | asdict(OfflineIQLConfig())
-    )
-    # Internal aliases keep the offline algorithm readable while sourcing all
-    # overlapping environment, PPO, FM, and W&B values from shared configs.
+    """Compose the robomimic frozen-IQL configuration from offline configs."""
+    config = ConfigView(TrainingConfig().to_dict() | EnvConfig().to_dict())
+    # Internal aliases keep the implementation names aligned with the generic
+    # reference script while all values remain owned by offline_config.
     config.update(
         max_samples=config["fm_max_samples"],
         decoder_learning_rate=config["fm_learning_rate"],
@@ -118,9 +79,11 @@ def build_config() -> ConfigView:
         flow_steps=config["fm_flow_steps"],
         timestep_embed_dim=config["fm_timestep_embed_dim"],
         n_fm_samples_per_action=config["fm_n_samples_per_action"],
-        batch_size=config["ppo_batch_size"],
-        discount=config["ppo_discounting"],
-        actor_learning_rate=config["ppo_learning_rate"],
+        decoder_min_epochs=config["fm_min_epochs"],
+        decoder_patience=config["fm_patience"],
+        decoder_min_delta=config["fm_min_delta"],
+        decoder_eval_batches=config["fm_eval_batches"],
+        latent_inverse_steps=config["fm_latent_inverse_steps"],
     )
     return config
 
@@ -284,34 +247,27 @@ def make_encoder_config(
     action_dim: int,
     episode_length: int,
 ) -> encoder_ppo.EncoderConfig:
-    """Build checkpoint metadata using the shared robomimic PPO config."""
+    """Build the same online checkpoint metadata as the reference script."""
     return encoder_ppo.EncoderConfig(
-        action_repeat=config.action_repeat,
+        action_repeat=1,
         batch_size=config.batch_size,
         discounting=config.discount,
-        entropy_cost=config.ppo_entropy_cost,
+        entropy_cost=0.0,
         episode_length=episode_length,
         learning_rate=config.actor_learning_rate,
-        normalize_observations=config.ppo_normalize_observations,
-        num_envs=config.num_envs,
-        num_evals=config.ppo_num_evals,
-        num_minibatches=config.ppo_num_minibatches,
-        num_timesteps=config.ppo_num_timesteps,
-        num_updates_per_batch=config.ppo_num_updates_per_batch,
-        reward_scaling=config.ppo_reward_scaling,
-        unroll_length=config.ppo_unroll_length,
+        normalize_observations=True,
+        num_envs=1,
+        num_evals=1,
+        num_minibatches=1,
+        num_timesteps=config.online_num_timesteps,
+        num_updates_per_batch=1,
+        reward_scaling=1.0,
+        unroll_length=1,
         z_dim=action_dim,
-        gae_lambda=config.ppo_gae_lambda,
-        normalize_advantage=config.ppo_normalize_advantage,
-        clipping_epsilon=(
-            config.ppo_clipping_epsilon
-            if config.ppo_clipping_epsilon is not None
-            else 0.15
-        ),
-        value_loss_coeff=config.ppo_value_loss_coeff,
-        z_regularization=config.ppo_z_regularization,
-        max_grad_norm=config.ppo_max_grad_norm,
-        use_tanh_jacobian_for_z=config.ppo_use_tanh_jacobian_for_z,
+        clipping_epsilon=config.online_clipping_epsilon,
+        z_regularization=config.online_z_regularization,
+        max_grad_norm=config.online_max_grad_norm,
+        use_tanh_jacobian_for_z=config.online_use_tanh_jacobian_for_z,
     )
 
 
