@@ -28,3 +28,4 @@ results/
 nohup*.out
 output*.log
 ref/
+evaluation_videos/

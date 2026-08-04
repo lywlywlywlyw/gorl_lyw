@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import multiprocessing as mp
 import os
+import traceback
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -26,9 +27,10 @@ def _environment_worker(connection: Any, env_type: type, dataset_path: str) -> N
     os.environ["JAX_PLATFORMS"] = "cpu"
     os.environ["JAX_PLATFORM_NAME"] = "cpu"
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-    env = env_type(dataset_path=dataset_path)
+    env = None
     state = None
     try:
+        env = env_type(dataset_path=dataset_path)
         while True:
             command, payload = connection.recv()
             try:
@@ -45,12 +47,17 @@ def _environment_worker(connection: Any, env_type: type, dataset_path: str) -> N
                 else:
                     raise ValueError(f"Unknown worker command: {command}")
                 connection.send((True, result))
-            except Exception as exc:
-                connection.send((False, f"{type(exc).__name__}: {exc}"))
+            except Exception:
+                connection.send((False, traceback.format_exc()))
     except (EOFError, BrokenPipeError):
         pass
+    except Exception:
+        try:
+            connection.send((False, traceback.format_exc()))
+        except (BrokenPipeError, EOFError, OSError):
+            pass
     finally:
-        close = getattr(getattr(env, "env", env), "close", None)
+        close = getattr(getattr(env, "env", env), "close", None) if env is not None else None
         if callable(close):
             close()
         connection.close()

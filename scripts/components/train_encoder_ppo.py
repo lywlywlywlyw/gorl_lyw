@@ -258,12 +258,28 @@ def main(
     if not stage_init_before_training:
         required_fields = {"ppo_z_params", "ppo_z_obs_stats"}
         missing_fields = sorted(required_fields.difference(decoder_checkpoint))
-        if missing_fields:
+
+        # A pure-online run starts stage 0 from the identity decoder, which does
+        # not contain an encoder state yet. In that one case, keep the freshly
+        # initialized encoder above. Later stages must always resume from the
+        # checkpoint produced by the preceding stage. If stage 0 starts from an
+        # offline checkpoint that carries PPO state, resume it as before.
+        should_resume_encoder = not (
+            stage == 0 and decoder_checkpoint.get("is_identity", False)
+        )
+        if should_resume_encoder and missing_fields:
             raise ValueError(
-                "stage_init_before_training=False requires an offline or previous "
-                "stage checkpoint containing the encoder state; missing fields in "
-                f"{decoder_model_path}: {missing_fields}"
+                "stage_init_before_training=False requires previous encoder state "
+                f"for stage {stage}; missing fields in {decoder_model_path}: "
+                f"{missing_fields}"
             )
+        if not should_resume_encoder:
+            print(
+                "Initializing encoder normally for online stage 0; decoder "
+                "checkpoint contains no previous encoder state."
+            )
+
+    if not stage_init_before_training and should_resume_encoder:
         checkpoint_z_dim = decoder_checkpoint.get("z_dim")
         if checkpoint_z_dim is not None and int(checkpoint_z_dim) != z_dim:
             raise ValueError(

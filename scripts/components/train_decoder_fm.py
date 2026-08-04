@@ -85,28 +85,55 @@ def train_fm(
     resume_checkpoint = None
     resume_checkpoint_path = None
     if not stage_init_before_training:
-        resume_checkpoint_path = data.get("fm_model")
-        if not resume_checkpoint_path:
+        checkpoint_from_data = data.get("fm_model")
+        if stage > 0 and not checkpoint_from_data:
             raise ValueError(
-                "stage_init_before_training=False requires collected data with "
-                "an 'fm_model' checkpoint path. This mode must start from an "
-                "offline checkpoint and continue from the decoder used to collect data."
+                "stage_init_before_training=False requires collected data with an "
+                f"'fm_model' checkpoint path for stage {stage}."
             )
-        resume_checkpoint_path = Path(resume_checkpoint_path).expanduser()
-        if not resume_checkpoint_path.is_file():
-            raise FileNotFoundError(
-                f"Decoder resume checkpoint not found: {resume_checkpoint_path}"
+
+        if checkpoint_from_data:
+            candidate_path = Path(checkpoint_from_data).expanduser()
+            if not candidate_path.is_file():
+                raise FileNotFoundError(
+                    f"Decoder checkpoint referenced by collected data was not found: "
+                    f"{candidate_path}"
+                )
+            with candidate_path.open("rb") as f:
+                candidate_checkpoint = pickle.load(f)
+            if not isinstance(candidate_checkpoint, dict):
+                raise ValueError(
+                    f"Decoder checkpoint must contain a dictionary: {candidate_path}"
+                )
+
+            # In a pure-online run, stage 0 data is collected with the identity
+            # decoder. That checkpoint is only a bootstrap policy, not a trained
+            # state to resume, so initialize the trainable FM network normally.
+            # Offline stage-0 checkpoints and every later-stage checkpoint are
+            # still restored directly.
+            should_resume_decoder = stage > 0 or not candidate_checkpoint.get(
+                "is_identity", False
             )
-        with resume_checkpoint_path.open("rb") as f:
-            resume_checkpoint = pickle.load(f)
-        required_fields = {"params", "obs_stats", "config", "obs_dim", "action_dim"}
-        missing_fields = sorted(required_fields.difference(resume_checkpoint))
-        if missing_fields:
-            raise ValueError(
-                f"Decoder resume checkpoint {resume_checkpoint_path} is missing "
-                f"required fields: {missing_fields}"
-            )
-        print(f"Continuing decoder training from: {resume_checkpoint_path}")
+            if should_resume_decoder:
+                required_fields = {
+                    "params", "obs_stats", "config", "obs_dim", "action_dim"
+                }
+                missing_fields = sorted(
+                    required_fields.difference(candidate_checkpoint)
+                )
+                if missing_fields:
+                    raise ValueError(
+                        f"Decoder resume checkpoint {candidate_path} is missing "
+                        f"required fields: {missing_fields}"
+                    )
+                resume_checkpoint_path = candidate_path
+                resume_checkpoint = candidate_checkpoint
+                print(f"Continuing decoder training from: {resume_checkpoint_path}")
+            else:
+                print(
+                    "Initializing decoder normally for online stage 0; identity "
+                    "checkpoint is used only for data collection."
+                )
 
     states = data["states"]
     actions = data["actions"]

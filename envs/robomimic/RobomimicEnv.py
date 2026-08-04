@@ -21,6 +21,10 @@ class RobomimicEnv(BaseEnv):
         self.reward_shaping = reward_shaping
         self.obs_keys = self.load_dataset()
         self.env = self.load_env()
+        # Environment construction imports several robomimic modules. Rebuild the
+        # process-global modality map immediately before shape inference instead
+        # of relying on initialization side effects from load_env().
+        self.initialize_obs_modalities()
         self.shape_meta = FileUtils.get_shape_metadata_from_dataset(
             dataset_config={"path": self.dataset_path},
             action_keys=["actions"],
@@ -28,12 +32,15 @@ class RobomimicEnv(BaseEnv):
             verbose=True,
         )
 
-    def load_env(self):
+    def initialize_obs_modalities(self):
         ObsUtils.initialize_obs_modality_mapping_from_dict(
             modality_mapping={
                 "low_dim": self.obs_keys,
             }
         )
+
+    def load_env(self):
+        self.initialize_obs_modalities()
         env_meta = FileUtils.get_env_metadata_from_dataset(self.dataset_path)
         # Override the dataset setting before robomimic constructs robosuite.
         # This is forwarded by create_env_from_metadata -> robosuite.make.
@@ -64,8 +71,14 @@ class RobomimicEnv(BaseEnv):
         )
 
     def flatten_obs_dict(self, obs_dict: dict) -> jax.Array:
+        missing_keys = [key for key in self.obs_keys if key not in obs_dict]
+        if missing_keys:
+            raise KeyError(
+                "Robomimic environment observation is missing dataset keys "
+                f"{missing_keys}; available keys: {sorted(obs_dict)}"
+            )
         return jnp.concatenate(
-            [jnp.ravel(jnp.asarray(v)) for v in obs_dict.values()],
+            [jnp.ravel(jnp.asarray(obs_dict[key])) for key in self.obs_keys],
             axis=0,
         )
 

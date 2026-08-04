@@ -77,6 +77,12 @@ def run_command(
     return process.returncode
 
 
+def _tyro_bool_flag(name: str, enabled: bool) -> str:
+    """Return the Tyro flag for a boolean option without a separate value."""
+    option = name.replace("_", "-")
+    return f"--{option}" if enabled else f"--no-{option}"
+
+
 def _validate_offline_checkpoint(
     checkpoint_path: Path,
     expected_obs_dim: int,
@@ -326,7 +332,9 @@ def main(
             f"--stage {stage}",
             f"--global_step_offset {stage_step_offset}",
             f"--metrics_file {encoder_metrics_file}",
-            f"--stage_init_before_training {stage_init_before_training}",
+            _tyro_bool_flag(
+                "stage_init_before_training", stage_init_before_training
+            ),
         ])
 
         if wandb_run is not None:
@@ -402,7 +410,9 @@ def main(
             f"--stage {stage}",
             f"--global_epoch_offset {stage * config['fm_num_epochs']}",
             f"--metrics_file {decoder_metrics_file}",
-            f"--stage_init_before_training {stage_init_before_training}"
+            _tyro_bool_flag(
+                "stage_init_before_training", stage_init_before_training
+            ),
         ]
 
         cmd = " ".join(fm_cmd_parts)
