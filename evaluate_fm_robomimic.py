@@ -26,7 +26,7 @@ import numpy as np
 import tyro
 from jax import numpy as jnp
 
-
+from envs.robomimic.online_config.env_config import EnvConfig
 # Importing ``robomimic.utils.file_utils`` also imports its language utilities,
 # which eagerly construct CLIP. Evaluation only needs dataset metadata, and a
 # missing internet route must not make startup hang while Hugging Face checks
@@ -48,7 +48,6 @@ class EvaluationConfig:
     seed: int = 0
     deterministic: bool = True
     apply_tanh: bool | None = None
-    reward_shaping: bool = True
     render: bool = False
     render_camera: str = "agentview"
     video_dir: str | None = "evaluation_videos"
@@ -298,9 +297,10 @@ def load_policy(config: EvaluationConfig) -> LoadedPolicy:
     dataset_path = _resolve_dataset_path(
         (checkpoint, encoder_checkpoint, decoder_checkpoint), config
     )
+    env_config = EnvConfig().to_dict()
     env = _make_evaluation_env(
         dataset_path,
-        config.reward_shaping,
+        env_config['dense_reward'],
         render_offscreen=config.video_dir is not None,
     )
     # An online encoder checkpoint embeds the decoder that was used to train

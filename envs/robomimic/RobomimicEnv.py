@@ -16,21 +16,35 @@ class RobomimicEnv(BaseEnv):
         render_offscreen: bool = False,
         reward_shaping: bool = True,
     ):
+        # Keep construction / cleanup safe when this class is repeatedly created
+        # inside spawned rollout workers. In particular, robosuite owns native
+        # MuJoCo / EGL resources that must be released explicitly instead of being
+        # left to Python interpreter shutdown.
+        self.env = None
+        self._closed = False
         self.dataset_path = dataset_path
         self.render_offscreen = render_offscreen
         self.reward_shaping = reward_shaping
-        self.obs_keys = self.load_dataset()
-        self.env = self.load_env()
-        # Environment construction imports several robomimic modules. Rebuild the
-        # process-global modality map immediately before shape inference instead
-        # of relying on initialization side effects from load_env().
-        self.initialize_obs_modalities()
-        self.shape_meta = FileUtils.get_shape_metadata_from_dataset(
-            dataset_config={"path": self.dataset_path},
-            action_keys=["actions"],
-            all_obs_keys=self.obs_keys,
-            verbose=True,
-        )
+        try:
+            self.obs_keys = self.load_dataset()
+            self.env = self.load_env()
+            # Environment construction imports several robomimic modules. Rebuild the
+            # process-global modality map immediately before shape inference instead
+            # of relying on initialization side effects from load_env().
+            self.initialize_obs_modalities()
+            self.shape_meta = FileUtils.get_shape_metadata_from_dataset(
+                dataset_config={"path": self.dataset_path},
+                action_keys=["actions"],
+                all_obs_keys=self.obs_keys,
+                verbose=True,
+            )
+        except BaseException:
+            try:
+                self.close()
+            except Exception:
+                # Preserve the construction error; cleanup is best effort here.
+                pass
+            raise
 
     def initialize_obs_modalities(self):
         ObsUtils.initialize_obs_modality_mapping_from_dict(
@@ -91,6 +105,40 @@ class RobomimicEnv(BaseEnv):
             done=jnp.asarray(done),
             info=info,
         )
+
+    def close(self) -> None:
+        """Idempotently release the wrapped robosuite MuJoCo / EGL resources."""
+        if self._closed:
+            return
+        self._closed = True
+
+        env = self.env
+        self.env = None
+        if env is None:
+            return
+
+        close = getattr(env, "close", None)
+        if callable(close):
+            close()
+            return
+
+        # robomimic's EnvRobosuite wrapper does not expose close(), but its
+        # ``env`` member is the actual robosuite MujocoEnv and does. Calling
+        # that public method releases MjSim and its offscreen EGL context before
+        # the spawned worker interpreter starts tearing modules down.
+        wrapped_env = getattr(env, "env", None)
+        wrapped_close = getattr(wrapped_env, "close", None)
+        if callable(wrapped_close):
+            wrapped_close()
+
+    def __del__(self) -> None:
+        """Best-effort fallback for callers that forget to close the environment."""
+        try:
+            self.close()
+        except Exception:
+            # Destructors run during partially torn-down interpreter state and must
+            # never mask the original worker error.
+            pass
     
     @property
     def action_size(self) -> int:

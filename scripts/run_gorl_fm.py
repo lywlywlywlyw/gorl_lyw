@@ -214,7 +214,7 @@ def main(
     # and dataset runtime dependencies to be installed and importable.
     from envs.robomimic.RobomimicEnv import RobomimicEnv
 
-    env = RobomimicEnv(dataset_path=config['dataset_path'])
+    env = RobomimicEnv(dataset_path=config['dataset_path'], reward_shaping=config['dense_reward'])
     z_dim = env.action_size
     obs_dim = env.observation_size
     del env

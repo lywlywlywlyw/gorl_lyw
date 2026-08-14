@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from flow_policy.decoder_fm import DecoderFMConfig, DecoderFMState
 from envs.robomimic.RobomimicEnv import RobomimicEnv
 from envs.robomimic.online_config.decoder_configs.fm_config import FlowMatchingConfig
-
+from envs.robomimic.online_config.env_config import EnvConfig
 def main(
     env_name: str = "Lift",
     dataset_path: str = "/root/GoRL/datasets/robomimic/low_dim.hdf5",
@@ -33,9 +33,9 @@ def main(
         output_dir: Directory to save the checkpoint
         seed: Random seed for initialization
     """
-    fm_configs = FlowMatchingConfig().to_dict()
+    fm_configs = FlowMatchingConfig().to_dict() | EnvConfig().to_dict()
     # Load environment to get dimensions
-    env = RobomimicEnv(dataset_path=dataset_path)
+    env = RobomimicEnv(dataset_path=dataset_path, reward_shaping=fm_configs['dense_reward'])
 
     obs_dim = env.observation_size
     action_dim = env.action_size

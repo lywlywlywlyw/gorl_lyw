@@ -247,7 +247,7 @@ def make_dataset_environment(
     config: ConfigView,
 ) -> tuple[RobomimicEnv, str]:
     """Create robomimic exactly as in ``scripts/run_gorl_fm.py``."""
-    environment = RobomimicEnv(dataset_path=config.dataset_path)
+    environment = RobomimicEnv(dataset_path=config.dataset_path, reward_shaping=config.dense_reward)
     return environment, config.env_name
 
 

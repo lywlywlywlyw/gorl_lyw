@@ -38,9 +38,10 @@ def _record_eval_video(
     fps: int,
     apply_tanh_in_rollout: bool,
     output_path: Path,
+    reward_shaping: bool = False
 ):
     """Record one deterministic offscreen evaluation episode."""
-    video_env = RobomimicEnv(dataset_path=dataset_path, render_offscreen=True)
+    video_env = RobomimicEnv(dataset_path=dataset_path, render_offscreen=True, reward_shaping=reward_shaping)
     frames = []
     prng = jax.random.key(seed)
     state = video_env.reset(prng)
@@ -197,7 +198,7 @@ def main(
 
     # Initialize environment
     # env = registry.load(env_name, config=env_config)
-    env = RobomimicEnv(dataset_path=config['dataset_path'])
+    env = RobomimicEnv(dataset_path=config['dataset_path'], reward_shaping=config['dense_reward'])
 
     z_dim = env.action_size
 
@@ -438,6 +439,7 @@ def main(
                                 results_dir / "videos" /
                                 f"stage_{stage}_eval_{eval_count:03d}.mp4"
                             ),
+                            reward_shaping=config['dense_reward'],
                         )
                         if wandb_run is not None:
                             eval_log["video/evaluation"] = wandb.Video(str(video))

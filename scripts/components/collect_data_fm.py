@@ -67,7 +67,7 @@ def main(
         fm_config_source = pickle.load(f)
 
     # Setup environment
-    env = RobomimicEnv(dataset_path=config['dataset_path'])
+    env = RobomimicEnv(dataset_path=config['dataset_path'], reward_shaping=config['dense_reward'])
     z_dim = env.action_size 
     # Get config from checkpoint or create new one
     if "config" in ppo_z_checkpoint:
