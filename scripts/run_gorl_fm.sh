@@ -75,7 +75,7 @@ TF_NUM_INTRAOP_THREADS=1 \
 TF_NUM_INTEROP_THREADS=1 \
 MUJOCO_GL=egl \
 PYOPENGL_PLATFORM=egl \
-CUDA_VISIBLE_DEVICES=1 \
+CUDA_VISIBLE_DEVICES=2 \
 PYTHONPATH=/root/GoRL:/root/GoRL/envs/robomimic \
 python -u run_offline_fm_frozen_robomimic.py \
 > logs/gorl_offline-$(date +%Y%m%d_%H%M%S).log 2>&1 < /dev/null &

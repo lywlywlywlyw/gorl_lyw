@@ -9,7 +9,8 @@ class FlowMatchingConfig:
     fm_hidden_size: int = 64
     fm_num_layers: int = 4
     fm_batch_size: int = 8192
-    fm_num_epochs: int = 200
+    fm_num_epochs: int = 2000000
+    fm_checkpoint_interval: int = 10000
     fm_max_samples: int | None = None
     fm_min_epochs: int = 20
     fm_patience: int = 20

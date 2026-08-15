@@ -18,6 +18,10 @@ class TrainingConfig:
     )
     decoder_type: str = "fm"
     encoder_type: str = "iql"
+    # Optional offline checkpoint produced by run_offline_fm_frozen_robomimic.py.
+    # Decoder-only checkpoints resume decoder training; combined checkpoints
+    # resume directly from the encoder stage.
+    checkpoint_path: str | None = None
 
     # Parameters saved in the online-compatible EncoderConfig. These mirror
     # FrozenOfflineConfig in run_offline_fm_frozen_new.py.

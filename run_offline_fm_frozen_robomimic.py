@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import pickle
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,6 +46,7 @@ import jax
 import jax_dataclasses as jdc
 import numpy as np
 import optax
+import tyro
 from jax import Array
 from jax import numpy as jnp
 from tqdm import trange
@@ -72,9 +74,10 @@ class ConfigView(dict[str, Any]):
         self[name] = value
 
 
-def build_config() -> ConfigView:
+def build_config(training_config: TrainingConfig | None = None) -> ConfigView:
     """Compose the robomimic frozen-IQL configuration from offline configs."""
-    config = ConfigView(TrainingConfig().to_dict() | EnvConfig().to_dict())
+    training_config = training_config or TrainingConfig()
+    config = ConfigView(training_config.to_dict() | EnvConfig().to_dict())
     # Internal aliases keep the implementation names aligned with the generic
     # reference script while all values remain owned by offline_config.
     config.update(
@@ -84,6 +87,7 @@ def build_config() -> ConfigView:
         decoder_num_layers=config["fm_num_layers"],
         decoder_batch_size=config["fm_batch_size"],
         decoder_max_epochs=config["fm_num_epochs"],
+        decoder_checkpoint_interval=config["fm_checkpoint_interval"],
         decoder_validation_fraction=config["fm_validation_split"],
         flow_steps=config["fm_flow_steps"],
         timestep_embed_dim=config["fm_timestep_embed_dim"],
@@ -237,6 +241,7 @@ def validate_config(config: ConfigView) -> None:
         config.latent_inverse_steps,
         config.comparison_samples,
         config.checkpoint_interval,
+        config.decoder_checkpoint_interval,
     ) < 1:
         raise ValueError("Batch sizes and step/sample counts must be positive.")
     if config.wandb_mode not in {"online", "offline", "disabled"}:
@@ -602,6 +607,112 @@ def append_metrics(path: Path, record: dict[str, Any]) -> None:
         file.write(json.dumps(record) + "\n")
 
 
+def load_checkpoint(path: str | None) -> tuple[dict[str, Any] | None, Path | None]:
+    if path is None:
+        return None, None
+    checkpoint_path = Path(path).expanduser().resolve()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
+    with open(checkpoint_path, "rb") as file:
+        checkpoint = pickle.load(file)
+    if not isinstance(checkpoint, dict):
+        raise TypeError(f"Checkpoint must contain a dictionary: {checkpoint_path}")
+    return checkpoint, checkpoint_path
+
+
+def checkpoint_iql_step(checkpoint: dict[str, Any], path: Path | None) -> int:
+    if "encoder_iql_step" in checkpoint:
+        return int(checkpoint["encoder_iql_step"])
+    if path is not None:
+        match = re.search(r"checkpoint_step_(\d+)", path.name)
+        if match is not None:
+            return int(match.group(1))
+    return int(checkpoint.get("iteration", 0))
+
+
+def checkpoint_decoder_epoch(
+    checkpoint: dict[str, Any], path: Path | None
+) -> int:
+    if "decoder_epoch" in checkpoint:
+        return int(checkpoint["decoder_epoch"])
+    if path is not None:
+        match = re.search(r"decoder_checkpoint_epoch_(\d+)", path.name)
+        if match is not None:
+            return int(match.group(1))
+    return int(checkpoint.get("epoch", 0))
+
+
+def is_combined_checkpoint(checkpoint: dict[str, Any]) -> bool:
+    checkpoint_type = checkpoint.get("offline_checkpoint_type")
+    if checkpoint_type is not None:
+        return checkpoint_type == "decoder_encoder"
+    return all(
+        key in checkpoint
+        for key in ("ppo_z_params", "q1_params", "q2_params", "value_params")
+    )
+
+
+def restore_decoder(
+    decoder: DecoderFMState, checkpoint: dict[str, Any]
+) -> DecoderFMState:
+    params = checkpoint.get("params", checkpoint.get("fm_params"))
+    obs_stats = checkpoint.get("obs_stats", checkpoint.get("fm_obs_stats"))
+    if params is None or obs_stats is None:
+        raise KeyError("Checkpoint is missing decoder params or observation stats.")
+    with jdc.copy_and_mutate(decoder) as restored:
+        restored.params = params
+        restored.obs_stats = obs_stats
+        if "decoder_opt_state" in checkpoint:
+            restored.opt_state = checkpoint["decoder_opt_state"]
+        if "decoder_prng" in checkpoint:
+            restored.prng = checkpoint["decoder_prng"]
+        if "decoder_steps" in checkpoint:
+            restored.steps = checkpoint["decoder_steps"]
+    return restored
+
+
+def save_decoder_checkpoint(
+    path: Path,
+    config: ConfigView,
+    decoder: DecoderFMState,
+    decoder_epoch: int,
+    global_step: int,
+    best_params: PyTree,
+    best_validation: float,
+    stale_epochs: int,
+    rng: np.random.Generator,
+    key: Array,
+) -> None:
+    action_dim = int(decoder.params[-1][0].shape[-1])
+    checkpoint = {
+        "checkpoint_format": "gorl_offline_fm_decoder",
+        "checkpoint_version": 2,
+        "offline_checkpoint_type": "decoder",
+        "training_phase": "decoder",
+        # Keep the standard standalone decoder fields for interoperability.
+        "params": decoder.params,
+        "obs_stats": decoder.obs_stats,
+        "config": decoder.config,
+        "obs_dim": int(decoder.obs_stats.mean.shape[-1]),
+        "action_dim": action_dim,
+        "epoch": decoder_epoch,
+        "decoder_epoch": decoder_epoch,
+        "global_step": global_step,
+        # Offline training state required for an exact continuation.
+        "decoder_opt_state": decoder.opt_state,
+        "decoder_prng": decoder.prng,
+        "decoder_steps": decoder.steps,
+        "decoder_best_params": best_params,
+        "decoder_best_validation": best_validation,
+        "decoder_stale_epochs": stale_epochs,
+        "numpy_rng_state": rng.bit_generator.state,
+        "jax_key": key,
+        "offline_config": dict(config),
+    }
+    with open(path, "wb") as file:
+        pickle.dump(checkpoint, file)
+
+
 def save_compatible_checkpoint(
     path: Path,
     config: ConfigView,
@@ -612,6 +723,15 @@ def save_compatible_checkpoint(
     q1_params: PyTree,
     q2_params: PyTree,
     value_params: PyTree,
+    decoder_epoch: int,
+    encoder_iql_step: int,
+    actor_opt_state: PyTree,
+    critic_opt_state: PyTree,
+    value_opt_state: PyTree,
+    target_q1_params: PyTree,
+    target_q2_params: PyTree,
+    rng: np.random.Generator,
+    key: Array,
 ) -> None:
     obs_dim = int(decoder.obs_stats.mean.shape[-1])
     action_dim = int(decoder.params[-1][0].shape[-1])
@@ -620,13 +740,17 @@ def save_compatible_checkpoint(
         # decoder fields below at the top level for train_encoder_ppo.py.
         "checkpoint_format": "gorl_fm_decoder",
         "checkpoint_version": 1,
+        "offline_checkpoint_type": "decoder_encoder",
+        "training_phase": "encoder",
         # Standalone FM schema loaded by train_encoder_ppo.py.
         "params": decoder.params,
         "obs_stats": decoder.obs_stats,
         "config": decoder.config,
         "obs_dim": obs_dim,
         "action_dim": action_dim,
-        "epoch": config.decoder_max_epochs,
+        "epoch": decoder_epoch,
+        "decoder_epoch": decoder_epoch,
+        "encoder_iql_step": encoder_iql_step,
         "is_frozen_offline": True,
         # Combined online encoder schema loaded by collect_data_fm.py.
         "ppo_z_params": encoder_params,
@@ -643,6 +767,13 @@ def save_compatible_checkpoint(
         "q1_params": q1_params,
         "q2_params": q2_params,
         "value_params": value_params,
+        "actor_opt_state": actor_opt_state,
+        "critic_opt_state": critic_opt_state,
+        "value_opt_state": value_opt_state,
+        "target_q1_params": target_q1_params,
+        "target_q2_params": target_q2_params,
+        "numpy_rng_state": rng.bit_generator.state,
+        "jax_key": key,
     }
     # collect_data_fm.py interprets "config" as EncoderConfig, while
     # train_encoder_ppo.py interprets it as DecoderFMConfig. One file cannot
@@ -692,6 +823,7 @@ def main(config: ConfigView) -> None:
     logger = WandbLogger(config)
     rng = np.random.default_rng(config.seed)
     try:
+        resume_checkpoint, resume_path = load_checkpoint(config.checkpoint_path)
         env, environment_id = make_dataset_environment(config)
         buffer = load_replay_buffer(config, env)
         config.env_name = environment_id
@@ -748,6 +880,8 @@ def main(config: ConfigView) -> None:
             decoder.obs_stats = decoder.obs_stats.update(
                 jnp.asarray(buffer.observations)
             )
+        if resume_checkpoint is not None:
+            decoder = restore_decoder(decoder, resume_checkpoint)
 
         # Keep the same policy/value layer layouts used by EncoderState.init,
         # sized from the matching robomimic environment.
@@ -776,6 +910,35 @@ def main(config: ConfigView) -> None:
         )
         q1_params = networks.mlp_init(q1_key, q_dims)
         q2_params = networks.mlp_init(q2_key, q_dims)
+        resume_encoder = (
+            resume_checkpoint is not None
+            and is_combined_checkpoint(resume_checkpoint)
+        )
+        start_iql_step = 0
+        if resume_encoder:
+            encoder_params = resume_checkpoint["ppo_z_params"]
+            actor_params = encoder_params.policy
+            value_params = resume_checkpoint.get(
+                "value_params", encoder_params.value
+            )
+            q1_params = resume_checkpoint["q1_params"]
+            q2_params = resume_checkpoint["q2_params"]
+            encoder_obs_stats = resume_checkpoint.get(
+                "ppo_z_obs_stats", encoder_obs_stats
+            )
+            obs_mean = np.asarray(encoder_obs_stats.mean)
+            obs_std = np.asarray(encoder_obs_stats.std)
+            normalized_observations = (
+                buffer.observations - obs_mean
+            ) / (obs_std + 1e-8)
+            normalized_next_observations = (
+                buffer.next_observations - obs_mean
+            ) / (obs_std + 1e-8)
+            start_iql_step = checkpoint_iql_step(resume_checkpoint, resume_path)
+            print(
+                f"Resuming encoder training from IQL step {start_iql_step}: "
+                f"{resume_path}"
+            )
         train_indices, validation_indices = split_indices(
             len(buffer), config.decoder_validation_fraction, rng
         )
@@ -789,12 +952,41 @@ def main(config: ConfigView) -> None:
             "Training decoder once, then freezing it."
         )
 
+        start_decoder_epoch = 0
         best_params = jax.tree.map(jnp.copy, decoder.params)
         best_validation = float("inf")
         stale_epochs = 0
         global_step = 0
+        if resume_checkpoint is not None:
+            start_decoder_epoch = checkpoint_decoder_epoch(
+                resume_checkpoint, resume_path
+            )
+            global_step = int(resume_checkpoint.get("global_step", 0))
+            if "numpy_rng_state" in resume_checkpoint:
+                rng.bit_generator.state = resume_checkpoint["numpy_rng_state"]
+            key = resume_checkpoint.get("jax_key", key)
+            best_params = resume_checkpoint.get("decoder_best_params", best_params)
+            best_validation = float(
+                resume_checkpoint.get("decoder_best_validation", best_validation)
+            )
+            stale_epochs = int(
+                resume_checkpoint.get("decoder_stale_epochs", stale_epochs)
+            )
+            if not resume_encoder:
+                print(
+                    f"Resuming decoder training from epoch {start_decoder_epoch}: "
+                    f"{resume_path}"
+                )
         previous_latents: np.ndarray | None = None
-        for epoch in trange(config.decoder_max_epochs, desc="Decoder epochs"):
+        completed_decoder_epochs = start_decoder_epoch
+        decoder_target_epoch = (
+            start_decoder_epoch if resume_encoder else config.decoder_max_epochs
+        )
+        for epoch in trange(
+            start_decoder_epoch,
+            decoder_target_epoch,
+            desc="Decoder epochs",
+        ):
             losses = []
             permutation = rng.permutation(train_indices)
             for start in range(0, len(permutation), config.decoder_batch_size):
@@ -844,6 +1036,30 @@ def main(config: ConfigView) -> None:
                 stale_epochs = 0
             else:
                 stale_epochs += 1
+            completed_decoder_epochs = epoch + 1
+            if (
+                completed_decoder_epochs % config.decoder_checkpoint_interval == 0
+            ):
+                decoder_checkpoint_path = (
+                    output_dir
+                    / f"decoder_checkpoint_epoch_{completed_decoder_epochs:09d}.pkl"
+                )
+                save_decoder_checkpoint(
+                    decoder_checkpoint_path,
+                    config,
+                    decoder,
+                    completed_decoder_epochs,
+                    global_step,
+                    best_params,
+                    best_validation,
+                    stale_epochs,
+                    rng,
+                    key,
+                )
+                print(
+                    "Saved decoder checkpoint at epoch "
+                    f"{completed_decoder_epochs}: {decoder_checkpoint_path}"
+                )
             if (
                 epoch + 1 >= config.decoder_min_epochs
                 and stale_epochs >= config.decoder_patience
@@ -851,9 +1067,32 @@ def main(config: ConfigView) -> None:
                 print(f"Decoder early-stopped at epoch {epoch + 1}.")
                 break
 
-        with jdc.copy_and_mutate(decoder) as decoder:
-            decoder.params = best_params
-        print(f"Frozen decoder validation CFM loss: {best_validation:.6f}")
+        decoder_epoch = completed_decoder_epochs
+        if not resume_encoder:
+            final_decoder_path = output_dir / "decoder_checkpoint_final.pkl"
+            save_decoder_checkpoint(
+                final_decoder_path,
+                config,
+                decoder,
+                decoder_epoch,
+                global_step,
+                best_params,
+                best_validation,
+                stale_epochs,
+                rng,
+                key,
+            )
+            print(f"Saved final decoder checkpoint: {final_decoder_path}")
+            # The decoder-only checkpoint above keeps the latest params aligned
+            # with its optimizer state so increasing fm_num_epochs can resume
+            # training correctly. Encoder training freezes the best validation
+            # params, matching the original behavior.
+            with jdc.copy_and_mutate(decoder) as decoder:
+                decoder.params = best_params
+        if np.isfinite(best_validation):
+            print(f"Frozen decoder validation CFM loss: {best_validation:.6f}")
+        else:
+            print("Frozen decoder restored from checkpoint.")
         latent_targets = build_latent_targets(
             decoder,
             buffer,
@@ -891,6 +1130,22 @@ def main(config: ConfigView) -> None:
         value_opt_state = value_optimizer.init(value_params)
         target_q1_params = jax.tree.map(jnp.copy, q1_params)
         target_q2_params = jax.tree.map(jnp.copy, q2_params)
+        if resume_encoder and resume_checkpoint is not None:
+            actor_opt_state = resume_checkpoint.get(
+                "actor_opt_state", actor_opt_state
+            )
+            critic_opt_state = resume_checkpoint.get(
+                "critic_opt_state", critic_opt_state
+            )
+            value_opt_state = resume_checkpoint.get(
+                "value_opt_state", value_opt_state
+            )
+            target_q1_params = resume_checkpoint.get(
+                "target_q1_params", target_q1_params
+            )
+            target_q2_params = resume_checkpoint.get(
+                "target_q2_params", target_q2_params
+            )
         iql_update = make_iql_update(
             config, actor_optimizer, critic_optimizer, value_optimizer
         )
@@ -900,7 +1155,8 @@ def main(config: ConfigView) -> None:
             min(config.comparison_samples, len(buffer)),
             replace=False,
         )
-        for step in trange(config.encoder_iql_steps, desc="IQL"):
+        encoder_target_step = max(start_iql_step, config.encoder_iql_steps)
+        for step in trange(start_iql_step, encoder_target_step, desc="IQL"):
             indices = rng.integers(0, len(buffer), size=config.batch_size)
             (
                 actor_params,
@@ -934,7 +1190,7 @@ def main(config: ConfigView) -> None:
                 accumulators.setdefault(name, []).append(float(value))
             if (
                 (step + 1) % config.log_interval == 0
-                or step + 1 == config.encoder_iql_steps
+                or step + 1 == encoder_target_step
             ):
                 record = {
                     "method": "frozen_decoder",
@@ -992,6 +1248,15 @@ def main(config: ConfigView) -> None:
                     q1_params,
                     q2_params,
                     value_params,
+                    decoder_epoch,
+                    completed_iql_steps,
+                    actor_opt_state,
+                    critic_opt_state,
+                    value_opt_state,
+                    target_q1_params,
+                    target_q2_params,
+                    rng,
+                    key,
                 )
                 save_encoder_checkpoint(
                     periodic_encoder_path,
@@ -1012,6 +1277,7 @@ def main(config: ConfigView) -> None:
         )
         decoder_path = output_dir / "checkpoint_final.pkl"
         encoder_path = output_dir / "encoder_checkpoint_final.pkl"
+        final_iql_step = encoder_target_step
         save_compatible_checkpoint(
             decoder_path,
             config,
@@ -1022,6 +1288,15 @@ def main(config: ConfigView) -> None:
             q1_params,
             q2_params,
             value_params,
+            decoder_epoch,
+            final_iql_step,
+            actor_opt_state,
+            critic_opt_state,
+            value_opt_state,
+            target_q1_params,
+            target_q2_params,
+            rng,
+            key,
         )
         save_encoder_checkpoint(
             encoder_path,
@@ -1038,4 +1313,4 @@ def main(config: ConfigView) -> None:
 
 
 if __name__ == "__main__":
-    main(build_config())
+    main(build_config(tyro.cli(TrainingConfig)))

@@ -9,6 +9,7 @@ Robomimic action.
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import pickle
@@ -50,7 +51,7 @@ class EvaluationConfig:
     apply_tanh: bool | None = None
     render: bool = False
     render_camera: str = "agentview"
-    video_dir: str | None = "evaluation_videos"
+    video_dir: str | None = "evaluation_videos/" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     video_fps: int = 20
     video_skip: int = 1
     video_height: int = 512
