@@ -7,7 +7,7 @@ class IQLConfig:
 
     encoder_iql_steps: int = 500_000
     batch_size: int = 256
-    discount: float = 0.99
+    discount: float = 0.995
     expectile: float = 0.8
     temperature: float = 0.1
     max_adv_weight: float = 100.0

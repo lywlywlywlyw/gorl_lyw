@@ -42,6 +42,9 @@ class EncoderConfig:
     # Z regularization to prevent explosion
     z_regularization: float = 0.0
 
+    # Local anchor regularization for the deterministic latent representation.
+    latent_reg_coeff: float = 0.0
+
     # Gradient clipping (FPO uses 0.5)
     max_grad_norm: jdc.Static[float] = 0.5
 
@@ -83,6 +86,8 @@ class EncoderState:
     env: jdc.Static[RobomimicEnv]
     config: EncoderConfig
     params: ActorCriticParams
+    anchor_policy: MlpWeights
+    anchor_obs_stats: math_utils.RunningStats
     obs_stats: math_utils.RunningStats
     opt: jdc.Static[optax.GradientTransformation]
     opt_state: optax.OptState
@@ -107,16 +112,30 @@ class EncoderState:
 
         # We'll manage learning rate ourselves!
         opt = optax.scale_by_adam()
+        obs_stats = math_utils.RunningStats.init((obs_size,))
         return EncoderState(
             env=env,
             config=config,
             params=network_params,
-            obs_stats=math_utils.RunningStats.init((obs_size,)),
+            anchor_policy=jax.tree.map(lambda x: x.copy(), actor_net),
+            anchor_obs_stats=jax.tree.map(lambda x: x.copy(), obs_stats),
+            obs_stats=obs_stats,
             opt=opt,
             opt_state=opt.init(network_params),  # type: ignore
             prng=prng2,
             steps=jnp.zeros((), dtype=jnp.int32),
         )
+
+    def reset_latent_anchor(self) -> EncoderState:
+        """Snapshot the current policy once at the start of an encoder phase."""
+        with jdc.copy_and_mutate(self) as state:
+            state.anchor_policy = jax.tree.map(
+                lambda x: jax.lax.stop_gradient(x.copy()), self.params.policy
+            )
+            state.anchor_obs_stats = jax.tree.map(
+                lambda x: jax.lax.stop_gradient(x.copy()), self.obs_stats
+            )
+        return state
 
     def sample_z(
         self, obs: Array, prng: Array, deterministic: bool
@@ -255,8 +274,12 @@ class EncoderState:
 
         if self.config.normalize_observations:
             obs_norm = (transitions.obs - self.obs_stats.mean) / self.obs_stats.std
+            anchor_obs_norm = (
+                transitions.obs - self.anchor_obs_stats.mean
+            ) / self.anchor_obs_stats.std
         else:
             obs_norm = transitions.obs
+            anchor_obs_norm = transitions.obs
         value_pred = networks.value_mlp_fwd(self.params.value, obs_norm)
         assert value_pred.shape == (timesteps, batch_dim)
 
@@ -361,6 +384,23 @@ class EncoderState:
 
         # Compute the total loss that will be used for optimization
         total_loss = policy_loss + v_loss + entropy_loss
+
+        # The sampled rollout z values are constants in PPO minibatches, so use
+        # the policy mean as the deterministic latent representation. The anchor
+        # policy is snapshotted once per encoder phase and never optimized.
+        anchor_z = jax.lax.stop_gradient(
+            networks.gaussian_policy_fwd(self.anchor_policy, anchor_obs_norm).loc
+        )
+        latent_delta = z_dist.loc - anchor_z
+        latent_reg_unscaled = jnp.mean(jnp.sum(jnp.square(latent_delta), axis=-1))
+        total_loss = total_loss + self.config.latent_reg_coeff * latent_reg_unscaled
+        metrics["latent_reg_loss"] = latent_reg_unscaled
+        metrics["latent_reg_coeff"] = jnp.asarray(self.config.latent_reg_coeff)
+        metrics["latent_anchor_distance"] = jnp.mean(
+            jnp.linalg.norm(latent_delta, axis=-1)
+        )
+        metrics["latent_current_std"] = jnp.std(z_dist.loc)
+        metrics["latent_anchor_std"] = jnp.std(anchor_z)
 
         # Add z regularization to prevent explosion
         # CRITICAL: Regularize z_dist parameters (loc, scale), NOT sampled z values!

@@ -17,7 +17,7 @@ from jax import numpy as jnp
 
 from . import rollouts
 from envs.base_env import State
-
+from envs.robomimic.online_config.env_config import EnvConfig
 
 def _environment_worker(connection: Any, env_type: type, dataset_path: str) -> None:
     """Own and step one Robomimic environment in a child process."""
@@ -29,8 +29,9 @@ def _environment_worker(connection: Any, env_type: type, dataset_path: str) -> N
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     env = None
     state = None
+    config = EnvConfig().to_dict()
     try:
-        env = env_type(dataset_path=dataset_path)
+        env = env_type(dataset_path=dataset_path, reward_shaping=config['dense_reward'])
         while True:
             command, payload = connection.recv()
             try:
@@ -283,7 +284,10 @@ class BatchedRolloutStateEncoderFM:
                 self.terminated[env_index] = False
             for env_index, response in self._reset_indices(reset_indices, reset_keys).items():
                 next_states[env_index] = self._state(response)
-            states.append(obs); actions.append(action)
+            # Store the exact bounded action executed by the environment. These
+            # actions become the decoder training targets, so the FM loss must
+            # see the same tanh-transformed policy output as env.step().
+            states.append(obs); actions.append(env_action)
             rewards.append(jnp.asarray(step_rewards, dtype=jnp.float32)); self.env_states = next_states
         self.prng = prng
         return self, jnp.stack(states), jnp.stack(actions), jnp.stack(rewards)

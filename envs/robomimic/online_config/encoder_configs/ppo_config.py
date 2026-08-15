@@ -6,7 +6,7 @@ class PPOConfig:
     ppo_num_updates_per_batch: int = 4#10#16
     ppo_unroll_length: int = 16#30
     ppo_learning_rate: float = 1e-3
-    ppo_entropy_cost: float = 1e-2
+    ppo_entropy_cost: float = 0#1e-2
     ppo_discounting: float = 0.995
 
     # Training
@@ -21,6 +21,7 @@ class PPOConfig:
     ppo_clipping_epsilon: float | None = None
     ppo_apply_tanh_in_rollout: bool = True
     ppo_z_regularization: float = 0.0
+    latent_reg_coeff: float = 0.0
     ppo_max_grad_norm: float = 0.5
     ppo_use_tanh_jacobian_for_z: bool = False
 

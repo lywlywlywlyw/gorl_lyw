@@ -148,6 +148,7 @@ def main(
         prng=jax.random.fold_in(agent.ppo_z_state.prng, 0),
         num_envs=config['eval_num_envs'],
         max_episode_length=config['episode_length'],
+        apply_tanh_in_rollout=config['ppo_apply_tanh_in_rollout'],
     )
     s_np = {k: onp.array(v) for k, v in eval_outputs.scalar_metrics.items()}
 
@@ -162,6 +163,7 @@ def main(
             agent,
             episode_length=config['episode_length'],
             iterations_per_env=config['ppo_iterations_per_env'],
+            apply_tanh_in_rollout=config['ppo_apply_tanh_in_rollout'],
         )
 
         all_states.append(onp.array(states))

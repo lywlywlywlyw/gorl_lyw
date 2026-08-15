@@ -328,6 +328,7 @@ def main(
             f"--num_timesteps {stage_timesteps}",
             f"--clipping_epsilon {stage_clipping_epsilon}",
             f"--z_regularization {stage_z_regularization}",
+            f"--latent_reg_coeff {config['latent_reg_coeff']}",
             f"--max_grad_norm {stage_max_grad_norm}",
             f"--stage {stage}",
             f"--global_step_offset {stage_step_offset}",

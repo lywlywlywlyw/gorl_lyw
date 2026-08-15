@@ -92,6 +92,7 @@ def main(
     num_timesteps: int | None = None,
     clipping_epsilon: float | None = None,
     z_regularization: float | None = None,
+    latent_reg_coeff: float | None = None,
     max_grad_norm: float | None = None,
     stage: int = 0,
     global_step_offset: int = 0,
@@ -215,6 +216,11 @@ def main(
         if z_regularization is None
         else z_regularization
     )
+    resolved_latent_reg_coeff = (
+        config["latent_reg_coeff"]
+        if latent_reg_coeff is None
+        else latent_reg_coeff
+    )
     resolved_max_grad_norm = (
         config["ppo_max_grad_norm"]
         if max_grad_norm is None
@@ -246,6 +252,7 @@ def main(
         clipping_epsilon=resolved_clipping_epsilon,
         value_loss_coeff=config['ppo_value_loss_coeff'],
         z_regularization=resolved_z_regularization,
+        latent_reg_coeff=resolved_latent_reg_coeff,
         max_grad_norm=resolved_max_grad_norm,
         use_tanh_jacobian_for_z=config['ppo_use_tanh_jacobian_for_z'],)
 
@@ -300,6 +307,11 @@ def main(
             if "ppo_z_steps" in decoder_checkpoint:
                 encoder_state.steps = decoder_checkpoint["ppo_z_steps"]
         print(f"Continuing encoder training from: {decoder_model_path}")
+
+    # One train_encoder_ppo invocation is one encoder update phase. Snapshot the
+    # phase-start encoder only after any checkpoint restore, and never refresh it
+    # inside the rollout / gradient-update loop.
+    encoder_state = encoder_state.reset_latent_anchor()
 
     # Create decoder state from checkpoint
     decoder_prng = jax.random.PRNGKey(config['seed'] + 1000)
