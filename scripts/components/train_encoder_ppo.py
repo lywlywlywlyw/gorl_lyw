@@ -253,6 +253,7 @@ def main(
         value_loss_coeff=config['ppo_value_loss_coeff'],
         z_regularization=resolved_z_regularization,
         latent_reg_coeff=resolved_latent_reg_coeff,
+        latent_reg_threshold=config['latent_reg_threshold'],
         max_grad_norm=resolved_max_grad_norm,
         use_tanh_jacobian_for_z=config['ppo_use_tanh_jacobian_for_z'],)
 
