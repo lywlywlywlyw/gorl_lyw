@@ -45,6 +45,7 @@ class EncoderConfig:
     # Local anchor regularization for the deterministic latent representation.
     latent_reg_coeff: float = 0.0
     latent_reg_threshold: float = 0.0
+    latent_reg_target: float = 0.0
 
     # Gradient clipping (FPO uses 0.5)
     max_grad_norm: jdc.Static[float] = 0.5
@@ -393,23 +394,35 @@ class EncoderState:
             networks.gaussian_policy_fwd(self.anchor_policy, anchor_obs_norm).loc
         )
         latent_delta = z_dist.loc - anchor_z
-        latent_squared_distance = jnp.sum(jnp.square(latent_delta), axis=-1)
-        latent_distance = jnp.sqrt(latent_squared_distance)
+        #----
+        # latent_squared_distance = jnp.sum(jnp.square(latent_delta), axis=-1)
+        # latent_distance = jnp.sqrt(latent_squared_distance)
         threshold = jnp.maximum(self.config.latent_reg_threshold, 0.0)
 
-        # Avoid the undefined gradient of ||x||_2 at x == 0 on the inactive
-        # hinge branch while preserving the exact trust-region penalty values.
-        outside_trust_region = latent_distance > threshold
-        latent_distance_for_penalty = jnp.sqrt(
-            jnp.where(outside_trust_region, latent_squared_distance, 1.0)
+        # # Avoid the undefined gradient of ||x||_2 at x == 0 on the inactive
+        # # hinge branch while preserving the exact trust-region penalty values.
+        # outside_trust_region = latent_distance > threshold
+        # latent_distance_for_penalty = jnp.sqrt(
+        #     jnp.where(outside_trust_region, latent_squared_distance, 1.0)
+        # )
+        # latent_reg_unscaled = jnp.mean(
+        #     jnp.square(
+        #         jnp.where(
+        #             outside_trust_region,
+        #             latent_distance_for_penalty - threshold,
+        #             0.0,
+        #         )
+        #     )
+        # )
+        #---
+        latent_distance = jnp.linalg.norm(
+            latent_delta,
+            axis=-1,
         )
+
         latent_reg_unscaled = jnp.mean(
             jnp.square(
-                jnp.where(
-                    outside_trust_region,
-                    latent_distance_for_penalty - threshold,
-                    0.0,
-                )
+                latent_distance - self.config.latent_reg_target
             )
         )
         total_loss = total_loss + self.config.latent_reg_coeff * latent_reg_unscaled

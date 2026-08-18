@@ -14,7 +14,7 @@ class TrainingConfig:
 
     # encoder training config
     encoder_num_timesteps: Annotated[int, tyro.conf.arg(help="Default encoder training timesteps per stage")] = 2400000#100000000
-    encoder_timesteps_per_stage: Annotated[str | None, tyro.conf.arg(help="Comma-separated timesteps for each stage (e.g., '60000000,60000000,30000000,30000000')")] =  ",".join(["196608"] * 96)#",".join(["393216"] * 48)#",".join(["49152"] * 384)#"4800000,4800000,2400000,2400000"#"60000000,60000000,30000000,30000000"
+    encoder_timesteps_per_stage: Annotated[str | None, tyro.conf.arg(help="Comma-separated timesteps for each stage (e.g., '60000000,60000000,30000000,30000000')")] =  ",".join(["393216"] * 48)#",".join(["196608"] * 96)#",".join(["49152"] * 384)#"4800000,4800000,2400000,2400000"#"60000000,60000000,30000000,30000000"
     encoder_type: str = "ppo"
 
     # decoder training config

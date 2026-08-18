@@ -254,6 +254,7 @@ def main(
         z_regularization=resolved_z_regularization,
         latent_reg_coeff=resolved_latent_reg_coeff,
         latent_reg_threshold=config['latent_reg_threshold'],
+        latent_reg_target = config['latent_reg_target'],
         max_grad_norm=resolved_max_grad_norm,
         use_tanh_jacobian_for_z=config['ppo_use_tanh_jacobian_for_z'],)
 
