@@ -255,6 +255,8 @@ def main(
         latent_reg_coeff=resolved_latent_reg_coeff,
         latent_reg_threshold=config['latent_reg_threshold'],
         latent_reg_target = config['latent_reg_target'],
+        using_ema=config['using_ema'],
+        latent_anchor_ema_alpha=config['latent_anchor_ema_alpha'],
         max_grad_norm=resolved_max_grad_norm,
         use_tanh_jacobian_for_z=config['ppo_use_tanh_jacobian_for_z'],)
 
@@ -310,10 +312,19 @@ def main(
                 encoder_state.steps = decoder_checkpoint["ppo_z_steps"]
         print(f"Continuing encoder training from: {decoder_model_path}")
 
-    # One train_encoder_ppo invocation is one encoder update phase. Snapshot the
-    # phase-start encoder only after any checkpoint restore, and never refresh it
-    # inside the rollout / gradient-update loop.
-    encoder_state = encoder_state.reset_latent_anchor()
+    # Preserve the EMA policy across stages. Fresh runs and legacy checkpoints
+    # initialize it exactly once from the restored/current policy. Observation
+    # normalization remains a stage-start snapshot rather than an EMA.
+    has_restored_anchor = "ppo_z_anchor_policy" in decoder_checkpoint
+    if has_restored_anchor:
+        with jdc.copy_and_mutate(encoder_state) as encoder_state:
+            encoder_state.anchor_policy = jax.tree.map(
+                jax.lax.stop_gradient,
+                decoder_checkpoint["ppo_z_anchor_policy"],
+            )
+    if not has_restored_anchor:
+        encoder_state = encoder_state.initialize_latent_anchor()
+    encoder_state = encoder_state.snapshot_latent_anchor_obs_stats()
 
     # Create decoder state from checkpoint
     decoder_prng = jax.random.PRNGKey(config['seed'] + 1000)
@@ -479,6 +490,8 @@ def main(
                 checkpoint = {
                     "ppo_z_params": agent.ppo_z_state.params,
                     "ppo_z_obs_stats": agent.ppo_z_state.obs_stats,
+                    "ppo_z_anchor_policy": agent.ppo_z_state.anchor_policy,
+                    "ppo_z_anchor_obs_stats": agent.ppo_z_state.anchor_obs_stats,
                     "ppo_z_opt_state": agent.ppo_z_state.opt_state,
                     "ppo_z_prng": agent.ppo_z_state.prng,
                     "ppo_z_steps": agent.ppo_z_state.steps,
@@ -612,6 +625,8 @@ def main(
     final_checkpoint = {
         "ppo_z_params": agent.ppo_z_state.params,
         "ppo_z_obs_stats": agent.ppo_z_state.obs_stats,
+        "ppo_z_anchor_policy": agent.ppo_z_state.anchor_policy,
+        "ppo_z_anchor_obs_stats": agent.ppo_z_state.anchor_obs_stats,
         "ppo_z_opt_state": agent.ppo_z_state.opt_state,
         "ppo_z_prng": agent.ppo_z_state.prng,
         "ppo_z_steps": agent.ppo_z_state.steps,

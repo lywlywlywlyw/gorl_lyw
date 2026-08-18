@@ -46,6 +46,8 @@ class EncoderConfig:
     latent_reg_coeff: float = 0.0
     latent_reg_threshold: float = 0.0
     latent_reg_target: float = 0.0
+    using_ema: jdc.Static[bool] = True
+    latent_anchor_ema_alpha: jdc.Static[float] = 0.01
 
     # Gradient clipping (FPO uses 0.5)
     max_grad_norm: jdc.Static[float] = 0.5
@@ -55,6 +57,7 @@ class EncoderConfig:
 
     def __post_init__(self):
         assert self.action_repeat == 1  # "action repeat is dumb" - Kevin (?)
+        assert 0.0 <= self.latent_anchor_ema_alpha <= 1.0
 
     @property
     def iterations_per_env(self) -> int:
@@ -119,8 +122,12 @@ class EncoderState:
             env=env,
             config=config,
             params=network_params,
-            anchor_policy=jax.tree.map(lambda x: x.copy(), actor_net),
-            anchor_obs_stats=jax.tree.map(lambda x: x.copy(), obs_stats),
+            anchor_policy=jax.tree.map(
+                lambda x: jax.lax.stop_gradient(x.copy()), actor_net
+            ),
+            anchor_obs_stats=jax.tree.map(
+                lambda x: jax.lax.stop_gradient(x.copy()), obs_stats
+            ),
             obs_stats=obs_stats,
             opt=opt,
             opt_state=opt.init(network_params),  # type: ignore
@@ -128,14 +135,41 @@ class EncoderState:
             steps=jnp.zeros((), dtype=jnp.int32),
         )
 
-    def reset_latent_anchor(self) -> EncoderState:
-        """Snapshot the current policy once at the start of an encoder phase."""
+    def initialize_latent_anchor(self) -> EncoderState:
+        """Initialize the reference policy for a new run or legacy checkpoint."""
         with jdc.copy_and_mutate(self) as state:
             state.anchor_policy = jax.tree.map(
                 lambda x: jax.lax.stop_gradient(x.copy()), self.params.policy
             )
+        return state
+
+    def snapshot_latent_anchor_obs_stats(self) -> EncoderState:
+        """Snapshot normalization stats at the start of an encoder stage."""
+        with jdc.copy_and_mutate(self) as state:
             state.anchor_obs_stats = jax.tree.map(
                 lambda x: jax.lax.stop_gradient(x.copy()), self.obs_stats
+            )
+        return state
+
+    def update_latent_anchor_ema(self) -> EncoderState:
+        """Move the gradient-free reference policy toward the current policy."""
+        if not self.config.using_ema:
+            return self
+
+        alpha = self.config.latent_anchor_ema_alpha
+
+        def update_leaf(anchor: Array, current: Array) -> Array:
+            if jnp.issubdtype(anchor.dtype, jnp.inexact):
+                updated = (1.0 - alpha) * anchor + alpha * current
+            else:
+                updated = anchor
+            return jax.lax.stop_gradient(updated)
+
+        with jdc.copy_and_mutate(self) as state:
+            state.anchor_policy = jax.tree.map(
+                update_leaf,
+                self.anchor_policy,
+                self.params.policy,
             )
         return state
 
@@ -255,6 +289,20 @@ class EncoderState:
             state.params = jax.tree.map(jnp.add, self.params, param_update)
             state.opt_state = new_opt_state
             state.steps = state.steps + 1
+        if state.config.using_ema:
+            state = state.update_latent_anchor_ema()
+
+        policy_anchor_delta = jax.tree.map(
+            lambda current, anchor: current - anchor,
+            state.params.policy,
+            state.anchor_policy,
+        )
+        metrics["latent_anchor_parameter_distance"] = optax.global_norm(
+            policy_anchor_delta
+        )
+        metrics["latent_anchor_ema_alpha"] = jnp.asarray(
+            state.config.latent_anchor_ema_alpha
+        )
         return state, metrics
 
     def _compute_ppo_loss(
@@ -389,7 +437,7 @@ class EncoderState:
 
         # The sampled rollout z values are constants in PPO minibatches, so use
         # the policy mean as the deterministic latent representation. The anchor
-        # policy is snapshotted once per encoder phase and never optimized.
+        # policy is a gradient-free reference network and is never optimized.
         anchor_z = jax.lax.stop_gradient(
             networks.gaussian_policy_fwd(self.anchor_policy, anchor_obs_norm).loc
         )

@@ -303,6 +303,8 @@ def train_fm(
         for key in (
             "ppo_z_params",
             "ppo_z_obs_stats",
+            "ppo_z_anchor_policy",
+            "ppo_z_anchor_obs_stats",
             "ppo_z_opt_state",
             "ppo_z_prng",
             "ppo_z_steps",
