@@ -312,17 +312,20 @@ def main(
                 encoder_state.steps = decoder_checkpoint["ppo_z_steps"]
         print(f"Continuing encoder training from: {decoder_model_path}")
 
-    # Preserve the EMA policy across stages. Fresh runs and legacy checkpoints
-    # initialize it exactly once from the restored/current policy. Observation
-    # normalization remains a stage-start snapshot rather than an EMA.
-    has_restored_anchor = "ppo_z_anchor_policy" in decoder_checkpoint
-    if has_restored_anchor:
+    # EMA mode preserves its reference policy across stages. With EMA disabled,
+    # always snapshot the restored/current policy at the start of this encoder
+    # phase, exactly matching commit d64876c (which predates EMA persistence).
+    has_restored_anchor = (
+        encoder_config.using_ema
+        and "ppo_z_anchor_policy" in decoder_checkpoint
+    )
+    if encoder_config.using_ema and has_restored_anchor:
         with jdc.copy_and_mutate(encoder_state) as encoder_state:
             encoder_state.anchor_policy = jax.tree.map(
                 jax.lax.stop_gradient,
                 decoder_checkpoint["ppo_z_anchor_policy"],
             )
-    if not has_restored_anchor:
+    else:
         encoder_state = encoder_state.initialize_latent_anchor()
     encoder_state = encoder_state.snapshot_latent_anchor_obs_stats()
 

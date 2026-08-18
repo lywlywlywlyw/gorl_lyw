@@ -463,15 +463,24 @@ class EncoderState:
         #     )
         # )
         #---
-        latent_distance = jnp.linalg.norm(
-            latent_delta,
-            axis=-1,
-        )
+        latent_squared_distance = jnp.sum(jnp.square(latent_delta), axis=-1)
+        latent_distance = jnp.sqrt(latent_squared_distance)
 
-        latent_reg_unscaled = jnp.mean(
-            jnp.square(
-                latent_distance - self.config.latent_reg_target
-            )
+        # Preserve the exact loss and gradient path from commit d64876c when
+        # target == 0. In particular, differentiating square(norm(delta)) via
+        # norm(delta) can produce NaNs at delta == 0 because the norm gradient
+        # is undefined there, while sum(square(delta)) has the same value and a
+        # well-defined zero gradient. For non-zero targets, retain the intended
+        # distance-to-target objective.
+        latent_reg_unscaled = jax.lax.cond(
+            jnp.equal(self.config.latent_reg_target, 0.0),
+            lambda squared_distance: jnp.mean(squared_distance),
+            lambda squared_distance: jnp.mean(
+                jnp.square(
+                    jnp.sqrt(squared_distance) - self.config.latent_reg_target
+                )
+            ),
+            latent_squared_distance,
         )
         total_loss = total_loss + self.config.latent_reg_coeff * latent_reg_unscaled
         metrics["latent_reg_loss"] = latent_reg_unscaled

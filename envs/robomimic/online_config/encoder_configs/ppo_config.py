@@ -24,7 +24,7 @@ class PPOConfig:
     latent_reg_coeff: float = 0.01#0.01
     latent_reg_threshold: float = 0.0
     latent_reg_target: float = 0.0
-    using_ema: bool = True
+    using_ema: bool = False
     latent_anchor_ema_alpha: float = 0.01
     ppo_max_grad_norm: float = 0.5
     ppo_use_tanh_jacobian_for_z: bool = False
