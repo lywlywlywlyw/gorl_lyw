@@ -1,4 +1,4 @@
-"""Frozen-decoder offline training compatible with the online GoRL FM stack.
+"""Frozen-decoder offline training for subsequent online RLPD training.
 
 The method is the same two-stage procedure as ``run_offline_fm_frozen.py``:
 
@@ -7,18 +7,17 @@ The method is the same two-stage procedure as ``run_offline_fm_frozen.py``:
    encoder with IQL advantage-weighted behavior cloning.
 
 This file is deliberately self-contained with respect to the old offline
-scripts.  It imports only the same production network/state implementations
-used by ``scripts/run_gorl_fm.py`` and its components.
+scripts. It trains only the frozen FM decoder and IQL latent encoder needed to
+initialize ``scripts/run_rlpd_fm.py``.
 
-The final pickle has both:
+The final pickle contains:
 
-* top-level ``params/obs_stats/config/obs_dim/action_dim`` fields accepted by
-  ``scripts/components/train_encoder_ppo.py`` as an FM decoder checkpoint;
-* ``ppo_z_params/ppo_z_obs_stats/config`` fields matching online encoder
-  checkpoints and accepted by ``scripts/components/collect_data_fm.py``.
+* top-level ``params/obs_stats/config/obs_dim/action_dim`` FM decoder fields;
+* ``iql_z_*`` fields for actor warm-start;
+* ``rlpd_z_*`` fields for full RLPD actor/critic warm-start.
 
-The decoder checkpoints are marked with the stable ``gorl_fm_decoder`` format
-so they can be passed directly to ``scripts/run_gorl_fm.py`` via
+The combined checkpoints are marked as offline RLPD initialization artifacts
+and can be passed directly to ``scripts/run_rlpd_fm.py`` via
 ``--use-offline-checkpoint --offline-checkpoint-path ...``.
 
 Example:
@@ -54,7 +53,8 @@ from tqdm import trange
 from envs.robomimic.RobomimicEnv import RobomimicEnv
 from envs.robomimic.offline_config.env_config import EnvConfig
 from envs.robomimic.offline_config.training_config import TrainingConfig
-from flow_policy import encoder_ppo, math_utils, networks
+from envs.robomimic.online_config.encoder_configs.rlpd_config import RLPDConfig
+from flow_policy import encoder_rlpd, math_utils, networks
 from flow_policy.decoder_fm import DecoderFMConfig, DecoderFMState
 
 
@@ -77,7 +77,9 @@ class ConfigView(dict[str, Any]):
 def build_config(training_config: TrainingConfig | None = None) -> ConfigView:
     """Compose the robomimic frozen-IQL configuration from offline configs."""
     training_config = training_config or TrainingConfig()
-    config = ConfigView(training_config.to_dict() | EnvConfig().to_dict())
+    config = ConfigView(
+        training_config.to_dict() | EnvConfig().to_dict() | RLPDConfig().to_dict()
+    )
     # Internal aliases keep the implementation names aligned with the generic
     # reference script while all values remain owned by offline_config.
     config.update(
@@ -129,7 +131,7 @@ class WandbLogger:
             name=config.wandb_name,
             mode=config.wandb_mode,
             config={**dict(config), "method": "frozen_decoder"},
-            tags=["frozen_decoder", "online_compatible"],
+            tags=["frozen_decoder", "rlpd_warm_start"],
         )
 
     def log(self, metrics: dict[str, float], step: int) -> None:
@@ -256,32 +258,34 @@ def make_dataset_environment(
     return environment, config.env_name
 
 
-def make_encoder_config(
+def make_rlpd_encoder_config(
     config: ConfigView,
     action_dim: int,
     episode_length: int,
-) -> encoder_ppo.EncoderConfig:
-    """Build the same online checkpoint metadata as the reference script."""
-    return encoder_ppo.EncoderConfig(
-        action_repeat=1,
-        batch_size=config.batch_size,
-        discounting=config.discount,
-        entropy_cost=0.0,
+) -> encoder_rlpd.EncoderConfig:
+    """Build the exact encoder architecture used by online RLPD training."""
+    return encoder_rlpd.EncoderConfig(
+        learning_rate=config.rlpd_actor_learning_rate,
+        critic_learning_rate=config.rlpd_critic_learning_rate,
+        temperature_learning_rate=config.rlpd_temperature_learning_rate,
+        discounting=config.rlpd_discounting,
         episode_length=episode_length,
-        learning_rate=config.actor_learning_rate,
-        normalize_observations=True,
-        num_envs=1,
-        num_evals=1,
-        num_minibatches=1,
-        num_timesteps=config.online_num_timesteps,
-        num_updates_per_batch=1,
-        reward_scaling=1.0,
-        unroll_length=1,
+        normalize_observations=config.rlpd_normalize_observations,
+        num_envs=config.num_envs,
         z_dim=action_dim,
-        clipping_epsilon=config.online_clipping_epsilon,
-        z_regularization=config.online_z_regularization,
-        max_grad_norm=config.online_max_grad_norm,
-        use_tanh_jacobian_for_z=config.online_use_tanh_jacobian_for_z,
+        hidden_size=config.rlpd_hidden_size,
+        hidden_layers=config.rlpd_hidden_layers,
+        critic_ensemble_size=config.rlpd_critic_ensemble_size,
+        critic_subsample_size=config.rlpd_critic_subsample_size,
+        target_update_rate=config.rlpd_target_update_rate,
+        initial_temperature=config.rlpd_initial_temperature,
+        target_entropy=config.rlpd_target_entropy,
+        backup_entropy=config.rlpd_backup_entropy,
+        reward_scaling=config.rlpd_reward_scaling,
+        reward_bias=config.rlpd_reward_bias,
+        max_grad_norm=config.rlpd_max_grad_norm,
+        policy_update_period=config.rlpd_policy_update_period,
+        apply_tanh_in_rollout=config.rlpd_apply_tanh_in_rollout,
     )
 
 
@@ -464,9 +468,12 @@ def make_iql_update(
         masks,
         latent_actions,
     ):
+        # The encoder chooses decoder latents, so IQL must estimate Q(s, z).
+        # Keeping environment actions here would train a shape-compatible but
+        # semantically incompatible critic for online latent-space RLPD.
         target_q = jnp.minimum(
-            networks.q_mlp_fwd(target_q1_params, obs, actions),
-            networks.q_mlp_fwd(target_q2_params, obs, actions),
+            networks.q_mlp_fwd(target_q1_params, obs, latent_actions),
+            networks.q_mlp_fwd(target_q2_params, obs, latent_actions),
         )
 
         def value_loss_fn(params):
@@ -507,8 +514,8 @@ def make_iql_update(
 
         def critic_loss_fn(params):
             q1, q2 = params
-            q1_value = networks.q_mlp_fwd(q1, obs, actions)
-            q2_value = networks.q_mlp_fwd(q2, obs, actions)
+            q1_value = networks.q_mlp_fwd(q1, obs, latent_actions)
+            q2_value = networks.q_mlp_fwd(q2, obs, latent_actions)
             loss = jnp.mean(
                 jnp.square(q1_value - bellman_target)
                 + jnp.square(q2_value - bellman_target)
@@ -576,12 +583,12 @@ def policy_metrics(
         lambda o, z: forward_fm_batch(decoder, o, z)
     )(obs_raw, policy_z)
     q_policy = jnp.minimum(
-        networks.q_mlp_fwd(q1_params, obs_norm, policy_actions),
-        networks.q_mlp_fwd(q2_params, obs_norm, policy_actions),
+        networks.q_mlp_fwd(q1_params, obs_norm, policy_z),
+        networks.q_mlp_fwd(q2_params, obs_norm, policy_z),
     )
     q_data = jnp.minimum(
-        networks.q_mlp_fwd(q1_params, obs_norm, data_actions),
-        networks.q_mlp_fwd(q2_params, obs_norm, data_actions),
+        networks.q_mlp_fwd(q1_params, obs_norm, targets),
+        networks.q_mlp_fwd(q2_params, obs_norm, targets),
     )
     value = networks.value_mlp_fwd(value_params, obs_norm)
     return {
@@ -648,7 +655,12 @@ def is_combined_checkpoint(checkpoint: dict[str, Any]) -> bool:
         return checkpoint_type == "decoder_encoder"
     return all(
         key in checkpoint
-        for key in ("ppo_z_params", "q1_params", "q2_params", "value_params")
+        for key in (
+            "iql_z_actor_params",
+            "q1_params",
+            "q2_params",
+            "value_params",
+        )
     )
 
 
@@ -713,12 +725,12 @@ def save_decoder_checkpoint(
         pickle.dump(checkpoint, file)
 
 
-def save_compatible_checkpoint(
+def save_offline_checkpoint(
     path: Path,
     config: ConfigView,
-    online_config: encoder_ppo.EncoderConfig,
+    rlpd_config: encoder_rlpd.EncoderConfig,
     decoder: DecoderFMState,
-    encoder_params: encoder_ppo.ActorCriticParams,
+    actor_params: PyTree,
     encoder_obs_stats: Any,
     q1_params: PyTree,
     q2_params: PyTree,
@@ -735,14 +747,20 @@ def save_compatible_checkpoint(
 ) -> None:
     obs_dim = int(decoder.obs_stats.mean.shape[-1])
     action_dim = int(decoder.params[-1][0].shape[-1])
+    critic_params = tuple(
+        q1_params if member % 2 == 0 else q2_params
+        for member in range(rlpd_config.critic_ensemble_size)
+    )
+    target_critic_params = tuple(
+        target_q1_params if member % 2 == 0 else target_q2_params
+        for member in range(rlpd_config.critic_ensemble_size)
+    )
     checkpoint = {
-        # Stable schema marker consumed by scripts/run_gorl_fm.py. Keep the
-        # decoder fields below at the top level for train_encoder_ppo.py.
-        "checkpoint_format": "gorl_fm_decoder",
-        "checkpoint_version": 1,
+        "checkpoint_format": "gorl_offline_fm_rlpd",
+        "checkpoint_version": 2,
         "offline_checkpoint_type": "decoder_encoder",
         "training_phase": "encoder",
-        # Standalone FM schema loaded by train_encoder_ppo.py.
+        # Frozen FM decoder loaded by the RLPD training component.
         "params": decoder.params,
         "obs_stats": decoder.obs_stats,
         "config": decoder.config,
@@ -752,16 +770,26 @@ def save_compatible_checkpoint(
         "decoder_epoch": decoder_epoch,
         "encoder_iql_step": encoder_iql_step,
         "is_frozen_offline": True,
-        # Combined online encoder schema loaded by collect_data_fm.py.
-        "ppo_z_params": encoder_params,
-        "ppo_z_obs_stats": encoder_obs_stats,
         "env_name": config.env_name,
         "dataset_path": str(Path(config.dataset_path).expanduser().resolve()),
         "decoder_type": "fm",
         "z_dim": action_dim,
         "fm_params": decoder.params,
         "fm_obs_stats": decoder.obs_stats,
-        "online_encoder_config": online_config,
+        "rlpd_encoder_config": rlpd_config,
+        # Stage-0 RLPD warm start used when stage_init_before_training=True.
+        "iql_z_actor_params": actor_params,
+        "iql_z_obs_stats": encoder_obs_stats,
+        # Full RLPD-compatible state used when stage_init_before_training=False.
+        # IQL trains two Q networks; expand them alternately to the configured
+        # RLPD ensemble so every online critic starts from an offline-trained Q.
+        "rlpd_z_actor_params": actor_params,
+        "rlpd_z_critic_params": critic_params,
+        "rlpd_z_target_critic_params": target_critic_params,
+        "rlpd_z_log_temperature": jnp.log(
+            jnp.asarray(rlpd_config.initial_temperature)
+        ),
+        "rlpd_z_obs_stats": encoder_obs_stats,
         # Offline-only training state/metadata.
         "offline_config": dict(config),
         "q1_params": q1_params,
@@ -774,35 +802,6 @@ def save_compatible_checkpoint(
         "target_q2_params": target_q2_params,
         "numpy_rng_state": rng.bit_generator.state,
         "jax_key": key,
-    }
-    # collect_data_fm.py interprets "config" as EncoderConfig, while
-    # train_encoder_ppo.py interprets it as DecoderFMConfig. One file cannot
-    # place both types under the same key. The pipeline consumes this final
-    # checkpoint as a decoder, so "config" stays DecoderFMConfig. A separate
-    # encoder checkpoint is emitted below for collect-data/resume use.
-    with open(path, "wb") as file:
-        pickle.dump(checkpoint, file)
-
-
-def save_encoder_checkpoint(
-    path: Path,
-    config: ConfigView,
-    online_config: encoder_ppo.EncoderConfig,
-    decoder: DecoderFMState,
-    encoder_params: encoder_ppo.ActorCriticParams,
-    encoder_obs_stats: Any,
-) -> None:
-    checkpoint = {
-        "ppo_z_params": encoder_params,
-        "ppo_z_obs_stats": encoder_obs_stats,
-        "config": online_config,
-        "env_name": config.env_name,
-        "decoder_type": "fm",
-        "iteration": 0,
-        "reward": float("-inf"),
-        "z_dim": int(decoder.params[-1][0].shape[-1]),
-        "fm_params": decoder.params,
-        "fm_obs_stats": decoder.obs_stats,
     }
     with open(path, "wb") as file:
         pickle.dump(checkpoint, file)
@@ -841,7 +840,7 @@ def main(config: ConfigView) -> None:
                 f"{environment_id} robomimic action size {env.action_size}."
             )
         episode_length = int(config.episode_length)
-        online_config = make_encoder_config(
+        rlpd_config = make_rlpd_encoder_config(
             config, action_dim, episode_length
         )
         with open(output_dir / "config.json", "w") as file:
@@ -883,10 +882,14 @@ def main(config: ConfigView) -> None:
         if resume_checkpoint is not None:
             decoder = restore_decoder(decoder, resume_checkpoint)
 
-        # Keep the same policy/value layer layouts used by EncoderState.init,
-        # sized from the matching robomimic environment.
+        # IQL keeps its original actor/value training objectives, but the actor
+        # layout matches EncoderState.init in encoder_rlpd.py so its parameters
+        # can initialize online RLPD without conversion.
         actor_params = networks.mlp_init(
-            actor_key, (obs_dim, 32, 32, 32, 32, action_dim * 2)
+            actor_key,
+            (obs_dim,)
+            + (rlpd_config.hidden_size,) * rlpd_config.hidden_layers
+            + (action_dim * 2,),
         )
         value_params = networks.mlp_init(
             value_key, (obs_dim, 256, 256, 256, 256, 256, 1)
@@ -903,9 +906,18 @@ def main(config: ConfigView) -> None:
             buffer.next_observations - obs_mean
         ) / (obs_std + 1e-8)
 
+        if (
+            config.q_hidden_size != rlpd_config.hidden_size
+            or config.q_hidden_layers != rlpd_config.hidden_layers
+        ):
+            raise ValueError(
+                "Offline IQL Q architecture must match online RLPD: "
+                f"IQL=({config.q_hidden_size}, {config.q_hidden_layers}), "
+                f"RLPD=({rlpd_config.hidden_size}, {rlpd_config.hidden_layers})."
+            )
         q_dims = (
             obs_dim + action_dim,
-            *((config.q_hidden_size,) * config.q_hidden_layers),
+            *((rlpd_config.hidden_size,) * rlpd_config.hidden_layers),
             1,
         )
         q1_params = networks.mlp_init(q1_key, q_dims)
@@ -916,15 +928,12 @@ def main(config: ConfigView) -> None:
         )
         start_iql_step = 0
         if resume_encoder:
-            encoder_params = resume_checkpoint["ppo_z_params"]
-            actor_params = encoder_params.policy
-            value_params = resume_checkpoint.get(
-                "value_params", encoder_params.value
-            )
+            actor_params = resume_checkpoint["iql_z_actor_params"]
+            value_params = resume_checkpoint["value_params"]
             q1_params = resume_checkpoint["q1_params"]
             q2_params = resume_checkpoint["q2_params"]
             encoder_obs_stats = resume_checkpoint.get(
-                "ppo_z_obs_stats", encoder_obs_stats
+                "iql_z_obs_stats", encoder_obs_stats
             )
             obs_mean = np.asarray(encoder_obs_stats.mean)
             obs_std = np.asarray(encoder_obs_stats.std)
@@ -993,6 +1002,8 @@ def main(config: ConfigView) -> None:
                 batch = permutation[start : start + config.decoder_batch_size]
                 decoder, metrics = decoder.train_step(
                     jnp.asarray(buffer.observations[batch]),
+                    # Train directly on dataset (s, a). Dataset actions are
+                    # already the targets; never apply atanh/arctanh here.
                     jnp.asarray(buffer.actions[batch]),
                 )
                 losses.append(float(metrics["loss"]))
@@ -1227,23 +1238,16 @@ def main(config: ConfigView) -> None:
 
             completed_iql_steps = step + 1
             if completed_iql_steps % config.checkpoint_interval == 0:
-                periodic_encoder_params = encoder_ppo.ActorCriticParams(
-                    policy=actor_params, value=value_params
-                )
                 periodic_decoder_path = (
                     output_dir
                     / f"checkpoint_step_{completed_iql_steps:09d}.pkl"
                 )
-                periodic_encoder_path = (
-                    output_dir
-                    / f"encoder_checkpoint_step_{completed_iql_steps:09d}.pkl"
-                )
-                save_compatible_checkpoint(
+                save_offline_checkpoint(
                     periodic_decoder_path,
                     config,
-                    online_config,
+                    rlpd_config,
                     decoder,
-                    periodic_encoder_params,
+                    actor_params,
                     encoder_obs_stats,
                     q1_params,
                     q2_params,
@@ -1258,32 +1262,19 @@ def main(config: ConfigView) -> None:
                     rng,
                     key,
                 )
-                save_encoder_checkpoint(
-                    periodic_encoder_path,
-                    config,
-                    online_config,
-                    decoder,
-                    periodic_encoder_params,
-                    encoder_obs_stats,
-                )
                 print(
-                    "Saved periodic checkpoints at IQL step "
-                    f"{completed_iql_steps}: {periodic_decoder_path}, "
-                    f"{periodic_encoder_path}"
+                    "Saved periodic offline RLPD checkpoint at IQL step "
+                    f"{completed_iql_steps}: {periodic_decoder_path}"
                 )
 
-        trained_encoder_params = encoder_ppo.ActorCriticParams(
-            policy=actor_params, value=value_params
-        )
         decoder_path = output_dir / "checkpoint_final.pkl"
-        encoder_path = output_dir / "encoder_checkpoint_final.pkl"
         final_iql_step = encoder_target_step
-        save_compatible_checkpoint(
+        save_offline_checkpoint(
             decoder_path,
             config,
-            online_config,
+            rlpd_config,
             decoder,
-            trained_encoder_params,
+            actor_params,
             encoder_obs_stats,
             q1_params,
             q2_params,
@@ -1298,16 +1289,7 @@ def main(config: ConfigView) -> None:
             rng,
             key,
         )
-        save_encoder_checkpoint(
-            encoder_path,
-            config,
-            online_config,
-            decoder,
-            trained_encoder_params,
-            encoder_obs_stats,
-        )
-        print(f"Saved online-compatible decoder checkpoint: {decoder_path}")
-        print(f"Saved online-compatible encoder checkpoint: {encoder_path}")
+        print(f"Saved final offline RLPD checkpoint: {decoder_path}")
     finally:
         logger.finish()
 

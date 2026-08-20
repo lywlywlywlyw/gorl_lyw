@@ -222,8 +222,9 @@ class BatchedRolloutStateEncoderFM:
             obs = jnp.stack([jnp.asarray(state.obs) for state in self.env_states])
             prng_z, prng = jax.random.split(prng)
             z, z_info = agent_state.sample_z(obs, prng_z, deterministic=deterministic)
-            action = agent_state.map_z_to_action(obs, z)
-            env_action = jnp.tanh(action) if apply_tanh_in_rollout else action
+            # The encoder outputs latent z. The frozen decoder maps z to the
+            # environment action directly; do not tanh decoder output again.
+            env_action = agent_state.map_z_to_action(obs, z)
             responses = self._step_all(np.asarray(jax.device_get(env_action)))
             next_states, transition_next_states = [], []
             rewards, truncations, discounts = [], [], []
@@ -252,7 +253,9 @@ class BatchedRolloutStateEncoderFM:
                 next_states[env_index] = self._state(response)
             transition_steps.append(rollouts.TransitionStruct(
                 obs=obs, next_obs=jnp.stack([state.obs for state in transition_next_states]),
-                action=z, action_info=z_info, reward=jnp.asarray(rewards, dtype=jnp.float32),
+                action=z,
+                action_info={**z_info, "env_action": env_action},
+                reward=jnp.asarray(rewards, dtype=jnp.float32),
                 truncation=jnp.asarray(truncations, dtype=jnp.float32),
                 discount=jnp.asarray(discounts, dtype=jnp.float32)))
             self.env_states = next_states
@@ -267,8 +270,8 @@ class BatchedRolloutStateEncoderFM:
             obs = jnp.stack([state.obs for state in self.env_states])
             prng_sample, prng = jax.random.split(prng)
             z, _ = agent.sample_z(obs, prng_sample, deterministic=False)
-            action = agent.map_z_to_action(obs, z)
-            env_action = jnp.tanh(action) if apply_tanh_in_rollout else action
+            # Decoder output is already the environment action.
+            env_action = agent.map_z_to_action(obs, z)
             responses = self._step_all(np.asarray(jax.device_get(env_action)))
             next_states, step_rewards, reset_indices, reset_keys = [], [], [], []
             for env_index, response in enumerate(responses):
@@ -284,9 +287,8 @@ class BatchedRolloutStateEncoderFM:
                 self.terminated[env_index] = False
             for env_index, response in self._reset_indices(reset_indices, reset_keys).items():
                 next_states[env_index] = self._state(response)
-            # Store the exact bounded action executed by the environment. These
-            # actions become the decoder training targets, so the FM loss must
-            # see the same tanh-transformed policy output as env.step().
+            # Store the exact decoder action executed by the environment. No
+            # extra tanh is applied before env.step or decoder training.
             states.append(obs); actions.append(env_action)
             rewards.append(jnp.asarray(step_rewards, dtype=jnp.float32)); self.env_states = next_states
         self.prng = prng

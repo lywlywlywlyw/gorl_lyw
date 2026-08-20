@@ -1,4 +1,4 @@
-"""Collect data from PPO_z + FM for training new FM."""
+"""Collect data from a latent-space encoder + FM for training a new FM."""
 
 import datetime
 import pickle
@@ -17,7 +17,7 @@ from tqdm import tqdm
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-from flow_policy import encoder_ppo
+from flow_policy import encoder_ppo, encoder_rlpd
 from flow_policy.decoder_fm import DecoderFMState
 from flow_policy.agent import EncoderFMAgent
 from flow_policy.rollout_encoder import (
@@ -58,9 +58,20 @@ def main(
         else:
             raise ValueError("No FM model found. Please specify --fm_model_path")
 
-    # Load PPO_z checkpoint
+    # Load encoder checkpoint. The legacy CLI argument name is retained so the
+    # existing PPO pipeline remains backward compatible.
     with open(ppo_z_checkpoint_path, "rb") as f:
-        ppo_z_checkpoint = pickle.load(f)
+        encoder_checkpoint = pickle.load(f)
+
+    if "rlpd_z_actor_params" in encoder_checkpoint:
+        encoder_algorithm = "rlpd"
+    elif "ppo_z_params" in encoder_checkpoint:
+        encoder_algorithm = "ppo"
+    else:
+        raise ValueError(
+            "Encoder checkpoint is neither RLPD nor PPO; expected "
+            "'rlpd_z_actor_params' or 'ppo_z_params'."
+        )
 
     # Load FM model config (needed for initialization)
     with open(fm_model_path, "rb") as f:
@@ -70,8 +81,8 @@ def main(
     env = RobomimicEnv(dataset_path=config['dataset_path'], reward_shaping=config['dense_reward'])
     z_dim = env.action_size 
     # Get config from checkpoint or create new one
-    if "config" in ppo_z_checkpoint:
-        encoder_config = ppo_z_checkpoint["config"]
+    if "config" in encoder_checkpoint:
+        encoder_config = encoder_checkpoint["config"]
     else:
         # Create config with z_dim
         encoder_config = encoder_ppo.EncoderConfig(action_repeat=config['action_repeat'],
@@ -97,17 +108,44 @@ def main(
         max_grad_norm=config['ppo_max_grad_norm'],
         use_tanh_jacobian_for_z=config['ppo_use_tanh_jacobian_for_z'],)
 
-    # Initialize PPO_z state
-    ppo_z_state = encoder_ppo.EncoderState.init(
-        prng=jax.random.key(config['seed']),
-        env=env,
-        config=encoder_config
-    )
-
-    # Load PPO_z parameters
-    with jdc.copy_and_mutate(ppo_z_state) as ppo_z_state:
-        ppo_z_state.params = ppo_z_checkpoint["ppo_z_params"]
-        ppo_z_state.obs_stats = ppo_z_checkpoint["ppo_z_obs_stats"]
+    # Reconstruct the algorithm-specific encoder state.
+    if encoder_algorithm == "rlpd":
+        ppo_z_state = encoder_rlpd.EncoderState.init(
+            prng=jax.random.key(config['seed']),
+            env=env,
+            config=encoder_config,
+        )
+        with jdc.copy_and_mutate(ppo_z_state) as ppo_z_state:
+            ppo_z_state.actor_params = encoder_checkpoint["rlpd_z_actor_params"]
+            ppo_z_state.critic_params = encoder_checkpoint["rlpd_z_critic_params"]
+            ppo_z_state.target_critic_params = encoder_checkpoint[
+                "rlpd_z_target_critic_params"
+            ]
+            ppo_z_state.log_temperature = encoder_checkpoint[
+                "rlpd_z_log_temperature"
+            ]
+            ppo_z_state.obs_stats = encoder_checkpoint["rlpd_z_obs_stats"]
+            for state_name in (
+                "actor_opt_state",
+                "critic_opt_state",
+                "temperature_opt_state",
+                "prng",
+                "steps",
+            ):
+                checkpoint_key = f"rlpd_z_{state_name}"
+                if checkpoint_key in encoder_checkpoint:
+                    setattr(ppo_z_state, state_name, encoder_checkpoint[checkpoint_key])
+        apply_tanh_in_rollout = encoder_config.apply_tanh_in_rollout
+    else:
+        ppo_z_state = encoder_ppo.EncoderState.init(
+            prng=jax.random.key(config['seed']),
+            env=env,
+            config=encoder_config
+        )
+        with jdc.copy_and_mutate(ppo_z_state) as ppo_z_state:
+            ppo_z_state.params = encoder_checkpoint["ppo_z_params"]
+            ppo_z_state.obs_stats = encoder_checkpoint["ppo_z_obs_stats"]
+        apply_tanh_in_rollout = config['ppo_apply_tanh_in_rollout']
 
     # Initialize FM state
     fm_prng = jax.random.PRNGKey(config['seed'] + 1000)
@@ -121,9 +159,9 @@ def main(
     # Load FM parameters from PPO_z checkpoint (not from standalone FM file)
     # This ensures we use the exact FM that was trained with PPO_z
     with jdc.copy_and_mutate(fm_state) as fm_state:
-        if "fm_params" in ppo_z_checkpoint and "fm_obs_stats" in ppo_z_checkpoint:
-            fm_state.params = ppo_z_checkpoint["fm_params"]
-            fm_state.obs_stats = ppo_z_checkpoint["fm_obs_stats"]
+        if "fm_params" in encoder_checkpoint and "fm_obs_stats" in encoder_checkpoint:
+            fm_state.params = encoder_checkpoint["fm_params"]
+            fm_state.obs_stats = encoder_checkpoint["fm_obs_stats"]
         else:
             # Fallback: use standalone FM (shouldn't happen but safe)
             fm_state.params = fm_config_source["params"]
@@ -148,7 +186,7 @@ def main(
         prng=jax.random.fold_in(agent.ppo_z_state.prng, 0),
         num_envs=config['eval_num_envs'],
         max_episode_length=config['episode_length'],
-        apply_tanh_in_rollout=config['ppo_apply_tanh_in_rollout'],
+        apply_tanh_in_rollout=apply_tanh_in_rollout,
     )
     s_np = {k: onp.array(v) for k, v in eval_outputs.scalar_metrics.items()}
 
@@ -163,7 +201,7 @@ def main(
             agent,
             episode_length=config['episode_length'],
             iterations_per_env=config['ppo_iterations_per_env'],
-            apply_tanh_in_rollout=config['ppo_apply_tanh_in_rollout'],
+            apply_tanh_in_rollout=apply_tanh_in_rollout,
         )
 
         all_states.append(onp.array(states))
@@ -184,7 +222,9 @@ def main(
 
     # Save data
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    data_file = output_path / f"ppo_z_fm_data_{config['env_name']}_{timestamp}.pkl"
+    data_file = output_path / (
+        f"{encoder_algorithm}_z_fm_data_{config['env_name']}_{timestamp}.pkl"
+    )
 
     data = {
         "states": all_states,
@@ -192,7 +232,9 @@ def main(
         "rewards": all_rewards,
         "env_name": config['env_name'],
         "config": encoder_config,
-        "collection_method": "ppo_z_fm_rollout",
+        "collection_method": f"{encoder_algorithm}_z_fm_rollout",
+        "encoder_algorithm": encoder_algorithm,
+        "encoder_checkpoint": ppo_z_checkpoint_path,
         "ppo_z_checkpoint": ppo_z_checkpoint_path,
         "fm_model": fm_model_path,
         "num_iterations": config['data_collection_iterations'],

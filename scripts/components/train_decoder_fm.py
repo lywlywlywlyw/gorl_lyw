@@ -262,26 +262,40 @@ def train_fm(
     prng = jax.random.PRNGKey(config['seed'])
     fm_state = DecoderFMState.init(prng, obs_dim, action_dim, decoder_config)
 
-    # Restore the previous train state when requested. Older offline checkpoints
-    # only contain model parameters and observation statistics, so optimizer,
-    # PRNG, and step restoration is optional for backward compatibility.
+    # Online optimizers are independent from offline training. Offline
+    # checkpoints restore only model parameters and observation statistics;
+    # DecoderFMState.init provides fresh online optimizer/PRNG/step state.
+    resume_is_offline = bool(
+        resume_checkpoint is not None
+        and (
+            resume_checkpoint.get("is_frozen_offline", False)
+            or resume_checkpoint.get("offline_checkpoint_type") is not None
+            or str(resume_checkpoint.get("checkpoint_format", "")).startswith(
+                "gorl_offline"
+            )
+        )
+    )
     with jdc.copy_and_mutate(fm_state) as fm_state:
         if resume_checkpoint is not None:
             fm_state.params = resume_checkpoint["params"]
             fm_state.obs_stats = resume_checkpoint["obs_stats"]
-            if "fm_opt_state" in resume_checkpoint:
+            # Offline optimizer state is never inherited. A previous online
+            # stage may retain its own optimizer when continuation is requested.
+            if not resume_is_offline and "fm_opt_state" in resume_checkpoint:
                 fm_state.opt_state = resume_checkpoint["fm_opt_state"]
-            if "fm_prng" in resume_checkpoint:
+            if not resume_is_offline and "fm_prng" in resume_checkpoint:
                 fm_state.prng = resume_checkpoint["fm_prng"]
-            if "fm_steps" in resume_checkpoint:
+            if not resume_is_offline and "fm_steps" in resume_checkpoint:
                 fm_state.steps = resume_checkpoint["fm_steps"]
         fm_state.obs_stats = fm_state.obs_stats.update(jnp.array(train_states))
 
     # Preserve the encoder train state in decoder checkpoints. The pipeline only
     # passes the latest decoder checkpoint into the next encoder stage, so these
-    # fields allow stage_init_before_training=False to resume PPO as well.
+    # fields allow stage_init_before_training=False to resume PPO or RLPD.
     carried_encoder_fields = {}
-    encoder_checkpoint_path = data.get("ppo_z_checkpoint")
+    encoder_checkpoint_path = data.get("encoder_checkpoint") or data.get(
+        "ppo_z_checkpoint"
+    )
     if encoder_checkpoint_path:
         encoder_checkpoint_path = Path(encoder_checkpoint_path).expanduser()
         if not encoder_checkpoint_path.is_file():
@@ -291,7 +305,46 @@ def train_fm(
             )
         with encoder_checkpoint_path.open("rb") as f:
             encoder_checkpoint = pickle.load(f)
-        required_encoder_fields = {"ppo_z_params", "ppo_z_obs_stats"}
+        encoder_algorithm = data.get("encoder_algorithm")
+        if encoder_algorithm is None:
+            encoder_algorithm = (
+                "rlpd" if "rlpd_z_actor_params" in encoder_checkpoint else "ppo"
+            )
+        if encoder_algorithm == "rlpd":
+            required_encoder_fields = {
+                "rlpd_z_actor_params",
+                "rlpd_z_critic_params",
+                "rlpd_z_target_critic_params",
+                "rlpd_z_log_temperature",
+                "rlpd_z_obs_stats",
+            }
+            encoder_field_names = (
+                "rlpd_z_actor_params",
+                "rlpd_z_critic_params",
+                "rlpd_z_target_critic_params",
+                "rlpd_z_log_temperature",
+                "rlpd_z_actor_opt_state",
+                "rlpd_z_critic_opt_state",
+                "rlpd_z_temperature_opt_state",
+                "rlpd_z_obs_stats",
+                "rlpd_z_prng",
+                "rlpd_z_steps",
+            )
+        elif encoder_algorithm == "ppo":
+            required_encoder_fields = {"ppo_z_params", "ppo_z_obs_stats"}
+            encoder_field_names = (
+                "ppo_z_params",
+                "ppo_z_obs_stats",
+                "ppo_z_anchor_policy",
+                "ppo_z_anchor_obs_stats",
+                "ppo_z_opt_state",
+                "ppo_z_prng",
+                "ppo_z_steps",
+            )
+        else:
+            raise ValueError(
+                f"Unsupported encoder_algorithm in collected data: {encoder_algorithm!r}"
+            )
         missing_encoder_fields = sorted(
             required_encoder_fields.difference(encoder_checkpoint)
         )
@@ -300,15 +353,7 @@ def train_fm(
                 f"Encoder checkpoint {encoder_checkpoint_path} is missing required "
                 f"fields: {missing_encoder_fields}"
             )
-        for key in (
-            "ppo_z_params",
-            "ppo_z_obs_stats",
-            "ppo_z_anchor_policy",
-            "ppo_z_anchor_obs_stats",
-            "ppo_z_opt_state",
-            "ppo_z_prng",
-            "ppo_z_steps",
-        ):
+        for key in encoder_field_names:
             if key in encoder_checkpoint:
                 carried_encoder_fields[key] = encoder_checkpoint[key]
 
