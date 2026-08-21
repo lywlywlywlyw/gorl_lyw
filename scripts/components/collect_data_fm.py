@@ -3,6 +3,7 @@
 import datetime
 import pickle
 import time
+import json
 from pathlib import Path
 from typing import Annotated
 
@@ -27,6 +28,126 @@ from flow_policy.rollout_encoder import (
 from envs.robomimic.RobomimicEnv import RobomimicEnv
 from envs.robomimic.online_config.training_config import TrainingConfig
 from envs.robomimic.online_config.env_config import EnvConfig
+try:
+    from .metrics_ipc import append_metrics
+    from .online_pipeline_ipc import ChunkReplayBuffer, VersionManager
+except ImportError:  # Direct execution: python scripts/components/collect_data_fm.py
+    from metrics_ipc import append_metrics
+    from online_pipeline_ipc import ChunkReplayBuffer, VersionManager
+
+
+def _load_policy_pair(
+    encoder_path: Path,
+    decoder_path: Path,
+    env: RobomimicEnv,
+    config: dict,
+) -> tuple[EncoderFMAgent, bool]:
+    """Load one explicit matching policy pair; never reads trainer memory."""
+    with encoder_path.open("rb") as file:
+        encoder_checkpoint = pickle.load(file)
+    with decoder_path.open("rb") as file:
+        decoder_checkpoint = pickle.load(file)
+    encoder_config = encoder_checkpoint["config"]
+    encoder_state = encoder_rlpd.EncoderState.init(
+        jax.random.key(config["seed"]), env, encoder_config
+    )
+    with jdc.copy_and_mutate(encoder_state) as state:
+        state.actor_params = encoder_checkpoint["rlpd_z_actor_params"]
+        state.critic_params = encoder_checkpoint["rlpd_z_critic_params"]
+        state.target_critic_params = encoder_checkpoint["rlpd_z_target_critic_params"]
+        state.log_temperature = encoder_checkpoint["rlpd_z_log_temperature"]
+        state.obs_stats = encoder_checkpoint["rlpd_z_obs_stats"]
+        for name in ("actor_opt_state", "critic_opt_state", "temperature_opt_state", "prng", "steps"):
+            key = f"rlpd_z_{name}"
+            if key in encoder_checkpoint:
+                setattr(state, name, encoder_checkpoint[key])
+    decoder_state = DecoderFMState.init(
+        jax.random.PRNGKey(config["seed"] + 1000),
+        decoder_checkpoint["obs_dim"], decoder_checkpoint["action_dim"],
+        decoder_checkpoint["config"],
+    )
+    with jdc.copy_and_mutate(decoder_state) as state:
+        state.params = decoder_checkpoint["params"]
+        state.obs_stats = decoder_checkpoint["obs_stats"]
+    return EncoderFMAgent(ppo_z_state=encoder_state, fm_state=decoder_state), bool(
+        encoder_config.apply_tanh_in_rollout
+    )
+
+
+def run_async_collector(
+    pipeline_root: str,
+    replay_buffer_dir: str,
+    stop_file: str,
+    poll_seconds: float = 2.0,
+    rollout_steps: int = 100,
+    replay_capacity: int | None = None,
+    metrics_file: str | None = None,
+) -> None:
+    """Continuously collect real transitions with the latest complete Policy_n."""
+    config = TrainingConfig().to_dict() | EnvConfig().to_dict()
+    manager = VersionManager(pipeline_root)
+    replay = ChunkReplayBuffer(replay_buffer_dir, replay_capacity)
+    stop = Path(stop_file)
+    env = RobomimicEnv(
+        dataset_path=config["dataset_path"], reward_shaping=config["dense_reward"]
+    )
+    rollout_state = BatchedRolloutStateEncoderFM.init(
+        env, jax.random.key(config["seed"] + 1), config["num_envs"]
+    )
+    current_version = -1
+    agent = None
+    apply_tanh = True
+    try:
+        while not stop.exists():
+            latest = manager.latest_policy()
+            if latest is None:
+                time.sleep(poll_seconds)
+                continue
+            version, encoder_path, decoder_path = latest
+            if version != current_version:
+                agent, apply_tanh = _load_policy_pair(
+                    encoder_path, decoder_path, env, config
+                )
+                current_version = version
+                if metrics_file:
+                    append_metrics(metrics_file, {
+                        "collector/policy_version": version,
+                        "collector/policy_switch": 1,
+                    })
+            assert agent is not None
+            rollout_state, transitions = rollout_state.rollout(
+                agent,
+                episode_length=config["episode_length"],
+                iterations_per_env=rollout_steps,
+                apply_tanh_in_rollout=apply_tanh,
+            )
+            rewards = onp.asarray(jax.device_get(transitions.reward)).reshape(-1)
+            discounts = onp.asarray(jax.device_get(transitions.discount)).reshape(-1)
+            truncations = onp.asarray(jax.device_get(transitions.truncation)).reshape(-1).astype(bool)
+            payload = {
+                "observations": onp.asarray(jax.device_get(transitions.obs)).reshape(-1, int(env.observation_size)),
+                "actions": onp.asarray(jax.device_get(transitions.action_info.env_action)).reshape(-1, int(env.action_size)),
+                "rewards": rewards,
+                "next_observations": onp.asarray(jax.device_get(transitions.next_obs)).reshape(-1, int(env.observation_size)),
+                "masks": discounts,
+                "dones": onp.logical_and(discounts == 0.0, ~truncations),
+                "truncations": truncations,
+            }
+            replay.append(payload, metadata={
+                "policy_version": version,
+                "encoder_checkpoint": str(encoder_path),
+                "decoder_checkpoint": str(decoder_path),
+            })
+            if metrics_file:
+                append_metrics(metrics_file, {
+                    "collector/policy_version": version,
+                    "collector/transitions": len(rewards),
+                    "collector/replay_size": replay.size(),
+                    "collector/reward_mean": float(rewards.mean()),
+                })
+    finally:
+        rollout_state.close()
+
 def main(
     ppo_z_checkpoint_path: str | None = None,
     fm_model_path: str | None = None,

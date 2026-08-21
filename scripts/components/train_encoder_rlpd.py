@@ -29,7 +29,12 @@ from flow_policy.rollout_encoder import (
     BatchedRolloutStateEncoderFM,
     eval_policy_encoder_fm,
 )
-from metrics_ipc import append_metrics
+try:
+    from .metrics_ipc import append_metrics
+    from .online_pipeline_ipc import atomic_pickle_dump, load_transition_data
+except ImportError:  # Direct execution: python scripts/components/train_encoder_rlpd.py
+    from metrics_ipc import append_metrics
+    from online_pipeline_ipc import atomic_pickle_dump, load_transition_data
 
 
 @dataclass
@@ -236,6 +241,50 @@ def _sample_mixed_batch(
     return encoder_rlpd.RLPDTransitionBatch(**batch)
 
 
+def _sample_transition_arrays(
+    data: dict[str, np.ndarray],
+    count: int,
+    rng: np.random.Generator,
+) -> dict[str, np.ndarray]:
+    indices = rng.integers(0, len(data["rewards"]), size=count)
+    return {key: value[indices] for key, value in data.items()}
+
+
+def _sample_async_mixed_batch(
+    replay: dict[str, np.ndarray],
+    demo: dict[str, np.ndarray],
+    demo_ratio: float,
+    batch_size: int,
+    rng: np.random.Generator,
+    decoder: DecoderFMState,
+) -> encoder_rlpd.RLPDTransitionBatch:
+    """Build one RLPD batch in the fixed stage decoder's latent coordinates."""
+    demo_count = int(round(batch_size * demo_ratio))
+    demo_count = max(0, min(batch_size, demo_count))
+    replay_count = batch_size - demo_count
+    if demo_count and len(demo["rewards"]) == 0:
+        raise ValueError("demo_buffer is empty but encoder_demo_ratio is non-zero.")
+    if replay_count and len(replay["rewards"]) == 0:
+        raise ValueError("replay_buffer is empty but encoder_replay_ratio is non-zero.")
+
+    pieces = {key: [] for key in ("observations", "actions", "rewards", "next_observations", "masks")}
+    for source, count in ((demo, demo_count), (replay, replay_count)):
+        if count == 0:
+            continue
+        sampled = _sample_transition_arrays(source, count, rng)
+        pieces["observations"].append(sampled["observations"])
+        # Deliberately reconstruct every latent, including fresh replay data.
+        # Thus no latent from a collector or an older stage is treated as GT.
+        pieces["actions"].append(
+            _inverse_fm_batch(decoder, sampled["observations"], sampled["actions"])
+        )
+        for key in ("rewards", "next_observations", "masks"):
+            pieces[key].append(sampled[key])
+    return encoder_rlpd.RLPDTransitionBatch(
+        **{key: jnp.asarray(np.concatenate(values, axis=0)) for key, values in pieces.items()}
+    )
+
+
 def _checkpoint(
     agent: EncoderFMAgent,
     encoder_config: encoder_rlpd.EncoderConfig,
@@ -265,6 +314,139 @@ def _checkpoint(
         "best_reward": best_reward,
         "z_dim": z_dim,
     }
+
+
+def train_async_stage(
+    decoder_checkpoint_path: str,
+    previous_encoder_checkpoint_path: str,
+    demo_buffer_path: str,
+    replay_snapshot_path: str,
+    output_checkpoint_path: str,
+    version: int,
+    train_env_steps: int,
+    demo_ratio: float = 0.5,
+    replay_ratio: float = 0.5,
+    metrics_file: str | None = None,
+) -> None:
+    """Train one immutable Encoder_n stage without collecting environment data.
+
+    The caller creates ``replay_snapshot_path`` before launching this function.
+    Both source buffers provide real ``(s, a)`` and the fixed Decoder_{n-1}
+    converts every action to that stage's latent coordinate system.
+    """
+    if train_env_steps <= 0:
+        raise ValueError("train_env_steps must be positive.")
+    if not np.isclose(demo_ratio + replay_ratio, 1.0):
+        raise ValueError("encoder demo/replay ratios must sum to 1.0.")
+
+    config = TrainingConfig().to_dict() | EnvConfig().to_dict()
+    env = RobomimicEnv(
+        dataset_path=config["dataset_path"], reward_shaping=config["dense_reward"]
+    )
+    z_dim = int(env.action_size)
+    encoder_config = encoder_rlpd.EncoderConfig(
+        learning_rate=config["rlpd_actor_learning_rate"],
+        critic_learning_rate=config["rlpd_critic_learning_rate"],
+        temperature_learning_rate=config["rlpd_temperature_learning_rate"],
+        discounting=config["rlpd_discounting"],
+        episode_length=config["episode_length"],
+        normalize_observations=config["rlpd_normalize_observations"],
+        num_envs=config["num_envs"],
+        z_dim=z_dim,
+        hidden_size=config["rlpd_hidden_size"],
+        hidden_layers=config["rlpd_hidden_layers"],
+        critic_ensemble_size=config["rlpd_critic_ensemble_size"],
+        critic_subsample_size=config["rlpd_critic_subsample_size"],
+        target_update_rate=config["rlpd_target_update_rate"],
+        initial_temperature=config["rlpd_initial_temperature"],
+        target_entropy=config["rlpd_target_entropy"],
+        backup_entropy=config["rlpd_backup_entropy"],
+        reward_scaling=config["rlpd_reward_scaling"],
+        reward_bias=config["rlpd_reward_bias"],
+        max_grad_norm=config["rlpd_max_grad_norm"],
+        policy_update_period=config["rlpd_policy_update_period"],
+        apply_tanh_in_rollout=config["rlpd_apply_tanh_in_rollout"],
+    )
+    encoder_state = encoder_rlpd.EncoderState.init(
+        jax.random.key(config["seed"] + version), env, encoder_config
+    )
+    with Path(previous_encoder_checkpoint_path).expanduser().open("rb") as file:
+        previous = pickle.load(file)
+    required_encoder = {
+        "rlpd_z_actor_params", "rlpd_z_critic_params",
+        "rlpd_z_target_critic_params", "rlpd_z_log_temperature", "rlpd_z_obs_stats",
+    }
+    missing = sorted(required_encoder.difference(previous))
+    if missing:
+        raise ValueError(f"Previous encoder checkpoint is missing fields: {missing}")
+    with jdc.copy_and_mutate(encoder_state) as state:
+        state.actor_params = previous["rlpd_z_actor_params"]
+        state.critic_params = previous["rlpd_z_critic_params"]
+        state.target_critic_params = previous["rlpd_z_target_critic_params"]
+        state.log_temperature = previous["rlpd_z_log_temperature"]
+        state.obs_stats = previous["rlpd_z_obs_stats"]
+        for name in ("actor_opt_state", "critic_opt_state", "temperature_opt_state", "prng", "steps"):
+            key = f"rlpd_z_{name}"
+            if key in previous:
+                setattr(state, name, previous[key])
+
+    with Path(decoder_checkpoint_path).expanduser().open("rb") as file:
+        decoder_checkpoint = pickle.load(file)
+    decoder_state = DecoderFMState.init(
+        jax.random.PRNGKey(config["seed"] + 1000 + version),
+        decoder_checkpoint["obs_dim"], decoder_checkpoint["action_dim"],
+        decoder_checkpoint["config"],
+    )
+    with jdc.copy_and_mutate(decoder_state) as state:
+        state.params = decoder_checkpoint["params"]
+        state.obs_stats = decoder_checkpoint["obs_stats"]
+
+    demo = load_transition_data(demo_buffer_path)
+    replay = load_transition_data(replay_snapshot_path)
+    if demo["observations"].shape[-1] != int(env.observation_size):
+        raise ValueError("demo_buffer observation dimension does not match env.")
+    if replay["observations"].shape[-1] != int(env.observation_size):
+        raise ValueError("replay_buffer observation dimension does not match env.")
+
+    # One environment step corresponds to the same configurable high-UTD update
+    # multiplier used by the existing online implementation.
+    updates = max(1, int(train_env_steps * config["rlpd_updates_per_env_step"]))
+    rng = np.random.default_rng(config["seed"] + version)
+    metrics: dict[str, Any] = {}
+    started = time.time()
+    for update in tqdm(range(updates), desc=f"Encoder {version}"):
+        batch = _sample_async_mixed_batch(
+            replay, demo, demo_ratio, config["rlpd_batch_size"], rng, decoder_state
+        )
+        if update == 0:
+            encoder_state = encoder_state.update_observation_stats(
+                jnp.concatenate([batch.observations, batch.next_observations], axis=0)
+            )
+        encoder_state, critic_metrics = encoder_state.update_critic(batch)
+        metrics = dict(critic_metrics)
+        if (update + 1) % config["rlpd_policy_update_period"] == 0:
+            encoder_state, actor_metrics = encoder_state.update_actor_and_temperature(batch)
+            metrics.update(actor_metrics)
+        if metrics_file and ((update + 1) % 100 == 0 or update + 1 == updates):
+            append_metrics(metrics_file, {
+                "pipeline/version": version,
+                "pipeline/encoder_step": update + 1,
+                **{f"train/{key}": float(np.asarray(value)) for key, value in metrics.items()},
+            })
+
+    agent = EncoderFMAgent(ppo_z_state=encoder_state, fm_state=decoder_state)
+    checkpoint = _checkpoint(agent, encoder_config, config, updates, -float("inf"), z_dim)
+    checkpoint.update({
+        "version": version,
+        "fixed_decoder_checkpoint": str(Path(decoder_checkpoint_path).resolve()),
+        "previous_encoder_checkpoint": str(Path(previous_encoder_checkpoint_path).resolve()),
+        "train_env_steps": train_env_steps,
+        "train_updates": updates,
+        "demo_ratio": demo_ratio,
+        "replay_ratio": replay_ratio,
+        "wall_time_seconds": time.time() - started,
+    })
+    atomic_pickle_dump(checkpoint, output_checkpoint_path)
 
 
 def _tree_shapes(tree: Any) -> Any:

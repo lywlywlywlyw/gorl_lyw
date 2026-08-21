@@ -2,7 +2,9 @@
 
 import datetime
 import pickle
+import time
 from pathlib import Path
+from typing import Any
 
 import jax
 import jax_dataclasses as jdc
@@ -16,7 +18,111 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from flow_policy.decoder_fm import DecoderFMConfig, DecoderFMState
 from envs.robomimic.online_config.training_config import TrainingConfig
 from envs.robomimic.online_config.env_config import EnvConfig
-from metrics_ipc import append_metrics
+try:
+    from .metrics_ipc import append_metrics
+    from .online_pipeline_ipc import atomic_pickle_dump, load_transition_data
+except ImportError:  # Direct execution: python scripts/components/train_decoder_fm.py
+    from metrics_ipc import append_metrics
+    from online_pipeline_ipc import atomic_pickle_dump, load_transition_data
+
+
+def train_async_stage(
+    encoder_checkpoint_path: str,
+    previous_decoder_checkpoint_path: str,
+    replay_snapshot_path: str,
+    output_checkpoint_path: str,
+    version: int,
+    train_steps: int,
+    metrics_file: str | None = None,
+) -> None:
+    """Train one Decoder_n from an immutable replay snapshot.
+
+    This is the existing FM objective (``DecoderFMState.train_step``) without
+    success/reward filtering. ``Encoder_n`` is loaded and validated once at the
+    stage boundary, then recorded in the output checkpoint. The current FM
+    implementation constructs its own noise latent, so no alternate latent
+    target is introduced here.
+    """
+    if train_steps <= 0:
+        raise ValueError("train_steps must be positive.")
+    config = TrainingConfig().to_dict() | EnvConfig().to_dict()
+    with Path(encoder_checkpoint_path).expanduser().open("rb") as file:
+        encoder_checkpoint = pickle.load(file)
+    required_encoder = {"rlpd_z_actor_params", "rlpd_z_obs_stats", "config"}
+    missing = sorted(required_encoder.difference(encoder_checkpoint))
+    if missing:
+        raise ValueError(f"Fixed encoder checkpoint is missing fields: {missing}")
+
+    with Path(previous_decoder_checkpoint_path).expanduser().open("rb") as file:
+        previous = pickle.load(file)
+    required_decoder = {"params", "obs_stats", "config", "obs_dim", "action_dim"}
+    missing = sorted(required_decoder.difference(previous))
+    if missing:
+        raise ValueError(f"Previous decoder checkpoint is missing fields: {missing}")
+
+    replay = load_transition_data(replay_snapshot_path)
+    states = replay["observations"]
+    actions = replay["actions"]
+    if len(states) < 2:
+        raise ValueError("Decoder stage requires at least two replay transitions.")
+    if states.shape[-1] != int(previous["obs_dim"]):
+        raise ValueError("Replay observation dimension does not match decoder.")
+    if actions.shape[-1] != int(previous["action_dim"]):
+        raise ValueError("Replay action dimension does not match decoder.")
+
+    decoder_config = previous["config"]
+    fm_state = DecoderFMState.init(
+        jax.random.PRNGKey(config["seed"] + 2000 + version),
+        int(previous["obs_dim"]), int(previous["action_dim"]), decoder_config,
+    )
+    with jdc.copy_and_mutate(fm_state) as state:
+        state.params = previous["params"]
+        state.obs_stats = previous["obs_stats"]
+        # Preserve online continuation state when available. Offline bootstrap
+        # checkpoints simply start with the newly initialized optimizer.
+        if "fm_opt_state" in previous:
+            state.opt_state = previous["fm_opt_state"]
+        if "fm_prng" in previous:
+            state.prng = previous["fm_prng"]
+        if "fm_steps" in previous:
+            state.steps = previous["fm_steps"]
+        state.obs_stats = state.obs_stats.update(jnp.asarray(states))
+
+    rng = np.random.default_rng(config["seed"] + version)
+    batch_size = int(config["fm_batch_size"])
+    started = time.time()
+    metrics: dict[str, Any] = {}
+    for step in tqdm(range(train_steps), desc=f"Decoder {version}"):
+        indices = rng.integers(0, len(states), size=batch_size)
+        fm_state, metrics = fm_state.train_step(
+            jnp.asarray(states[indices]), jnp.asarray(actions[indices])
+        )
+        if metrics_file and ((step + 1) % 100 == 0 or step + 1 == train_steps):
+            append_metrics(metrics_file, {
+                "pipeline/version": version,
+                "pipeline/decoder_step": step + 1,
+                **{f"decoder/{key}": float(np.asarray(value)) for key, value in metrics.items()},
+            })
+
+    checkpoint = {
+        "params": fm_state.params,
+        "obs_stats": fm_state.obs_stats,
+        "fm_opt_state": fm_state.opt_state,
+        "fm_prng": fm_state.prng,
+        "fm_steps": fm_state.steps,
+        "config": decoder_config,
+        "obs_dim": int(previous["obs_dim"]),
+        "action_dim": int(previous["action_dim"]),
+        "env_name": config["env_name"],
+        "decoder_type": "fm",
+        "version": version,
+        "fixed_encoder_checkpoint": str(Path(encoder_checkpoint_path).resolve()),
+        "previous_decoder_checkpoint": str(Path(previous_decoder_checkpoint_path).resolve()),
+        "train_steps": train_steps,
+        "final_loss": float(np.asarray(metrics.get("loss", np.nan))),
+        "wall_time_seconds": time.time() - started,
+    }
+    atomic_pickle_dump(checkpoint, output_checkpoint_path)
 
 def train_fm(
     data_path: str = "data/ppo_training_data_WalkerWalk_20250928_212057.pkl",
