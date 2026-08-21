@@ -378,8 +378,8 @@ def _validate_offline_checkpoint(
 def main(
     use_offline_checkpoint: bool = False,
     offline_checkpoint_path: str | None = None,
-    stage_init_before_training: bool = True,
-    mode: str = "legacy",
+    stage_init_before_training: bool = False,
+    mode: str = "async",
     demo_buffer_path: str | None = None,
     async_run_dir: str | None = None,
     async_num_versions: int = 48,
@@ -580,7 +580,11 @@ def main(
         # =====================================================================
         if stage == 0 and initial_offline_checkpoint is not None:
             fm_checkpoint = initial_offline_checkpoint
-            print(f"Using offline FM decoder for stage 0: {fm_checkpoint}")
+            encoder_checkpoint = initial_offline_checkpoint
+            print(
+                "Using offline checkpoint as Encoder_0 and Decoder_0: "
+                f"{initial_offline_checkpoint}"
+            )
             if wandb_run is not None:
                 wandb_run.log({
                     "pipeline/stage": stage,
@@ -615,7 +619,8 @@ def main(
         stage_timesteps = timesteps_list[stage]
         stage_step_offset = sum(timesteps_list[:stage])
 
-        cmd = " ".join([
+        encoder_source_checkpoint = encoder_checkpoint
+        cmd_parts = [
             "MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python scripts/components/train_encoder_rlpd.py",
             f"--decoder_model_path {shlex.quote(str(fm_checkpoint))}",
             f"--exp_name {shlex.quote(encoder_exp_name)}",
@@ -627,7 +632,13 @@ def main(
             _tyro_bool_flag(
                 "stage_init_before_training", stage_init_before_training
             ),
-        ])
+        ]
+        if not stage_init_before_training and encoder_source_checkpoint is not None:
+            cmd_parts.append(
+                "--encoder_model_path "
+                f"{shlex.quote(str(encoder_source_checkpoint))}"
+            )
+        cmd = " ".join(cmd_parts)
 
         if wandb_run is not None:
             wandb_run.log({"pipeline/stage": stage, "pipeline/phase": "train_encoder"})

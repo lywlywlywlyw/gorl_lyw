@@ -40,12 +40,10 @@ except ImportError:  # Direct execution: python scripts/components/train_encoder
 @dataclass
 class ReplayBuffer:
     observations: np.ndarray
-    latents: np.ndarray
-    env_actions: np.ndarray
+    actions: np.ndarray
     rewards: np.ndarray
     next_observations: np.ndarray
     masks: np.ndarray
-    is_new: np.ndarray
     capacity: int
     size: int = 0
     cursor: int = 0
@@ -54,12 +52,10 @@ class ReplayBuffer:
     def create(cls, capacity: int, obs_dim: int, action_dim: int) -> "ReplayBuffer":
         return cls(
             observations=np.empty((capacity, obs_dim), dtype=np.float32),
-            latents=np.empty((capacity, action_dim), dtype=np.float32),
-            env_actions=np.empty((capacity, action_dim), dtype=np.float32),
+            actions=np.empty((capacity, action_dim), dtype=np.float32),
             rewards=np.empty((capacity,), dtype=np.float32),
             next_observations=np.empty((capacity, obs_dim), dtype=np.float32),
             masks=np.empty((capacity,), dtype=np.float32),
-            is_new=np.empty((capacity,), dtype=np.bool_),
             capacity=capacity,
         )
 
@@ -68,20 +64,14 @@ class ReplayBuffer:
             "observations": np.asarray(jax.device_get(transitions.obs)).reshape(
                 -1, self.observations.shape[-1]
             ),
-            "latents": np.asarray(jax.device_get(transitions.action)).reshape(
-                -1, self.latents.shape[-1]
-            ),
-            "env_actions": np.asarray(
+            "actions": np.asarray(
                 jax.device_get(transitions.action_info.env_action)
-            ).reshape(-1, self.env_actions.shape[-1]),
+            ).reshape(-1, self.actions.shape[-1]),
             "rewards": np.asarray(jax.device_get(transitions.reward)).reshape(-1),
             "next_observations": np.asarray(
                 jax.device_get(transitions.next_obs)
             ).reshape(-1, self.next_observations.shape[-1]),
             "masks": np.asarray(jax.device_get(transitions.discount)).reshape(-1),
-            "is_new": np.ones(
-                np.asarray(jax.device_get(transitions.reward)).size, dtype=np.bool_
-            ),
         }
         count = len(arrays["rewards"])
         if count >= self.capacity:
@@ -101,18 +91,12 @@ class ReplayBuffer:
             key: getattr(self, key)[indices]
             for key in (
                 "observations",
-                "latents",
-                "env_actions",
+                "actions",
                 "rewards",
                 "next_observations",
                 "masks",
-                "is_new",
             )
         }
-
-    def mark_all_old(self) -> None:
-        """Invalidate rollout latents after the current encoder stage."""
-        self.is_new[: self.size] = False
 
     def save(self, path: str | None) -> None:
         if path is None:
@@ -132,6 +116,19 @@ class ReplayBuffer:
                 replay = pickle.load(file)
             if not isinstance(replay, cls):
                 raise TypeError(f"Invalid encoder replay buffer: {source}")
+            # Migrate replay files produced before buffers were standardized on
+            # real environment actions. Stored latents and freshness flags are
+            # intentionally discarded: z is always reconstructed at training
+            # time with the fixed decoder for the current encoder stage.
+            if not hasattr(replay, "actions"):
+                if not hasattr(replay, "env_actions"):
+                    raise ValueError(
+                        f"Encoder replay buffer has no environment actions: {source}"
+                    )
+                replay.actions = replay.env_actions
+            for obsolete in ("latents", "env_actions", "is_new"):
+                if hasattr(replay, obsolete):
+                    delattr(replay, obsolete)
             return replay
         return cls.create(capacity, obs_dim, action_dim)
 
@@ -172,10 +169,24 @@ def _inverse_fm_batch(
     observations: np.ndarray,
     actions: np.ndarray,
 ) -> np.ndarray:
+    """Map environment actions back to the fixed decoder's input latent ``z``.
+
+    ``DecoderFMState.sample_action_from_z`` integrates the learned flow from
+    ``t=1`` (latent) to ``t=0`` (environment action).  Encoder training needs
+    actions expressed in exactly that decoder's latent coordinates, so this
+    function integrates the same vector field in the opposite direction.
+    """
     obs = jnp.asarray(observations)
     x = jnp.asarray(actions)
-    obs_norm = (obs - decoder.obs_stats.mean) / (decoder.obs_stats.std + 1e-8)
-    # times = jnp.linspace(1.0, 0.0, decoder.config.flow_steps + 1)
+    if obs.ndim != 2 or x.ndim != 2:
+        raise ValueError("Inverse FM expects batched rank-2 observations and actions.")
+    if obs.shape[0] != x.shape[0]:
+        raise ValueError("Inverse FM observations and actions must have equal batch size.")
+    obs_norm = (
+        (obs - decoder.obs_stats.mean) / (decoder.obs_stats.std + 1e-8)
+        if decoder.config.normalize_observations
+        else obs
+    )
     times = jnp.linspace(0.0, 1.0, decoder.config.flow_steps + 1)
 
     def step(x_t, pair):
@@ -213,14 +224,15 @@ def _sample_mixed_batch(
     }
     if online_count:
         sampled = online.sample(rng, online_count)
-        latents = sampled["latents"].copy()
-        old = ~sampled["is_new"]
-        if np.any(old):
-            latents[old] = _inverse_fm_batch(
-                decoder, sampled["observations"][old], sampled["env_actions"][old]
-            )
         pieces["observations"].append(sampled["observations"])
-        pieces["actions"].append(latents)
+        # Always reconstruct z from the real (s, a) pair with Decoder_{n-1}.
+        # Even a freshly collected latent was produced before this optimizer
+        # update and must not bypass the fixed decoder coordinate transform.
+        pieces["actions"].append(
+            _inverse_fm_batch(
+                decoder, sampled["observations"], sampled["actions"]
+            )
+        )
         for key in ("rewards", "next_observations", "masks"):
             pieces[key].append(sampled[key])
     if demo_count:
@@ -479,6 +491,7 @@ def _validate_iql_actor_warm_start(
 def main(
     exp_name: str,
     decoder_model_path: str | None = None,
+    encoder_model_path: str | None = None,
     num_timesteps: int | None = None,
     stage: int = 0,
     global_step_offset: int = 0,
@@ -505,6 +518,18 @@ def main(
     missing = sorted(required.difference(decoder_checkpoint))
     if missing:
         raise ValueError(f"Decoder checkpoint is missing fields: {missing}")
+
+    # Keep the two versioned components explicit.  For legacy combined
+    # checkpoints this defaults to decoder_model_path, while the pipeline can
+    # pass Encoder_{n-1} and Decoder_{n-1} as independent files.
+    if encoder_model_path is None:
+        encoder_model_path = decoder_model_path
+    with open(encoder_model_path, "rb") as file:
+        encoder_checkpoint = pickle.load(file)
+    if not isinstance(encoder_checkpoint, dict):
+        raise ValueError(
+            f"Encoder checkpoint must contain a dictionary: {encoder_model_path}"
+        )
 
     env = RobomimicEnv(
         dataset_path=config["dataset_path"], reward_shaping=config["dense_reward"]
@@ -536,15 +561,15 @@ def main(
     encoder_state = encoder_rlpd.EncoderState.init(
         jax.random.key(config["seed"]), env, encoder_config
     )
-    has_encoder_state = "rlpd_z_actor_params" in decoder_checkpoint
-    has_iql_actor_warm_start = "iql_z_actor_params" in decoder_checkpoint
+    has_encoder_state = "rlpd_z_actor_params" in encoder_checkpoint
+    has_iql_actor_warm_start = "iql_z_actor_params" in encoder_checkpoint
     should_resume_encoder = not (
-        stage == 0 and decoder_checkpoint.get("is_identity", False)
+        stage == 0 and encoder_checkpoint.get("is_identity", False)
     )
     if not stage_init_before_training and should_resume_encoder and not has_encoder_state:
         raise ValueError(
             "stage_init_before_training=False requires previous RLPD encoder state "
-            f"for stage {stage}; checkpoint {decoder_model_path} does not contain "
+            f"for stage {stage}; checkpoint {encoder_model_path} does not contain "
             "'rlpd_z_actor_params'."
         )
     resume = (
@@ -552,23 +577,23 @@ def main(
         and should_resume_encoder
         and has_encoder_state
     )
-    decoder_checkpoint_is_offline = bool(
-        decoder_checkpoint.get("is_frozen_offline", False)
-        or decoder_checkpoint.get("offline_checkpoint_type") is not None
-        or str(decoder_checkpoint.get("checkpoint_format", "")).startswith(
+    encoder_checkpoint_is_offline = bool(
+        encoder_checkpoint.get("is_frozen_offline", False)
+        or encoder_checkpoint.get("offline_checkpoint_type") is not None
+        or str(encoder_checkpoint.get("checkpoint_format", "")).startswith(
             "gorl_offline"
         )
     )
     if resume:
         with jdc.copy_and_mutate(encoder_state) as state:
-            state.actor_params = decoder_checkpoint["rlpd_z_actor_params"]
-            state.critic_params = decoder_checkpoint["rlpd_z_critic_params"]
-            state.target_critic_params = decoder_checkpoint["rlpd_z_target_critic_params"]
-            state.log_temperature = decoder_checkpoint["rlpd_z_log_temperature"]
-            state.obs_stats = decoder_checkpoint["rlpd_z_obs_stats"]
+            state.actor_params = encoder_checkpoint["rlpd_z_actor_params"]
+            state.critic_params = encoder_checkpoint["rlpd_z_critic_params"]
+            state.target_critic_params = encoder_checkpoint["rlpd_z_target_critic_params"]
+            state.log_temperature = encoder_checkpoint["rlpd_z_log_temperature"]
+            state.obs_stats = encoder_checkpoint["rlpd_z_obs_stats"]
             # Never inherit an offline optimizer. Online-to-online continuation
             # may preserve optimizer/PRNG/step state as before.
-            if not decoder_checkpoint_is_offline:
+            if not encoder_checkpoint_is_offline:
                 for name in (
                     "actor_opt_state",
                     "critic_opt_state",
@@ -577,20 +602,20 @@ def main(
                     "steps",
                 ):
                     key = f"rlpd_z_{name}"
-                    if key in decoder_checkpoint:
-                        setattr(state, name, decoder_checkpoint[key])
+                    if key in encoder_checkpoint:
+                        setattr(state, name, encoder_checkpoint[key])
     elif has_iql_actor_warm_start:
         _validate_iql_actor_warm_start(
-            encoder_state, decoder_checkpoint, decoder_model_path
+            encoder_state, encoder_checkpoint, encoder_model_path
         )
         with jdc.copy_and_mutate(encoder_state) as state:
-            state.actor_params = decoder_checkpoint["iql_z_actor_params"]
-            state.obs_stats = decoder_checkpoint.get(
+            state.actor_params = encoder_checkpoint["iql_z_actor_params"]
+            state.obs_stats = encoder_checkpoint.get(
                 "iql_z_obs_stats", state.obs_stats
             )
         print(
             "Warm-started online RLPD actor and observation statistics from "
-            f"offline IQL checkpoint: {decoder_model_path}"
+            f"offline IQL checkpoint: {encoder_model_path}"
         )
 
     decoder_state = DecoderFMState.init(
@@ -699,7 +724,6 @@ def main(
                     file,
                 )
 
-    replay.mark_all_old()
     replay.save(replay_buffer_path)
     with open(results_dir / "final_checkpoint.pkl", "wb") as file:
         pickle.dump(

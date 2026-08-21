@@ -236,8 +236,12 @@ class DecoderFMState:
         # Handle single observation
         single_obs = obs.ndim == 1
 
-        # Normalize observation
-        obs_norm = (obs - self.obs_stats.mean) / (self.obs_stats.std + 1e-8)
+        # Use the same observation preprocessing as sample_action, training,
+        # and the action-to-latent inverse used by encoder training.
+        if self.config.normalize_observations:
+            obs_norm = (obs - self.obs_stats.mean) / (self.obs_stats.std + 1e-8)
+        else:
+            obs_norm = obs
         if single_obs:
             obs_norm = obs_norm[None, :]
             z = z[None, :]
