@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 class RLPDConfig:
     """RLPD encoder hyperparameters for latent-space online training."""
 
-    rlpd_batch_size: int = 128
+    rlpd_batch_size: int = 1024
     rlpd_replay_buffer_capacity: int = 200_000
     rlpd_learning_starts: int = 24_576
     rlpd_updates_per_env_step: int = 1

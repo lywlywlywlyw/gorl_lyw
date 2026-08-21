@@ -7,6 +7,7 @@ Stage 1+: Encoder update → Collect data → Decoder update → Repeat
 
 import datetime
 import json
+import os
 import pickle
 import shlex
 import subprocess
@@ -52,7 +53,27 @@ def _write_replay_snapshot(replay: ChunkReplayBuffer, target: Path) -> Path:
     return atomic_pickle_dump(data, target)
 
 
+def _configure_worker_gpu(role: str, gpu_id: int) -> None:
+    """Restrict one spawned async worker to one physical GPU.
+
+    This must run before importing worker modules because those modules import
+    JAX at module scope. After ``CUDA_VISIBLE_DEVICES`` is set, the selected
+    physical GPU is exposed to that worker as local device 0.
+    """
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    os.environ["MUJOCO_GL"] = "egl"
+    os.environ["PYOPENGL_PLATFORM"] = "egl"
+    # EGL enumerates physical devices independently of CUDA's local numbering.
+    os.environ["MUJOCO_EGL_DEVICE_ID"] = str(gpu_id)
+    print(
+        f"[{role}] physical GPU {gpu_id} selected "
+        "(CUDA_VISIBLE_DEVICES; local device 0).",
+        flush=True,
+    )
+
+
 def _encoder_worker(settings: dict) -> None:
+    _configure_worker_gpu("encoder", settings["encoder_gpu_id"])
     from scripts.components.train_encoder_rlpd import train_async_stage
 
     manager = VersionManager(settings["versions_dir"])
@@ -89,6 +110,7 @@ def _encoder_worker(settings: dict) -> None:
 
 
 def _decoder_worker(settings: dict) -> None:
+    _configure_worker_gpu("decoder", settings["decoder_gpu_id"])
     from scripts.components.train_decoder_fm import train_async_stage
 
     manager = VersionManager(settings["versions_dir"])
@@ -122,6 +144,7 @@ def _decoder_worker(settings: dict) -> None:
 
 
 def _collector_worker(settings: dict) -> None:
+    _configure_worker_gpu("collector", settings["collector_gpu_id"])
     from scripts.components.collect_data_fm import run_async_collector
 
     run_async_collector(
@@ -164,13 +187,17 @@ def run_async_pipeline(
     run_dir: str | None = None,
     num_versions: int = 24,
     encoder_train_env_steps: int = 49152,
-    decoder_train_steps: int = 1000,
+    decoder_train_steps: int = 500,
     encoder_demo_ratio: float = 0.5,
     encoder_replay_ratio: float = 0.5,
-    minimum_replay_size: int = 24576,
+    minimum_replay_size: int = 49152,
     replay_capacity: int | None = 200000,
     collector_rollout_steps: int = 32,
     poll_seconds: float = 1.0,
+    collector_gpu_id: int = 0,
+    encoder_gpu_id: int = 1,
+    decoder_gpu_id: int = 2,
+    parent_gpu_id: int = 3,
 ) -> None:
     """Run Collector, Encoder Trainer and Decoder Trainer as independent processes."""
     if not np.isclose(encoder_demo_ratio + encoder_replay_ratio, 1.0):
@@ -179,6 +206,35 @@ def run_async_pipeline(
         raise ValueError("num_versions must be at least 1")
     if minimum_replay_size < 1:
         raise ValueError("minimum_replay_size must be positive")
+    worker_gpu_ids = {
+        "collector": collector_gpu_id,
+        "encoder": encoder_gpu_id,
+        "decoder": decoder_gpu_id,
+    }
+    invalid_gpu_ids = {
+        role: gpu_id for role, gpu_id in worker_gpu_ids.items() if gpu_id < 0
+    }
+    if invalid_gpu_ids:
+        raise ValueError(f"async worker GPU IDs must be non-negative: {invalid_gpu_ids}")
+    if len(set(worker_gpu_ids.values())) != len(worker_gpu_ids):
+        raise ValueError(
+            "async collector, encoder and decoder must use different GPUs; "
+            f"received {worker_gpu_ids}"
+        )
+    if parent_gpu_id < 0:
+        raise ValueError("parent_gpu_id must be non-negative")
+    if parent_gpu_id in worker_gpu_ids.values():
+        raise ValueError(
+            "the async parent validation process must not share a worker GPU; "
+            f"parent={parent_gpu_id}, workers={worker_gpu_ids}"
+        )
+
+    # The parent imports JAX below to validate environment dimensions. Pin it to
+    # the spare GPU before that first import so it cannot reserve worker memory.
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(parent_gpu_id)
+    os.environ["MUJOCO_GL"] = "egl"
+    os.environ["PYOPENGL_PLATFORM"] = "egl"
+    os.environ["MUJOCO_EGL_DEVICE_ID"] = str(parent_gpu_id)
     config = TrainingConfig().to_dict() | EnvConfig().to_dict()
     from envs.robomimic.RobomimicEnv import RobomimicEnv
     env = RobomimicEnv(dataset_path=config["dataset_path"], reward_shaping=config["dense_reward"])
@@ -223,8 +279,18 @@ def run_async_pipeline(
         "minimum_replay_size": minimum_replay_size,
         "replay_capacity": replay_capacity, "collector_rollout_steps": collector_rollout_steps,
         "poll_seconds": poll_seconds,
+        "collector_gpu_id": collector_gpu_id,
+        "encoder_gpu_id": encoder_gpu_id,
+        "decoder_gpu_id": decoder_gpu_id,
+        "parent_gpu_id": parent_gpu_id,
     }
     atomic_pickle_dump(settings, root / "pipeline_settings.pkl")
+    print(
+        "Asynchronous GPU assignment: "
+        f"collector=cuda:{collector_gpu_id}, "
+        f"encoder=cuda:{encoder_gpu_id}, decoder=cuda:{decoder_gpu_id}; "
+        f"parent validation=cuda:{parent_gpu_id}"
+    )
     context = mp.get_context("spawn")
     processes = [
         context.Process(name="data-collector", target=_collector_worker, args=(settings,)),
@@ -384,13 +450,17 @@ def main(
     async_run_dir: str | None = None,
     async_num_versions: int = 24,
     encoder_train_env_steps: int = 49152,
-    decoder_train_steps: int = 1000,
+    decoder_train_steps: int = 500,
     encoder_demo_ratio: float = 0.5,
     encoder_replay_ratio: float = 0.5,
-    minimum_replay_size: int = 24576,
+    minimum_replay_size: int = 49152,
     replay_capacity: int | None = 200000,
     collector_rollout_steps: int = 32,
     poll_seconds: float = 1.0,
+    collector_gpu_id: int = 0,
+    encoder_gpu_id: int = 1,
+    decoder_gpu_id: int = 2,
+    parent_gpu_id: int = 3,
 ) -> None:
     """Run the complete RLPD encoder + FM decoder training pipeline.
 
@@ -427,6 +497,10 @@ def main(
             replay_capacity=replay_capacity,
             collector_rollout_steps=collector_rollout_steps,
             poll_seconds=poll_seconds,
+            collector_gpu_id=collector_gpu_id,
+            encoder_gpu_id=encoder_gpu_id,
+            decoder_gpu_id=decoder_gpu_id,
+            parent_gpu_id=parent_gpu_id,
         )
         return
 
