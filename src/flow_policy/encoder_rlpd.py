@@ -76,6 +76,8 @@ class EncoderState:
 
     @staticmethod
     def init(prng: Array, env: Any, config: EncoderConfig) -> "EncoderState":
+        if config.initial_temperature <= 0.0:
+            raise ValueError("initial_temperature must be positive")
         obs_dim = int(env.observation_size)
         actor_key, critic_key, prng = jax.random.split(prng, 3)
         actor_dims = (obs_dim,) + (config.hidden_size,) * config.hidden_layers + (
@@ -98,7 +100,8 @@ class EncoderState:
             optax.adam(config.critic_learning_rate),
         )
         temperature_optimizer = optax.adam(config.temperature_learning_rate)
-        log_temperature = jnp.log(jnp.asarray(config.initial_temperature))
+        initial_temperature = jnp.asarray(config.initial_temperature)
+        log_temperature = jnp.log(jnp.exp(initial_temperature) - 1.0)
         return EncoderState(
             actor_params=actor_params,
             critic_params=critic_params,
@@ -160,7 +163,7 @@ class EncoderState:
 
     @property
     def temperature(self) -> Array:
-        return jnp.exp(self.log_temperature)
+        return jax.nn.softplus(self.log_temperature)
 
     def _target_entropy(self) -> float:
         value = self.config.target_entropy
@@ -202,7 +205,7 @@ class EncoderState:
         if self.config.backup_entropy:
             target_q = target_q - jax.lax.stop_gradient(self.temperature) * next_log_probs
         
-        target = jax.lax.stop_gradient(target)
+        target = jax.lax.stop_gradient(target_q)
 
         def loss_fn(params: Any) -> tuple[Array, tuple[Array, Array]]:
             predicted = self._critic_values(params, batch.observations, batch.actions)
@@ -244,7 +247,7 @@ class EncoderState:
     def update_actor_and_temperature(
         self, batch: RLPDTransitionBatch
     ) -> tuple["EncoderState", dict[str, Array]]:
-        rng, actor_key = jax.random.split(self.prng)
+        rng, actor_key, temperature_key = jax.random.split(self.prng, 3)
         temperature = jax.lax.stop_gradient(self.temperature)
 
         def actor_loss_fn(params: networks.MlpWeights):
@@ -269,10 +272,15 @@ class EncoderState:
         actor_params = optax.apply_updates(self.actor_params, actor_updates)
         target_entropy = self._target_entropy()
 
+        _, temperature_log_probs = self._sample_with_params(
+            self.actor_params, batch.next_observations, temperature_key
+        )
+        temperature_entropy = -jnp.mean(temperature_log_probs)
+
         def temperature_loss_fn(log_temperature: Array) -> Array:
-            return -jnp.mean(
-                log_temperature
-                * jax.lax.stop_gradient(log_probs + target_entropy)
+            temperature = jax.nn.softplus(log_temperature)
+            return temperature * jax.lax.stop_gradient(
+                temperature_entropy - target_entropy
             )
 
         temperature_loss, temperature_grads = jax.value_and_grad(
@@ -299,7 +307,7 @@ class EncoderState:
             "actor_loss": actor_loss,
             "actor_q": actor_q,
             "entropy": entropy,
-            "temperature": jnp.exp(log_temperature),
+            "temperature": temperature,
             "temperature_loss": temperature_loss,
             "actor_grad_norm": _global_norm(actor_grads),
         }
