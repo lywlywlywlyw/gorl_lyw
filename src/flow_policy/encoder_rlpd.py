@@ -164,7 +164,7 @@ class EncoderState:
 
     def _target_entropy(self) -> float:
         value = self.config.target_entropy
-        return -float(self.config.z_dim) if value is None else float(value)
+        return -float(self.config.z_dim)/2 if value is None else float(value)
 
     @jax.jit
     def update_observation_stats(self, observations: Array) -> "EncoderState":
@@ -178,26 +178,30 @@ class EncoderState:
         next_actions, next_log_probs = self._sample_with_params(
             self.actor_params, batch.next_observations, action_key
         )
-        target_qs = self._critic_values(
+        target_next_qs = self._critic_values(
             self.target_critic_params, batch.next_observations, next_actions
         )
-        subset_size = min(
-            self.config.critic_subsample_size, self.config.critic_ensemble_size
-        )
-        subset = jax.random.choice(
-            subset_key,
-            self.config.critic_ensemble_size,
-            shape=(subset_size,),
-            replace=False,
-        )
-        target_q = jnp.min(target_qs[subset], axis=0)
+        if self.config.critic_subsample_size is not None:
+            subset_size = min(
+                self.config.critic_subsample_size, self.config.critic_ensemble_size
+            )
+            subset = jax.random.choice(
+                subset_key,
+                self.config.critic_ensemble_size,
+                shape=(subset_size,),
+                replace=False,
+            )
+            # target_qs = jnp.min(target_qs[subset], axis=0)
+            target_next_qs = target_next_qs[subset]
+        target_next_min_q = jnp.min(target_next_qs, axis=0)
+        target_q = (
+                    self.config.reward_scaling * batch.rewards
+                    + self.config.reward_bias
+                    + self.config.discounting * batch.masks * target_next_min_q
+                )
         if self.config.backup_entropy:
             target_q = target_q - jax.lax.stop_gradient(self.temperature) * next_log_probs
-        target = (
-            self.config.reward_scaling * batch.rewards
-            + self.config.reward_bias
-            + self.config.discounting * batch.masks * target_q
-        )
+        
         target = jax.lax.stop_gradient(target)
 
         def loss_fn(params: Any) -> tuple[Array, tuple[Array, Array]]:
