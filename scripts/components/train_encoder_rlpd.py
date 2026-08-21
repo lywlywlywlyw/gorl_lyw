@@ -67,7 +67,7 @@ class ReplayBuffer:
                 -1, self.latents.shape[-1]
             ),
             "env_actions": np.asarray(
-                jax.device_get(transitions.action_info["env_action"])
+                jax.device_get(transitions.action_info.env_action)
             ).reshape(-1, self.env_actions.shape[-1]),
             "rewards": np.asarray(jax.device_get(transitions.reward)).reshape(-1),
             "next_observations": np.asarray(

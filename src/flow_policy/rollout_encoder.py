@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 import jax
-# import jax_dataclasses as jdc
+import jax_dataclasses as jdc
 import numpy as np
 from jax import Array
 from jax import numpy as jnp
@@ -80,6 +80,19 @@ class EncoderAgentProtocol(Protocol):
     ) -> Array:
         """Map z to action using decoder (deterministic)."""
         ...
+
+
+@jdc.pytree_dataclass
+class EncoderRolloutActionInfo:
+    """Policy sampling metadata plus the action executed by the environment."""
+
+    policy_info: Any
+    env_action: Array
+
+    @property
+    def log_prob(self) -> Array:
+        """Preserve the action-info interface expected by PPO training."""
+        return self.policy_info.log_prob
 
 
 @dataclass
@@ -254,7 +267,10 @@ class BatchedRolloutStateEncoderFM:
             transition_steps.append(rollouts.TransitionStruct(
                 obs=obs, next_obs=jnp.stack([state.obs for state in transition_next_states]),
                 action=z,
-                action_info={**z_info, "env_action": env_action},
+                action_info=EncoderRolloutActionInfo(
+                    policy_info=z_info,
+                    env_action=env_action,
+                ),
                 reward=jnp.asarray(rewards, dtype=jnp.float32),
                 truncation=jnp.asarray(truncations, dtype=jnp.float32),
                 discount=jnp.asarray(discounts, dtype=jnp.float32)))
