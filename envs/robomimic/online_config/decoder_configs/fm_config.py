@@ -5,7 +5,7 @@ from dataclasses import dataclass, asdict
 class FlowMatchingConfig:
     fm_batch_size: int = 2048
     fm_num_epochs: int = 20#50
-    fm_learning_rate: float = 0.0003
+    fm_learning_rate: float = 0.0001
     fm_max_samples: int = 10000000
     fm_hidden_size: int = 64
     fm_num_layers: int = 4

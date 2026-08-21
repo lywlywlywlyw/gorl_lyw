@@ -5,15 +5,15 @@ from dataclasses import asdict, dataclass
 class RLPDConfig:
     """RLPD encoder hyperparameters for latent-space online training."""
 
-    rlpd_batch_size: int = 256
-    rlpd_replay_buffer_capacity: int = 500_000
-    rlpd_learning_starts: int = 5_000
-    rlpd_updates_per_env_step: int = 2
-    rlpd_policy_update_period: int = 2
-    rlpd_actor_learning_rate: float = 3e-4
+    rlpd_batch_size: int = 128
+    rlpd_replay_buffer_capacity: int = 200_000
+    rlpd_learning_starts: int = 24_576
+    rlpd_updates_per_env_step: int = 1
+    rlpd_policy_update_period: int = 4
+    rlpd_actor_learning_rate: float = 1e-4
     rlpd_critic_learning_rate: float = 3e-4
-    rlpd_temperature_learning_rate: float = 3e-4
-    rlpd_discounting: float = 0.97
+    rlpd_temperature_learning_rate: float = 1e-4
+    rlpd_discounting: float = 0.99
     rlpd_target_update_rate: float = 0.005
     rlpd_initial_temperature: float = 1.0
     rlpd_target_entropy: float | None = None
