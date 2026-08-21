@@ -21,7 +21,6 @@ from tqdm import tqdm
 
 from envs.robomimic.RobomimicEnv import RobomimicEnv
 from envs.robomimic.online_config.env_config import EnvConfig
-from envs.robomimic.online_config.encoder_configs.rlpd_config import RLPDConfig
 from envs.robomimic.online_config.training_config import TrainingConfig
 from flow_policy import encoder_rlpd
 from flow_policy.agent import EncoderFMAgent
@@ -305,7 +304,7 @@ def main(
     stage_init_before_training: bool = True,
     replay_buffer_path: str | None = None,
 ) -> None:
-    config = TrainingConfig().to_dict() | EnvConfig().to_dict() | RLPDConfig().to_dict()
+    config = TrainingConfig().to_dict() | EnvConfig().to_dict()
     if config["decoder_type"] != "fm":
         raise ValueError("train_encoder_rlpd.py currently supports the FM decoder only.")
     total_timesteps = config["encoder_num_timesteps"] if num_timesteps is None else num_timesteps

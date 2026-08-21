@@ -28,8 +28,6 @@ if str(SRC_ROOT) not in sys.path:
 import tyro
 from envs.robomimic.online_config.training_config import TrainingConfig
 from envs.robomimic.online_config.env_config import EnvConfig
-from envs.robomimic.online_config.encoder_configs.rlpd_config import RLPDConfig
-
 def _forward_metrics(metrics_file: Path, wandb_run, offset: int) -> int:
     """Forward complete JSONL events written since offset to the parent W&B run."""
     if not metrics_file.exists():
@@ -171,7 +169,6 @@ def main(
     config = (
         TrainingConfig().to_dict()
         | EnvConfig().to_dict()
-        | RLPDConfig().to_dict()
     )
     if (
         not stage_init_before_training
