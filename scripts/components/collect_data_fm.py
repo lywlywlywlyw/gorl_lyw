@@ -47,7 +47,11 @@ def _load_policy_pair(
         encoder_checkpoint = pickle.load(file)
     with decoder_path.open("rb") as file:
         decoder_checkpoint = pickle.load(file)
-    encoder_config = encoder_checkpoint["config"]
+    # Offline combined checkpoints use ``config`` for the FM decoder and keep
+    # the encoder config separately. Online encoder checkpoints use ``config``.
+    encoder_config = encoder_checkpoint.get(
+        "rlpd_encoder_config", encoder_checkpoint["config"]
+    )
     encoder_state = encoder_rlpd.EncoderState.init(
         jax.random.key(config["seed"]), env, encoder_config
     )

@@ -165,9 +165,16 @@ def _bootstrap_async_pipeline(
     """Publish immutable encoder_0 + decoder_0 extracted from one offline checkpoint."""
     with initial_checkpoint.open("rb") as file:
         checkpoint = pickle.load(file)
+    encoder_checkpoint = dict(checkpoint)
+    # Combined offline checkpoints keep the decoder config in the conventional
+    # ``config`` field and the RLPD config in a dedicated field.  Each async
+    # component, however, expects ``config`` to describe that component.
+    encoder_checkpoint["config"] = checkpoint["rlpd_encoder_config"]
     bootstrap_dir = manager.root / ".bootstrap"
     bootstrap_dir.mkdir(exist_ok=True)
-    encoder_source = atomic_pickle_dump(checkpoint, bootstrap_dir / "encoder_0.pkl")
+    encoder_source = atomic_pickle_dump(
+        encoder_checkpoint, bootstrap_dir / "encoder_0.pkl"
+    )
     decoder_source = atomic_pickle_dump(checkpoint, bootstrap_dir / "decoder_0.pkl")
     if not manager.is_component_ready("encoder", 0):
         manager.publish_component("encoder", 0, encoder_source, {
@@ -431,6 +438,7 @@ def _validate_offline_checkpoint(
             "rlpd_z_target_critic_params",
             "rlpd_z_log_temperature",
             "rlpd_z_obs_stats",
+            "rlpd_encoder_config",
         }
         missing_rlpd_keys = sorted(required_rlpd_keys.difference(checkpoint))
         if missing_rlpd_keys:
