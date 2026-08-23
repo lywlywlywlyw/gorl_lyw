@@ -10,6 +10,7 @@ from typing import Annotated
 import jax
 import jax_dataclasses as jdc
 import numpy as onp
+import cv2
 import tyro
 from jax import numpy as jnp
 # from mujoco_playground import dm_control_suite, locomotion, registry
@@ -78,6 +79,100 @@ def _load_policy_pair(
     )
 
 
+def _record_policy_evaluation(
+    agent: EncoderFMAgent,
+    config: dict,
+    version: int,
+    output_path: Path | None,
+    apply_tanh_in_rollout: bool,
+) -> dict[str, float | int | str]:
+    """Evaluate a newly published policy and record the first episode."""
+    num_episodes = int(config["eval_num_envs"])
+    if num_episodes < 1:
+        raise ValueError("eval_num_envs must be positive.")
+    video_env = RobomimicEnv(
+        dataset_path=config["dataset_path"],
+        render_offscreen=True,
+        reward_shaping=config["dense_reward"],
+    )
+    returns: list[float] = []
+    lengths: list[int] = []
+    successes: list[float] = []
+    writer = None
+    try:
+        for episode in range(num_episodes):
+            key = jax.random.key(config["seed"] + version * 10000 + episode)
+            state = video_env.reset(key)
+            episode_return = 0.0
+            success = False
+            length = 0
+            if episode == 0 and output_path is not None:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                writer = cv2.VideoWriter(
+                    str(output_path),
+                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    max(1, int(config["wandb_video_fps"])),
+                    (int(config["wandb_video_width"]), int(config["wandb_video_height"])),
+                )
+                if not writer.isOpened():
+                    writer.release()
+                    writer = None
+                    raise RuntimeError(f"Could not create evaluation video: {output_path}")
+            for step in range(int(config["episode_length"])):
+                if writer is not None and step % max(1, int(config["wandb_video_frame_skip"])) == 0:
+                    frame = video_env.render(
+                        mode="rgb_array",
+                        width=int(config["wandb_video_width"]),
+                        height=int(config["wandb_video_height"]),
+                    )
+                    writer.write(cv2.cvtColor(onp.asarray(frame, dtype=onp.uint8), cv2.COLOR_RGB2BGR))
+                key, sample_key = jax.random.split(key)
+                obs = jnp.expand_dims(state.obs, axis=0)
+                latent, _ = agent.sample_z(obs, sample_key, deterministic=True)
+                action = agent.map_z_to_action(obs, latent)[0]
+                if apply_tanh_in_rollout:
+                    action = jnp.tanh(action)
+                state = video_env.step(state, action)
+                episode_return += float(onp.asarray(state.reward))
+                length = step + 1
+                for success_key in ("success", "task_success", "is_success"):
+                    if success_key in state.info:
+                        value = state.info[success_key]
+                        if isinstance(value, dict):
+                            value = value.get("task", False)
+                        success = success or bool(onp.asarray(value))
+                if bool(onp.asarray(state.done)):
+                    break
+            if writer is not None:
+                frame = video_env.render(
+                    mode="rgb_array",
+                    width=int(config["wandb_video_width"]),
+                    height=int(config["wandb_video_height"]),
+                )
+                writer.write(cv2.cvtColor(onp.asarray(frame, dtype=onp.uint8), cv2.COLOR_RGB2BGR))
+                writer.release()
+                writer = None
+            returns.append(episode_return)
+            lengths.append(length)
+            successes.append(float(success))
+    finally:
+        if writer is not None:
+            writer.release()
+        video_env.close()
+    metrics: dict[str, float | int | str] = {
+        "pipeline/version": version,
+        "eval/return_mean": float(onp.mean(returns)),
+        "eval/return_std": float(onp.std(returns)),
+        "eval/return_min": float(onp.min(returns)),
+        "eval/return_max": float(onp.max(returns)),
+        "eval/episode_length_mean": float(onp.mean(lengths)),
+        "eval/success_rate": float(onp.mean(successes)),
+    }
+    if output_path is not None:
+        metrics["_video_path"] = str(output_path.resolve())
+    return metrics
+
+
 def run_async_collector(
     pipeline_root: str,
     replay_buffer_dir: str,
@@ -86,6 +181,7 @@ def run_async_collector(
     rollout_steps: int = 100,
     replay_capacity: int | None = None,
     metrics_file: str | None = None,
+    evaluation_dir: str | None = None,
 ) -> None:
     """Continuously collect real transitions with the latest complete Policy_n."""
     config = TrainingConfig().to_dict() | EnvConfig().to_dict()
@@ -101,6 +197,7 @@ def run_async_collector(
     current_version = -1
     agent = None
     apply_tanh = True
+    evaluations_seen = 0
     try:
         while not stop.exists():
             latest = manager.latest_policy()
@@ -115,9 +212,34 @@ def run_async_collector(
                 current_version = version
                 if metrics_file:
                     append_metrics(metrics_file, {
+                        "pipeline/version": version,
                         "collector/policy_version": version,
                         "collector/policy_switch": 1,
                     })
+                evaluations_seen += 1
+                video_interval = max(1, int(config["wandb_video_interval_evals"]))
+                record_video = evaluations_seen % video_interval == 0
+                if metrics_file:
+                    try:
+                        append_metrics(
+                            metrics_file,
+                            _record_policy_evaluation(
+                                agent,
+                                config,
+                                version,
+                                (
+                                    Path(evaluation_dir) / f"policy_{version:04d}.mp4"
+                                    if record_video and evaluation_dir is not None
+                                    else None
+                                ),
+                                apply_tanh,
+                            ),
+                        )
+                    except Exception as error:
+                        print(
+                            f"WARNING: Evaluation for Policy_{version} failed: {error}",
+                            flush=True,
+                        )
             assert agent is not None
             rollout_state, transitions = rollout_state.rollout(
                 agent,
@@ -144,6 +266,7 @@ def run_async_collector(
             })
             if metrics_file:
                 append_metrics(metrics_file, {
+                    "pipeline/version": version,
                     "collector/policy_version": version,
                     "collector/transitions": len(rewards),
                     "collector/replay_size": replay.size(),
