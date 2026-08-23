@@ -56,24 +56,24 @@ def _load_policy_pair(
     encoder_state = encoder_rlpd.EncoderState.init(
         jax.random.key(config["seed"]), env, encoder_config
     )
-    with jdc.copy_and_mutate(encoder_state) as state:
-        state.actor_params = encoder_checkpoint["rlpd_z_actor_params"]
-        state.critic_params = encoder_checkpoint["rlpd_z_critic_params"]
-        state.target_critic_params = encoder_checkpoint["rlpd_z_target_critic_params"]
-        state.log_temperature = encoder_checkpoint["rlpd_z_log_temperature"]
-        state.obs_stats = encoder_checkpoint["rlpd_z_obs_stats"]
+    with jdc.copy_and_mutate(encoder_state) as encoder_state:
+        encoder_state.actor_params = encoder_checkpoint["rlpd_z_actor_params"]
+        encoder_state.critic_params = encoder_checkpoint["rlpd_z_critic_params"]
+        encoder_state.target_critic_params = encoder_checkpoint["rlpd_z_target_critic_params"]
+        encoder_state.log_temperature = encoder_checkpoint["rlpd_z_log_temperature"]
+        encoder_state.obs_stats = encoder_checkpoint["rlpd_z_obs_stats"]
         for name in ("actor_opt_state", "critic_opt_state", "temperature_opt_state", "prng", "steps"):
             key = f"rlpd_z_{name}"
             if key in encoder_checkpoint:
-                setattr(state, name, encoder_checkpoint[key])
+                setattr(encoder_state, name, encoder_checkpoint[key])
     decoder_state = DecoderFMState.init(
         jax.random.PRNGKey(config["seed"] + 1000),
         decoder_checkpoint["obs_dim"], decoder_checkpoint["action_dim"],
         decoder_checkpoint["config"],
     )
-    with jdc.copy_and_mutate(decoder_state) as state:
-        state.params = decoder_checkpoint["params"]
-        state.obs_stats = decoder_checkpoint["obs_stats"]
+    with jdc.copy_and_mutate(decoder_state) as decoder_state:
+        decoder_state.params = decoder_checkpoint["params"]
+        decoder_state.obs_stats = decoder_checkpoint["obs_stats"]
     return EncoderFMAgent(ppo_z_state=encoder_state, fm_state=decoder_state), bool(
         encoder_config.apply_tanh_in_rollout
     )

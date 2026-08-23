@@ -62,12 +62,16 @@ class RunningStats:
         batch_ndims = x.ndim - self.mean.ndim
         assert x.shape[batch_ndims:] == self.mean.shape == self.var_sum.shape
 
-        new_count = self.count + onp.prod(x.shape[:batch_ndims])
+        batch_count = onp.prod(x.shape[:batch_ndims])
+        new_count = self.count + batch_count
         diff_to_old_mean = x - self.mean
         new_mean = (
             self.mean + jnp.sum(diff_to_old_mean, axis=range(batch_ndims)) / new_count
         )
-        new_var_sum = jnp.sum(
+        # Preserve the previous sum of squared deviations while merging the new
+        # batch. This is the parallel Welford update written in a form that also
+        # handles the initial count=0 update without a special case.
+        new_var_sum = self.var_sum + jnp.sum(
             diff_to_old_mean * (x - new_mean), axis=range(batch_ndims)
         )
         var_clipped = jnp.clip(new_var_sum / new_count, 1e-12, 1e12)

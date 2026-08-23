@@ -1,17 +1,15 @@
-import h5py
+import pickle
+import pathlib
+import sys
 
-file_path = '/root/GoRL/datasets/d4rl/walker2d-medium-expert-v2.hdf5'
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "src"))
 
-with h5py.File(file_path, 'r') as f:
-    print("文件结构:")
-    for key in f.keys():
-        print(f"  {key}: {type(f[key])}")
-        if isinstance(f[key], h5py.Dataset):
-            print(f"    shape: {f[key].shape}")
-    
-    # 如果是robomimic格式，通常demo数量在 'data' 组里
-    if 'data' in f:
-        print(f"\n演示数量: {len(f['data'].keys())}")
-        # 打印每个演示的key
-        for i, demo_key in enumerate(f['data'].keys()):
-            print(f"  Demo {i+1}: {demo_key}")
+encoder_path = pathlib.Path("/root/GoRL/results/offline_fm_frozen_robomimic_20260821_184814/checkpoint_final.pkl")
+with encoder_path.open("rb") as file:
+    encoder_checkpoint = pickle.load(file)
+# Offline combined checkpoints use ``config`` for the FM decoder and keep
+# the encoder config separately. Online encoder checkpoints use ``config``.
+encoder_config = encoder_checkpoint.get(
+    "rlpd_encoder_config", encoder_checkpoint["config"]
+)
+print(encoder_config.apply_tanh_in_rollout)
