@@ -90,6 +90,7 @@ def _encoder_worker(settings: dict) -> None:
             demo_ratio=settings["encoder_demo_ratio"],
             replay_ratio=settings["encoder_replay_ratio"],
             metrics_file=settings["metrics_file"],
+            inherit_optimizer_state=version > 1,
         )
         manager.publish_component("encoder", version, temporary_output, {
             "version": version,
@@ -98,6 +99,7 @@ def _encoder_worker(settings: dict) -> None:
             "demo_ratio": settings["encoder_demo_ratio"],
             "replay_ratio": settings["encoder_replay_ratio"],
             "train_env_steps": settings["encoder_train_env_steps"],
+            "inherited_optimizer_state": version > 1,
         })
         temporary_output.unlink(missing_ok=True)
 
@@ -124,6 +126,7 @@ def _decoder_worker(settings: dict) -> None:
             version=version,
             train_steps=settings["decoder_train_steps"],
             metrics_file=settings["metrics_file"],
+            inherit_optimizer_state=version > 1,
         )
         manager.publish_component("decoder", version, temporary_output, {
             "version": version,
@@ -131,6 +134,7 @@ def _decoder_worker(settings: dict) -> None:
             "previous_decoder_version": version - 1,
             "replay_snapshot": str(snapshot),
             "train_steps": settings["decoder_train_steps"],
+            "inherited_optimizer_state": version > 1,
         })
         manager.publish_policy(version)
         temporary_output.unlink(missing_ok=True)

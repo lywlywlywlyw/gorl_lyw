@@ -34,6 +34,7 @@ def train_async_stage(
     version: int,
     train_steps: int,
     metrics_file: str | None = None,
+    inherit_optimizer_state: bool = True,
 ) -> None:
     """Train one Decoder_n from an immutable replay snapshot.
 
@@ -71,22 +72,28 @@ def train_async_stage(
         raise ValueError("Replay action dimension does not match decoder.")
 
     decoder_config = previous["config"]
+    if inherit_optimizer_state and "fm_opt_state" not in previous:
+        raise ValueError(
+            "Online decoder continuation requires optimizer state; "
+            "missing field: fm_opt_state"
+        )
     fm_state = DecoderFMState.init(
         jax.random.PRNGKey(config["seed"] + 2000 + version),
         int(previous["obs_dim"]), int(previous["action_dim"]), decoder_config,
     )
-    with jdc.copy_and_mutate(fm_state) as state:
-        state.params = previous["params"]
-        state.obs_stats = previous["obs_stats"]
-        # Preserve online continuation state when available. Offline bootstrap
-        # checkpoints simply start with the newly initialized optimizer.
-        if "fm_opt_state" in previous:
-            state.opt_state = previous["fm_opt_state"]
+    with jdc.copy_and_mutate(fm_state) as fm_state:
+        fm_state.params = previous["params"]
+        fm_state.obs_stats = previous["obs_stats"]
+        # Decoder_1 inherits Decoder_0 parameters but intentionally starts with
+        # a fresh online optimizer. Decoder_2+ continue the complete online
+        # training state from the preceding decoder version.
+        if inherit_optimizer_state:
+            fm_state.opt_state = previous["fm_opt_state"]
         if "fm_prng" in previous:
-            state.prng = previous["fm_prng"]
+            fm_state.prng = previous["fm_prng"]
         if "fm_steps" in previous:
-            state.steps = previous["fm_steps"]
-        state.obs_stats = state.obs_stats.update(jnp.asarray(states))
+            fm_state.steps = previous["fm_steps"]
+        fm_state.obs_stats = fm_state.obs_stats.update(jnp.asarray(states))
 
     rng = np.random.default_rng(config["seed"] + version)
     batch_size = int(config["fm_batch_size"])
@@ -119,6 +126,7 @@ def train_async_stage(
         "fixed_encoder_checkpoint": str(Path(encoder_checkpoint_path).resolve()),
         "previous_decoder_checkpoint": str(Path(previous_decoder_checkpoint_path).resolve()),
         "train_steps": train_steps,
+        "inherited_optimizer_state": inherit_optimizer_state,
         "final_loss": float(np.asarray(metrics.get("loss", np.nan))),
         "wall_time_seconds": time.time() - started,
     }

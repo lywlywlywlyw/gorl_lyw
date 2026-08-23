@@ -339,6 +339,7 @@ def train_async_stage(
     demo_ratio: float = 0.5,
     replay_ratio: float = 0.5,
     metrics_file: str | None = None,
+    inherit_optimizer_state: bool = True,
 ) -> None:
     """Train one immutable Encoder_n stage without collecting environment data.
 
@@ -391,16 +392,33 @@ def train_async_stage(
     missing = sorted(required_encoder.difference(previous))
     if missing:
         raise ValueError(f"Previous encoder checkpoint is missing fields: {missing}")
-    with jdc.copy_and_mutate(encoder_state) as state:
-        state.actor_params = previous["rlpd_z_actor_params"]
-        state.critic_params = previous["rlpd_z_critic_params"]
-        state.target_critic_params = previous["rlpd_z_target_critic_params"]
-        state.log_temperature = previous["rlpd_z_log_temperature"]
-        state.obs_stats = previous["rlpd_z_obs_stats"]
-        for name in ("actor_opt_state", "critic_opt_state", "temperature_opt_state", "prng", "steps"):
+    optimizer_keys = {
+        "actor_opt_state": "rlpd_z_actor_opt_state",
+        "critic_opt_state": "rlpd_z_critic_opt_state",
+        "temperature_opt_state": "rlpd_z_temperature_opt_state",
+    }
+    if inherit_optimizer_state:
+        missing_optimizer = sorted(
+            key for key in optimizer_keys.values() if key not in previous
+        )
+        if missing_optimizer:
+            raise ValueError(
+                "Online encoder continuation requires optimizer state; "
+                f"missing fields: {missing_optimizer}"
+            )
+    with jdc.copy_and_mutate(encoder_state) as encoder_state:
+        encoder_state.actor_params = previous["rlpd_z_actor_params"]
+        encoder_state.critic_params = previous["rlpd_z_critic_params"]
+        encoder_state.target_critic_params = previous["rlpd_z_target_critic_params"]
+        encoder_state.log_temperature = previous["rlpd_z_log_temperature"]
+        encoder_state.obs_stats = previous["rlpd_z_obs_stats"]
+        if inherit_optimizer_state:
+            for name, key in optimizer_keys.items():
+                setattr(encoder_state, name, previous[key])
+        for name in ("prng", "steps"):
             key = f"rlpd_z_{name}"
             if key in previous:
-                setattr(state, name, previous[key])
+                setattr(encoder_state, name, previous[key])
 
     with Path(decoder_checkpoint_path).expanduser().open("rb") as file:
         decoder_checkpoint = pickle.load(file)
@@ -409,9 +427,9 @@ def train_async_stage(
         decoder_checkpoint["obs_dim"], decoder_checkpoint["action_dim"],
         decoder_checkpoint["config"],
     )
-    with jdc.copy_and_mutate(decoder_state) as state:
-        state.params = decoder_checkpoint["params"]
-        state.obs_stats = decoder_checkpoint["obs_stats"]
+    with jdc.copy_and_mutate(decoder_state) as decoder_state:
+        decoder_state.params = decoder_checkpoint["params"]
+        decoder_state.obs_stats = decoder_checkpoint["obs_stats"]
 
     demo = load_transition_data(demo_buffer_path)
     replay = load_transition_data(replay_snapshot_path)
@@ -456,6 +474,7 @@ def train_async_stage(
         "train_updates": updates,
         "demo_ratio": demo_ratio,
         "replay_ratio": replay_ratio,
+        "inherited_optimizer_state": inherit_optimizer_state,
         "wall_time_seconds": time.time() - started,
     })
     atomic_pickle_dump(checkpoint, output_checkpoint_path)

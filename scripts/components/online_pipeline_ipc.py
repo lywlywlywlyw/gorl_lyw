@@ -204,6 +204,11 @@ class VersionManager:
             raise RuntimeError(f"decoder_{version} is not READY")
         final = self.component_dir("policy", version)
         if final.exists():
+            checkpoint = final / "checkpoint.pkl"
+            if not checkpoint.is_file():
+                atomic_pickle_dump(
+                    self._combined_policy_checkpoint(version), checkpoint
+                )
             return final
         temporary = self.root / f".policy_{version}.{uuid.uuid4().hex}.tmp"
         temporary.mkdir()
@@ -213,10 +218,46 @@ class VersionManager:
             "decoder_checkpoint": str(self.component_checkpoint("decoder", version)),
             "created_at": time.time(),
         }
+        atomic_pickle_dump(
+            self._combined_policy_checkpoint(version), temporary / "checkpoint.pkl"
+        )
         atomic_json_dump(metadata, temporary / "metadata.json")
         (temporary / "READY").write_text("ready\n", encoding="utf-8")
         os.replace(temporary, final)
         return final
+
+    def _combined_policy_checkpoint(self, version: int) -> dict[str, Any]:
+        """Build one self-contained Encoder_n + Decoder_n evaluation artifact."""
+        encoder_path = self.component_checkpoint("encoder", version)
+        decoder_path = self.component_checkpoint("decoder", version)
+        with encoder_path.open("rb") as file:
+            encoder = pickle.load(file)
+        with decoder_path.open("rb") as file:
+            decoder = pickle.load(file)
+        if not isinstance(encoder, dict) or not isinstance(decoder, dict):
+            raise TypeError("Encoder and decoder checkpoints must be dictionaries.")
+
+        encoder_config = encoder.get("rlpd_encoder_config", encoder.get("config"))
+        if encoder_config is None:
+            raise KeyError("Encoder checkpoint is missing its RLPD config.")
+
+        # Start with the complete encoder train state, then make Decoder_n the
+        # canonical decoder at the standard top-level fields. In particular,
+        # overwrite fm_params embedded by Encoder_n, which describe the fixed
+        # Decoder_{n-1} used during encoder training rather than Policy_n.
+        combined = dict(encoder)
+        combined.update(decoder)
+        combined.update({
+            "checkpoint_format": "gorl_online_rlpd_fm_policy",
+            "checkpoint_version": 1,
+            "policy_version": version,
+            "rlpd_encoder_config": encoder_config,
+            "fm_params": decoder["params"],
+            "fm_obs_stats": decoder["obs_stats"],
+            "encoder_checkpoint": str(encoder_path),
+            "decoder_checkpoint": str(decoder_path),
+        })
+        return combined
 
     def ready_policy_versions(self) -> list[int]:
         versions = []
