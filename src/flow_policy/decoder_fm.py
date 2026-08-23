@@ -211,8 +211,9 @@ class DecoderFMState:
             )
             x0 = x0 + perturb
 
-        # No clipping - FPO doesn't clip actions
-        action = x0
+        # Robomimic actions are normalized to [-1, 1]. Keep decoder output
+        # consistent with the action accepted by the environment everywhere.
+        action = jnp.clip(x0, -1.0, 1.0)
 
         if single_obs:
             action = action.squeeze(0)
@@ -302,8 +303,8 @@ class DecoderFMState:
             )
             x0 = x0 + perturb
 
-        # No clipping - FPO doesn't clip actions
-        action = x0
+        # Robomimic actions are normalized to [-1, 1].
+        action = jnp.clip(x0, -1.0, 1.0)
 
         if single_obs:
             action = action.squeeze(0)

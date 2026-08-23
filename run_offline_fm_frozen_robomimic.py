@@ -244,6 +244,10 @@ def validate_config(config: ConfigView) -> None:
         config.comparison_samples,
         config.checkpoint_interval,
         config.decoder_checkpoint_interval,
+        config.validation_interval,
+        config.validation_batches,
+        config.early_stopping_min_steps,
+        config.early_stopping_patience,
     ) < 1:
         raise ValueError("Batch sizes and step/sample counts must be positive.")
     if config.wandb_mode not in {"online", "offline", "disabled"}:
@@ -339,7 +343,7 @@ def forward_fm_batch(
     actions, _ = jax.lax.scan(
         step, latents, (schedule.t_current, schedule.t_next)
     )
-    return actions
+    return jnp.clip(actions, -1.0, 1.0)
 
 
 def build_latent_targets(
@@ -557,9 +561,65 @@ def make_iql_update(
                 "advantage": jnp.mean(advantage),
                 "adv_weight": jnp.mean(advantage_weight),
             },
+
         )
 
     return update
+
+def iql_validation_losses(
+    config: ConfigView,
+    q1_params: PyTree,
+    q2_params: PyTree,
+    value_params: PyTree,
+    target_q1_params: PyTree,
+    target_q2_params: PyTree,
+    normalized_observations: np.ndarray,
+    normalized_next_observations: np.ndarray,
+    buffer: ReplayBuffer,
+    latent_targets: np.ndarray,
+    indices: np.ndarray,
+) -> dict[str, float]:
+    """Compute deterministic held-out Bellman TD and expectile value losses."""
+    obs = jnp.asarray(normalized_observations[indices])
+    next_obs = jnp.asarray(normalized_next_observations[indices])
+    latents = jnp.asarray(latent_targets[indices])
+    rewards = jnp.asarray(buffer.rewards[indices])
+    masks = jnp.asarray(buffer.masks[indices])
+    target_q = jnp.minimum(
+        networks.q_mlp_fwd(target_q1_params, obs, latents),
+        networks.q_mlp_fwd(target_q2_params, obs, latents),
+    )
+    value = networks.value_mlp_fwd(value_params, obs)
+    value_loss = jnp.mean(expectile_loss(target_q - value, config.expectile))
+    next_value = networks.value_mlp_fwd(value_params, next_obs)
+    bellman_target = rewards + config.discount * masks * next_value
+    q1 = networks.q_mlp_fwd(q1_params, obs, latents)
+    q2 = networks.q_mlp_fwd(q2_params, obs, latents)
+    td_loss = jnp.mean(
+        jnp.square(q1 - bellman_target) + jnp.square(q2 - bellman_target)
+    )
+    return {
+        "validation_td_loss": float(td_loss),
+        "validation_value_loss": float(value_loss),
+        "validation_loss": float(td_loss + value_loss),
+    }
+
+
+
+def compatible_opt_state(
+    checkpoint: dict[str, Any], name: str, default: PyTree
+) -> PyTree:
+    """Restore optimizer state only when its transform structure matches."""
+    candidate = checkpoint.get(name)
+    if candidate is None:
+        return default
+    if (
+        jax.tree_util.tree_structure(candidate)
+        != jax.tree_util.tree_structure(default)
+    ):
+        print(f"Ignoring incompatible legacy optimizer state: {name}.")
+        return default
+    return candidate
 
 
 def policy_metrics(
@@ -1133,23 +1193,32 @@ def main(config: ConfigView) -> None:
             global_step,
         )
 
-        actor_optimizer = optax.adam(config.actor_learning_rate)
-        critic_optimizer = optax.adam(config.critic_learning_rate)
-        value_optimizer = optax.adam(config.value_learning_rate)
+        actor_optimizer = optax.chain(
+            optax.clip_by_global_norm(config.max_grad_norm),
+            optax.adam(config.actor_learning_rate),
+        )
+        critic_optimizer = optax.chain(
+            optax.clip_by_global_norm(config.max_grad_norm),
+            optax.adam(config.critic_learning_rate),
+        )
+        value_optimizer = optax.chain(
+            optax.clip_by_global_norm(config.max_grad_norm),
+            optax.adam(config.value_learning_rate),
+        )
         actor_opt_state = actor_optimizer.init(actor_params)
         critic_opt_state = critic_optimizer.init((q1_params, q2_params))
         value_opt_state = value_optimizer.init(value_params)
         target_q1_params = jax.tree.map(jnp.copy, q1_params)
         target_q2_params = jax.tree.map(jnp.copy, q2_params)
         if resume_encoder and resume_checkpoint is not None:
-            actor_opt_state = resume_checkpoint.get(
-                "actor_opt_state", actor_opt_state
+            actor_opt_state = compatible_opt_state(
+                resume_checkpoint, "actor_opt_state", actor_opt_state
             )
-            critic_opt_state = resume_checkpoint.get(
-                "critic_opt_state", critic_opt_state
+            critic_opt_state = compatible_opt_state(
+                resume_checkpoint, "critic_opt_state", critic_opt_state
             )
-            value_opt_state = resume_checkpoint.get(
-                "value_opt_state", value_opt_state
+            value_opt_state = compatible_opt_state(
+                resume_checkpoint, "value_opt_state", value_opt_state
             )
             target_q1_params = resume_checkpoint.get(
                 "target_q1_params", target_q1_params
@@ -1166,9 +1235,25 @@ def main(config: ConfigView) -> None:
             min(config.comparison_samples, len(buffer)),
             replace=False,
         )
+        validation_eval_indices = rng.choice(
+            validation_indices,
+            min(
+                len(validation_indices),
+                config.validation_batches * config.batch_size,
+            ),
+            replace=False,
+        )
+        latest_validation_metrics: dict[str, float] = {}
+        best_validation_loss = float("inf")
+        best_iql_step = start_iql_step
+        best_iql_state = None
+        stale_validations = 0
         encoder_target_step = max(start_iql_step, config.encoder_iql_steps)
+        completed_iql_steps = start_iql_step
         for step in trange(start_iql_step, encoder_target_step, desc="IQL"):
-            indices = rng.integers(0, len(buffer), size=config.batch_size)
+            indices = rng.choice(
+                train_indices, size=config.batch_size, replace=True
+            )
             (
                 actor_params,
                 actor_opt_state,
@@ -1199,15 +1284,64 @@ def main(config: ConfigView) -> None:
             )
             for name, value in metrics.items():
                 accumulators.setdefault(name, []).append(float(value))
+            completed_iql_steps = step + 1
+            should_validate = (
+                completed_iql_steps % config.validation_interval == 0
+                or completed_iql_steps == encoder_target_step
+            )
+            should_stop = False
+            if should_validate:
+                latest_validation_metrics = iql_validation_losses(
+                    config,
+                    q1_params,
+                    q2_params,
+                    value_params,
+                    target_q1_params,
+                    target_q2_params,
+                    normalized_observations,
+                    normalized_next_observations,
+                    buffer,
+                    latent_targets,
+                    validation_eval_indices,
+                )
+                if completed_iql_steps >= config.early_stopping_min_steps:
+                    validation_loss = latest_validation_metrics[
+                        "validation_loss"
+                    ]
+                    if validation_loss < (
+                        best_validation_loss - config.early_stopping_min_delta
+                    ):
+                        best_validation_loss = validation_loss
+                        best_iql_step = completed_iql_steps
+                        best_iql_state = (
+                            actor_params, actor_opt_state,
+                            q1_params, q2_params, critic_opt_state,
+                            value_params, value_opt_state,
+                            target_q1_params, target_q2_params,
+                        )
+                        stale_validations = 0
+                    else:
+                        stale_validations += 1
+                    should_stop = (
+                        stale_validations >= config.early_stopping_patience
+                    )
             if (
                 (step + 1) % config.log_interval == 0
-                or step + 1 == encoder_target_step
+                or completed_iql_steps == encoder_target_step
+                or should_validate
             ):
                 record = {
                     "method": "frozen_decoder",
                     "phase": "encoder",
                     "global_step": global_step + step + 1,
                     "encoder/iql_step": step + 1,
+                    "encoder/best_iql_step": best_iql_step,
+                    "encoder/best_validation_loss": best_validation_loss,
+                    "encoder/stale_validations": stale_validations,
+                    **{
+                        f"iql/{name}": value
+                        for name, value in latest_validation_metrics.items()
+                    },
                     **{
                         f"iql/{name}": float(np.mean(values))
                         for name, values in accumulators.items()
@@ -1236,7 +1370,6 @@ def main(config: ConfigView) -> None:
                 print(f"  step {step + 1}: {record}")
                 accumulators.clear()
 
-            completed_iql_steps = step + 1
             if completed_iql_steps % config.checkpoint_interval == 0:
                 periodic_decoder_path = (
                     output_dir
@@ -1267,8 +1400,33 @@ def main(config: ConfigView) -> None:
                     f"{completed_iql_steps}: {periodic_decoder_path}"
                 )
 
+            if should_stop:
+                print(
+                    f"IQL early-stopped at step {completed_iql_steps}; "
+                    f"best held-out loss {best_validation_loss:.6f} "
+                    f"at step {best_iql_step}."
+                )
+                break
+        if best_iql_state is None:
+            best_iql_step = completed_iql_steps
+            best_iql_state = (
+                actor_params, actor_opt_state,
+                q1_params, q2_params, critic_opt_state,
+                value_params, value_opt_state,
+                target_q1_params, target_q2_params,
+            )
+        (
+            actor_params,
+            actor_opt_state,
+            q1_params, q2_params, critic_opt_state,
+            value_params, value_opt_state,
+            target_q1_params, target_q2_params,
+        ) = best_iql_state
+        print(
+            f"Restored best encoder from IQL step {best_iql_step}."
+        )
         decoder_path = output_dir / "checkpoint_final.pkl"
-        final_iql_step = encoder_target_step
+        final_iql_step = best_iql_step
         save_offline_checkpoint(
             decoder_path,
             config,
