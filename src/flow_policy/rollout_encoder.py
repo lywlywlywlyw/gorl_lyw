@@ -19,6 +19,9 @@ from . import rollouts
 from envs.base_env import State
 from envs.robomimic.online_config.env_config import EnvConfig
 
+
+SUCCESS_REWARD_BONUS = 150.0
+
 def _environment_worker(connection: Any, env_type: type, dataset_path: str) -> None:
     """Own and step one Robomimic environment in a child process."""
     for variable in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
@@ -37,12 +40,17 @@ def _environment_worker(connection: Any, env_type: type, dataset_path: str) -> N
             try:
                 if command == "reset":
                     state = env.reset(payload)
-                    result = (np.asarray(state.obs), 0.0, False)
+                    result = (np.asarray(state.obs), 0.0, False, False)
                 elif command == "step":
                     if state is None:
                         raise RuntimeError("Environment must be reset before step().")
                     state = env.step(state, payload)
-                    result = (np.asarray(state.obs), float(np.asarray(state.reward)), bool(np.asarray(state.done)))
+                    result = (
+                        np.asarray(state.obs),
+                        float(np.asarray(state.reward)),
+                        bool(np.asarray(state.done)),
+                        bool(state.info.get("success", False)),
+                    )
                 elif command == "close":
                     break
                 else:
@@ -202,7 +210,9 @@ class BatchedRolloutStateEncoderFM:
         self.connections = []
         self.processes = []
 
-    def _step_all(self, actions: np.ndarray) -> list[tuple[np.ndarray, float, bool]]:
+    def _step_all(
+        self, actions: np.ndarray
+    ) -> list[tuple[np.ndarray, float, bool, bool]]:
         for connection, action in zip(self.connections, actions):
             connection.send(("step", action))
         return [self._receive(connection) for connection in self.connections]
@@ -213,16 +223,21 @@ class BatchedRolloutStateEncoderFM:
         return {index: self._receive(self.connections[index]) for index in indices}
 
     @staticmethod
-    def _receive(connection: Any) -> tuple[np.ndarray, float, bool]:
+    def _receive(connection: Any) -> tuple[np.ndarray, float, bool, bool]:
         ok, payload = connection.recv()
         if not ok:
             raise RuntimeError(f"Robomimic environment worker failed: {payload}")
         return payload
 
     @staticmethod
-    def _state(response: tuple[np.ndarray, float, bool]) -> State:
-        obs, reward, done = response
-        return State(obs=jnp.asarray(obs), reward=jnp.asarray(reward), done=jnp.asarray(done), info={})
+    def _state(response: tuple[np.ndarray, float, bool, bool]) -> State:
+        obs, reward, done, success = response
+        return State(
+            obs=jnp.asarray(obs),
+            reward=jnp.asarray(reward),
+            done=jnp.asarray(done),
+            info={"success": success},
+        )
 
     def rollout(self, agent_state: EncoderAgentProtocol, episode_length: int,
                 iterations_per_env: int, auto_reset: bool = True,
@@ -249,8 +264,20 @@ class BatchedRolloutStateEncoderFM:
                 else:
                     next_state = self._state(response)
                     next_step = self.steps[env_index] + 1
-                    done = bool(np.asarray(next_state.done))
-                truncated = next_step >= episode_length
+                    success = bool(next_state.info.get("success", False))
+                    reached_episode_limit = next_step >= episode_length
+                    done = success or reached_episode_limit
+                    reward = float(np.asarray(next_state.reward))
+                    if success:
+                        reward += SUCCESS_REWARD_BONUS
+                    next_state = next_state.replace(
+                        reward=jnp.asarray(reward, dtype=jnp.float32),
+                        done=jnp.asarray(done),
+                    )
+                # The requested online semantics treat both success and the
+                # configured episode-length limit as true terminal transitions,
+                # rather than bootstrappable time-limit truncations.
+                truncated = False
                 transition_next_states.append(next_state)
                 rewards.append(next_state.reward); truncations.append(truncated)
                 discounts.append(0.0 if done else 1.0)
@@ -292,9 +319,17 @@ class BatchedRolloutStateEncoderFM:
             next_states, step_rewards, reset_indices, reset_keys = [], [], [], []
             for env_index, response in enumerate(responses):
                 next_state = self._state(response); next_step = self.steps[env_index] + 1
-                done = bool(np.asarray(next_state.done)); truncated = next_step >= episode_length
+                success = bool(next_state.info.get("success", False))
+                done = success or next_step >= episode_length
+                reward = float(np.asarray(next_state.reward))
+                if success:
+                    reward += SUCCESS_REWARD_BONUS
+                next_state = next_state.replace(
+                    reward=jnp.asarray(reward, dtype=jnp.float32),
+                    done=jnp.asarray(done),
+                )
                 step_rewards.append(next_state.reward)
-                if done or truncated:
+                if done:
                     prng, reset_prng = jax.random.split(prng)
                     reset_indices.append(env_index); reset_keys.append(reset_prng)
                     next_states.append(None); self.steps[env_index] = 0

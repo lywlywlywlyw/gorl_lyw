@@ -99,12 +99,21 @@ class RobomimicEnv(BaseEnv):
     def step(self, state: State, action: jax.Array) -> State:
         obs_dict, reward, done, info = self.env.step(np.asarray(action))
         obs = self.flatten_obs_dict(obs_dict)
+        info = dict(info or {})
+        info["success"] = self.is_success()
         return State(
             obs=obs,
             reward=jnp.asarray(reward),
             done=jnp.asarray(done),
             info=info,
         )
+
+    def is_success(self) -> bool:
+        """Return the wrapped Robomimic task-level success signal."""
+        success = self.env.is_success()
+        if isinstance(success, dict):
+            success = success.get("task", False)
+        return bool(np.asarray(success))
 
     def close(self) -> None:
         """Idempotently release the wrapped robosuite MuJoCo / EGL resources."""

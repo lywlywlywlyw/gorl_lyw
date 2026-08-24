@@ -30,7 +30,7 @@ class EncoderConfig:
     target_update_rate: float = 0.005
     initial_temperature: float = 1.0
     target_entropy: float | None = None
-    backup_entropy: jdc.Static[bool] = True
+    backup_entropy: jdc.Static[bool] = False
     reward_scaling: float = 1.0
     reward_bias: float = 0.0
     max_grad_norm: float = 10.0

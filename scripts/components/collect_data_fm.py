@@ -256,7 +256,7 @@ def run_async_collector(
                 "rewards": rewards,
                 "next_observations": onp.asarray(jax.device_get(transitions.next_obs)).reshape(-1, int(env.observation_size)),
                 "masks": discounts,
-                "dones": onp.logical_and(discounts == 0.0, ~truncations),
+                "dones": (discounts == 0.0),
                 "truncations": truncations,
             }
             replay.append(payload, metadata={
