@@ -384,7 +384,7 @@ def load_policy(config: EvaluationConfig) -> LoadedPolicy:
             "episode_length",
             configured_episode_length
             if configured_episode_length is not None
-            else 300,
+            else 150,
         )
     )
     if config.episodes < 1 or episode_length < 1:
@@ -556,9 +556,13 @@ def evaluate(config: EvaluationConfig) -> dict[str, Any]:
                         policy, state.obs, action_key, config.deterministic
                     )
                     state = policy.env.step(state, action)
-                    episode_return += float(np.asarray(state.reward))
+                    step_success = _success(state.info)
+                    step_reward = float(np.asarray(state.reward))
+                    if step_success:
+                        step_reward += 150.0
+                    episode_return += step_reward
                     length = step + 1
-                    success = success or _success(state.info)
+                    success = success or step_success
                     if config.render:
                         policy.env.render(
                             mode="human", camera_name=config.render_camera
@@ -566,7 +570,7 @@ def evaluate(config: EvaluationConfig) -> dict[str, Any]:
                     if video_writer is not None and length % config.video_skip == 0:
                         _write_video_frame(video_writer, policy, config)
                         last_recorded_step = length
-                    if bool(np.asarray(state.done)):
+                    if step_success or bool(np.asarray(state.done)):
                         break
 
                 # Match run_gorl_fm's recorder by always preserving the terminal

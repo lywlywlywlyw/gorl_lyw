@@ -250,6 +250,14 @@ def validate_config(config: ConfigView) -> None:
         config.early_stopping_patience,
     ) < 1:
         raise ValueError("Batch sizes and step/sample counts must be positive.")
+    if config.max_grad_norm <= 0.0:
+        raise ValueError("max_grad_norm must be positive.")
+    if config.early_stopping_min_delta < 0.0:
+        raise ValueError("early_stopping_min_delta must be non-negative.")
+    if config.early_stopping_actor_nll_weight < 0.0:
+        raise ValueError(
+            "early_stopping_actor_nll_weight must be non-negative."
+        )
     if config.wandb_mode not in {"online", "offline", "disabled"}:
         raise ValueError("wandb_mode must be online, offline, or disabled.")
 
@@ -568,6 +576,7 @@ def make_iql_update(
 
 def iql_validation_losses(
     config: ConfigView,
+    actor_params: PyTree,
     q1_params: PyTree,
     q2_params: PyTree,
     value_params: PyTree,
@@ -589,6 +598,8 @@ def iql_validation_losses(
         networks.q_mlp_fwd(target_q1_params, obs, latents),
         networks.q_mlp_fwd(target_q2_params, obs, latents),
     )
+    distribution = networks.gaussian_policy_fwd(actor_params, obs)
+    actor_nll = -jnp.mean(jnp.sum(distribution.log_prob(latents), axis=-1))
     value = networks.value_mlp_fwd(value_params, obs)
     value_loss = jnp.mean(expectile_loss(target_q - value, config.expectile))
     next_value = networks.value_mlp_fwd(value_params, next_obs)
@@ -598,12 +609,28 @@ def iql_validation_losses(
     td_loss = jnp.mean(
         jnp.square(q1 - bellman_target) + jnp.square(q2 - bellman_target)
     )
+    q_scale = jnp.maximum(jnp.mean(jnp.abs(bellman_target)), 1.0)
+    value_scale = jnp.maximum(jnp.mean(jnp.abs(target_q)), 1.0)
+    relative_td_rmse = jnp.sqrt(td_loss / 2.0) / q_scale
+    relative_value_rmse = jnp.sqrt(value_loss) / value_scale
+    actor_nll_per_dim = actor_nll / latents.shape[-1]
+    validation_score = (
+        relative_td_rmse
+        + relative_value_rmse
+        + config.early_stopping_actor_nll_weight * actor_nll_per_dim
+    )
     return {
         "validation_td_loss": float(td_loss),
         "validation_value_loss": float(value_loss),
         "validation_loss": float(td_loss + value_loss),
+        "validation_q_scale": float(q_scale),
+        "validation_value_scale": float(value_scale),
+        "validation_relative_td_rmse": float(relative_td_rmse),
+        "validation_relative_value_rmse": float(relative_value_rmse),
+        "validation_actor_nll": float(actor_nll),
+        "validation_actor_nll_per_dim": float(actor_nll_per_dim),
+        "validation_score": float(validation_score),
     }
-
 
 
 def compatible_opt_state(
@@ -1244,7 +1271,7 @@ def main(config: ConfigView) -> None:
             replace=False,
         )
         latest_validation_metrics: dict[str, float] = {}
-        best_validation_loss = float("inf")
+        best_validation_score = float("inf")
         best_iql_step = start_iql_step
         best_iql_state = None
         stale_validations = 0
@@ -1293,6 +1320,7 @@ def main(config: ConfigView) -> None:
             if should_validate:
                 latest_validation_metrics = iql_validation_losses(
                     config,
+                    actor_params,
                     q1_params,
                     q2_params,
                     value_params,
@@ -1305,13 +1333,13 @@ def main(config: ConfigView) -> None:
                     validation_eval_indices,
                 )
                 if completed_iql_steps >= config.early_stopping_min_steps:
-                    validation_loss = latest_validation_metrics[
-                        "validation_loss"
+                    validation_score = latest_validation_metrics[
+                        "validation_score"
                     ]
-                    if validation_loss < (
-                        best_validation_loss - config.early_stopping_min_delta
+                    if validation_score < (
+                        best_validation_score - config.early_stopping_min_delta
                     ):
-                        best_validation_loss = validation_loss
+                        best_validation_score = validation_score
                         best_iql_step = completed_iql_steps
                         best_iql_state = (
                             actor_params, actor_opt_state,
@@ -1336,7 +1364,7 @@ def main(config: ConfigView) -> None:
                     "global_step": global_step + step + 1,
                     "encoder/iql_step": step + 1,
                     "encoder/best_iql_step": best_iql_step,
-                    "encoder/best_validation_loss": best_validation_loss,
+                    "encoder/best_validation_score": best_validation_score,
                     "encoder/stale_validations": stale_validations,
                     **{
                         f"iql/{name}": value
@@ -1403,7 +1431,7 @@ def main(config: ConfigView) -> None:
             if should_stop:
                 print(
                     f"IQL early-stopped at step {completed_iql_steps}; "
-                    f"best held-out loss {best_validation_loss:.6f} "
+                    f"best held-out score {best_validation_score:.6f} "
                     f"at step {best_iql_step}."
                 )
                 break

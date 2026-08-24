@@ -24,9 +24,13 @@ class IQLConfig:
     checkpoint_interval: int = 100_000
     validation_interval: int = 1_000
     validation_batches: int = 32
-    early_stopping_min_steps: int = 50_000
-    early_stopping_patience: int = 20
-    early_stopping_min_delta: float = 1e-3
+    # Start model selection only after the critic scale has had time to form.
+    early_stopping_min_steps: int = 100_000
+    # Allow a long plateau before stopping; 50 validations = 50k updates.
+    early_stopping_patience: int = 50
+    early_stopping_min_delta: float = 1e-4
+    # Small policy-quality tie-breaker in the normalized validation score.
+    early_stopping_actor_nll_weight: float = 0.01
 
     def to_dict(self) -> dict:
         return asdict(self)

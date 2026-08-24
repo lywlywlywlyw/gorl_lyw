@@ -3,7 +3,8 @@
 处理规则：
 
 1. 若轨迹中存在原始 ``dones=True``，保留到第一个 True（包含该步），
-   删除后续数据；该轨迹的 ``success`` 仅最后一步为 True。
+   删除后续数据；该轨迹的 ``success`` 仅最后一步为 True，并将该步
+   ``reward`` 额外加 99。
 2. 若原始 ``dones`` 全为 False，保留完整轨迹并把最后一步 ``dones``
    改为 True；该轨迹的 ``success`` 全为 False。
 3. 从处理后的 HDF5 中选择最后一步 ``success=True`` 的轨迹，展平为
@@ -89,7 +90,7 @@ def copy_demo_contents(
 
 
 def process_done_labels(input_path: Path, output_path: Path) -> dict[str, int]:
-    """按照首个原始 done 截断轨迹，并写入 real done 和 success 标签。"""
+    """按首个原始 done 截断轨迹，并写入 done、success 和奖励加成。"""
     input_path = input_path.expanduser().resolve()
     output_path = output_path.expanduser().resolve()
     if not input_path.is_file():
@@ -134,11 +135,17 @@ def process_done_labels(input_path: Path, output_path: Path) -> dict[str, int]:
                     continue
                 if "dones" not in source_demo:
                     raise KeyError(f"轨迹 {source_demo.name} 中缺少 'dones'")
+                if "rewards" not in source_demo:
+                    raise KeyError(f"轨迹 {source_demo.name} 中缺少 'rewards'")
 
                 original_dones = np.asarray(source_demo["dones"]).reshape(-1)
                 original_length = len(original_dones)
                 if original_length == 0:
                     raise ValueError(f"轨迹 {source_demo.name} 是空轨迹")
+                if len(source_demo["rewards"]) != original_length:
+                    raise ValueError(
+                        f"轨迹 {source_demo.name} 的 dones 和 rewards 长度不一致"
+                    )
 
                 done_indices = np.flatnonzero(original_dones.astype(bool))
                 is_success = bool(done_indices.size)
@@ -165,6 +172,14 @@ def process_done_labels(input_path: Path, output_path: Path) -> dict[str, int]:
                 success = np.zeros(kept_length, dtype=np.bool_)
                 if is_success:
                     success[-1] = True
+                    processed_rewards = np.asarray(target_demo["rewards"])
+                    processed_rewards[-1] += 150
+                    del target_demo["rewards"]
+                    target_rewards = target_demo.create_dataset(
+                        "rewards",
+                        data=processed_rewards.astype(source_demo["rewards"].dtype),
+                    )
+                    copy_attributes(source_demo["rewards"].attrs, target_rewards.attrs)
                     successful_count += 1
                 else:
                     failed_count += 1
