@@ -34,6 +34,8 @@ class EncoderConfig:
     reward_scaling: float = 1.0
     reward_bias: float = 0.0
     max_grad_norm: float = 10.0
+    latent_kl_weight: float = 0.1
+    learn_temperature: jdc.Static[bool] = False
     policy_update_period: jdc.Static[int] = 20
     apply_tanh_in_rollout: jdc.Static[bool] = True
 
@@ -78,6 +80,8 @@ class EncoderState:
     def init(prng: Array, env: Any, config: EncoderConfig) -> "EncoderState":
         if config.initial_temperature <= 0.0:
             raise ValueError("initial_temperature must be positive")
+        if config.latent_kl_weight < 0.0:
+            raise ValueError("latent_kl_weight must be non-negative")
         obs_dim = int(env.observation_size)
         actor_key, critic_key, prng = jax.random.split(prng, 3)
         actor_dims = (obs_dim,) + (config.hidden_size,) * config.hidden_layers + (
@@ -251,17 +255,55 @@ class EncoderState:
         temperature = jax.lax.stop_gradient(self.temperature)
 
         def actor_loss_fn(params: networks.MlpWeights):
-            actions, log_probs = self._sample_with_params(
-                params, batch.observations, actor_key
-            )
+            distribution = self._distribution(batch.observations, params)
+            actions = distribution.sample(actor_key)
+            log_probs = self._log_prob(distribution, actions)
             qs = self._critic_values(self.critic_params, batch.observations, actions)
             q = jnp.mean(qs, axis=0)
-            loss = jnp.mean(temperature * log_probs - q)
-            return loss, (jnp.mean(-log_probs), jnp.mean(q), log_probs)
+            mean = distribution.loc
+            std = distribution.scale
+            # Analytic KL[N(mu, sigma^2) || N(0, I)]. The frozen FM decoder
+            # was trained from a standard-normal latent prior, so this keeps
+            # z in its supported region without clipping or squashing it.
+            prior_kl = 0.5 * jnp.sum(
+                jnp.square(mean) + jnp.square(std) - 1.0 - 2.0 * jnp.log(std),
+                axis=-1,
+            )
+            loss = jnp.mean(
+                temperature * log_probs
+                - q
+                + self.config.latent_kl_weight * prior_kl
+            )
+            return loss, (
+                jnp.mean(-log_probs),
+                jnp.mean(q),
+                jnp.mean(prior_kl),
+                jnp.mean(mean),
+                jnp.mean(jnp.abs(mean)),
+                jnp.mean(std),
+                jnp.mean(jnp.square(std)),
+                jnp.min(std),
+                jnp.max(std),
+                jnp.mean(jnp.linalg.norm(actions, axis=-1)),
+                jnp.max(jnp.abs(actions)),
+            )
 
-        (actor_loss, (entropy, actor_q, log_probs)), actor_grads = jax.value_and_grad(
+        (actor_loss, actor_aux), actor_grads = jax.value_and_grad(
             actor_loss_fn, has_aux=True
         )(self.actor_params)
+        (
+            entropy,
+            actor_q,
+            latent_prior_kl,
+            latent_mean,
+            latent_mean_abs,
+            latent_std,
+            latent_variance,
+            latent_std_min,
+            latent_std_max,
+            latent_norm,
+            latent_max_abs,
+        ) = actor_aux
         actor_optimizer = optax.chain(
             optax.clip_by_global_norm(self.config.max_grad_norm),
             optax.adam(self.config.learning_rate),
@@ -270,31 +312,37 @@ class EncoderState:
             actor_grads, self.actor_opt_state, self.actor_params
         )
         actor_params = optax.apply_updates(self.actor_params, actor_updates)
-        target_entropy = self._target_entropy()
 
-        _, temperature_log_probs = self._sample_with_params(
-            self.actor_params, batch.next_observations, temperature_key
-        )
-        temperature_entropy = -jnp.mean(temperature_log_probs)
+        # Temperature is fixed by default while the explicit decoder-prior KL
+        # regularizes the actor. Keep the old update path behind a config flag
+        # so experiments can opt back into automatic entropy tuning.
+        log_temperature = self.log_temperature
+        temperature_opt_state = self.temperature_opt_state
+        temperature_loss = jnp.zeros(())
+        if self.config.learn_temperature:
+            target_entropy = self._target_entropy()
+            _, temperature_log_probs = self._sample_with_params(
+                self.actor_params, batch.next_observations, temperature_key
+            )
+            temperature_entropy = -jnp.mean(temperature_log_probs)
 
-        def temperature_loss_fn(log_temperature: Array) -> Array:
-            temperature = jax.nn.softplus(log_temperature)
-            return temperature * jax.lax.stop_gradient(
-                temperature_entropy - target_entropy
+            def temperature_loss_fn(raw_temperature: Array) -> Array:
+                learned_temperature = jax.nn.softplus(raw_temperature)
+                return learned_temperature * jax.lax.stop_gradient(
+                    temperature_entropy - target_entropy
+                )
+
+            temperature_loss, temperature_grads = jax.value_and_grad(
+                temperature_loss_fn
+            )(self.log_temperature)
+            temperature_optimizer = optax.adam(self.config.temperature_learning_rate)
+            temperature_updates, temperature_opt_state = temperature_optimizer.update(
+                temperature_grads, self.temperature_opt_state, self.log_temperature
+            )
+            log_temperature = optax.apply_updates(
+                self.log_temperature, temperature_updates
             )
 
-        temperature_loss, temperature_grads = jax.value_and_grad(
-            temperature_loss_fn
-        )(self.log_temperature)
-        temperature_optimizer = optax.adam(self.config.temperature_learning_rate)
-        temperature_updates, temperature_opt_state = temperature_optimizer.update(
-            temperature_grads,
-            self.temperature_opt_state,
-            self.log_temperature,
-        )
-        log_temperature = optax.apply_updates(
-            self.log_temperature, temperature_updates
-        )
         state = jdc.replace(
             self,
             actor_params=actor_params,
@@ -310,4 +358,13 @@ class EncoderState:
             "temperature": temperature,
             "temperature_loss": temperature_loss,
             "actor_grad_norm": _global_norm(actor_grads),
+            "latent_prior_kl": latent_prior_kl,
+            "latent_mean": latent_mean,
+            "latent_mean_abs": latent_mean_abs,
+            "latent_std": latent_std,
+            "latent_variance": latent_variance,
+            "latent_std_min": latent_std_min,
+            "latent_std_max": latent_std_max,
+            "latent_norm": latent_norm,
+            "latent_max_abs": latent_max_abs,
         }

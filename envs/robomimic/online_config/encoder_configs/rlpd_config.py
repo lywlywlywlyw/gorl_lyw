@@ -13,9 +13,10 @@ class RLPDConfig:
     rlpd_actor_learning_rate: float = 1e-4
     rlpd_critic_learning_rate: float = 3e-4
     rlpd_temperature_learning_rate: float = 1e-4
+    rlpd_learn_temperature: bool = False
     rlpd_discounting: float = 0.99
     rlpd_target_update_rate: float = 0.005
-    rlpd_initial_temperature: float = 1.0
+    rlpd_initial_temperature: float = 0.02
     rlpd_target_entropy: float | None = None
     rlpd_backup_entropy: bool = False
     rlpd_critic_ensemble_size: int = 2
@@ -25,6 +26,7 @@ class RLPDConfig:
     rlpd_reward_scaling: float = 1.0
     rlpd_reward_bias: float = 0.0
     rlpd_max_grad_norm: float = 10.0
+    rlpd_latent_kl_weight: float = 1.0
     rlpd_normalize_observations: bool = True
     rlpd_apply_tanh_in_rollout: bool = False
     rlpd_rollout_steps_per_iteration: int = 8

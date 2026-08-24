@@ -280,6 +280,7 @@ def make_rlpd_encoder_config(
         learning_rate=config.rlpd_actor_learning_rate,
         critic_learning_rate=config.rlpd_critic_learning_rate,
         temperature_learning_rate=config.rlpd_temperature_learning_rate,
+        learn_temperature=config.rlpd_learn_temperature,
         discounting=config.rlpd_discounting,
         episode_length=episode_length,
         normalize_observations=config.rlpd_normalize_observations,
@@ -296,6 +297,7 @@ def make_rlpd_encoder_config(
         reward_scaling=config.rlpd_reward_scaling,
         reward_bias=config.rlpd_reward_bias,
         max_grad_norm=config.rlpd_max_grad_norm,
+        latent_kl_weight=config.rlpd_latent_kl_weight,
         policy_update_period=config.rlpd_policy_update_period,
         apply_tanh_in_rollout=config.rlpd_apply_tanh_in_rollout,
     )

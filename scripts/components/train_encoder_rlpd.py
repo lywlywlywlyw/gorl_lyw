@@ -361,6 +361,7 @@ def train_async_stage(
         learning_rate=config["rlpd_actor_learning_rate"],
         critic_learning_rate=config["rlpd_critic_learning_rate"],
         temperature_learning_rate=config["rlpd_temperature_learning_rate"],
+        learn_temperature=config["rlpd_learn_temperature"],
         discounting=config["rlpd_discounting"],
         episode_length=config["episode_length"],
         normalize_observations=config["rlpd_normalize_observations"],
@@ -377,6 +378,7 @@ def train_async_stage(
         reward_scaling=config["rlpd_reward_scaling"],
         reward_bias=config["rlpd_reward_bias"],
         max_grad_norm=config["rlpd_max_grad_norm"],
+        latent_kl_weight=config["rlpd_latent_kl_weight"],
         policy_update_period=config["rlpd_policy_update_period"],
         apply_tanh_in_rollout=config["rlpd_apply_tanh_in_rollout"],
     )
@@ -410,7 +412,8 @@ def train_async_stage(
         encoder_state.actor_params = previous["rlpd_z_actor_params"]
         encoder_state.critic_params = previous["rlpd_z_critic_params"]
         encoder_state.target_critic_params = previous["rlpd_z_target_critic_params"]
-        encoder_state.log_temperature = previous["rlpd_z_log_temperature"]
+        if encoder_config.learn_temperature:
+            encoder_state.log_temperature = previous["rlpd_z_log_temperature"]
         encoder_state.obs_stats = previous["rlpd_z_obs_stats"]
         if inherit_optimizer_state:
             for name, key in optimizer_keys.items():
@@ -558,6 +561,7 @@ def main(
         learning_rate=config["rlpd_actor_learning_rate"],
         critic_learning_rate=config["rlpd_critic_learning_rate"],
         temperature_learning_rate=config["rlpd_temperature_learning_rate"],
+        learn_temperature=config["rlpd_learn_temperature"],
         discounting=config["rlpd_discounting"],
         episode_length=config["episode_length"],
         normalize_observations=config["rlpd_normalize_observations"],
@@ -574,6 +578,7 @@ def main(
         reward_scaling=config["rlpd_reward_scaling"],
         reward_bias=config["rlpd_reward_bias"],
         max_grad_norm=config["rlpd_max_grad_norm"],
+        latent_kl_weight=config["rlpd_latent_kl_weight"],
         policy_update_period=config["rlpd_policy_update_period"],
         apply_tanh_in_rollout=config["rlpd_apply_tanh_in_rollout"],
     )
@@ -608,7 +613,8 @@ def main(
             state.actor_params = encoder_checkpoint["rlpd_z_actor_params"]
             state.critic_params = encoder_checkpoint["rlpd_z_critic_params"]
             state.target_critic_params = encoder_checkpoint["rlpd_z_target_critic_params"]
-            state.log_temperature = encoder_checkpoint["rlpd_z_log_temperature"]
+            if encoder_config.learn_temperature:
+                state.log_temperature = encoder_checkpoint["rlpd_z_log_temperature"]
             state.obs_stats = encoder_checkpoint["rlpd_z_obs_stats"]
             # Never inherit an offline optimizer. Online-to-online continuation
             # may preserve optimizer/PRNG/step state as before.
