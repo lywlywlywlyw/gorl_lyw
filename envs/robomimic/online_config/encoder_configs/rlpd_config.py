@@ -7,7 +7,7 @@ class RLPDConfig:
 
     rlpd_batch_size: int = 1024
     rlpd_replay_buffer_capacity: int = 200_000
-    rlpd_learning_starts: int = 24_576
+    rlpd_learning_starts: int = 8192#24_576
     rlpd_updates_per_env_step: int = 1
     rlpd_policy_update_period: int = 4
     rlpd_actor_learning_rate: float = 1e-4

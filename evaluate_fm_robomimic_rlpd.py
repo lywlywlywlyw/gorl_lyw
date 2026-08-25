@@ -35,8 +35,8 @@ from envs.robomimic.online_config.env_config import EnvConfig
 # for updates. Cached files remain available in offline mode.
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-
-
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["CUDA_VISIBLE_DEVICES"] = str(3)
 @dataclass
 class EvaluationConfig:
     """CLI configuration for Robomimic policy evaluation."""

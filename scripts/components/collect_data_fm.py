@@ -181,9 +181,12 @@ def run_async_collector(
     rollout_steps: int = 100,
     replay_capacity: int | None = None,
     metrics_file: str | None = None,
-    evaluation_dir: str | None = None,
 ) -> None:
-    """Continuously collect real transitions with the latest complete Policy_n."""
+    """Continuously collect transitions with the latest complete Policy_n.
+
+    Policy evaluation is handled by run_async_evaluator, so slow evaluation
+    cannot block collection or skip intermediate policy versions.
+    """
     config = TrainingConfig().to_dict() | EnvConfig().to_dict()
     manager = VersionManager(pipeline_root)
     replay = ChunkReplayBuffer(replay_buffer_dir, replay_capacity)
@@ -197,7 +200,6 @@ def run_async_collector(
     current_version = -1
     agent = None
     apply_tanh = True
-    evaluations_seen = 0
     try:
         while not stop.exists():
             latest = manager.latest_policy()
@@ -216,30 +218,6 @@ def run_async_collector(
                         "collector/policy_version": version,
                         "collector/policy_switch": 1,
                     })
-                evaluations_seen += 1
-                video_interval = max(1, int(config["wandb_video_interval_evals"]))
-                record_video = evaluations_seen % video_interval == 0
-                if metrics_file:
-                    try:
-                        append_metrics(
-                            metrics_file,
-                            _record_policy_evaluation(
-                                agent,
-                                config,
-                                version,
-                                (
-                                    Path(evaluation_dir) / f"policy_{version:04d}.mp4"
-                                    if record_video and evaluation_dir is not None
-                                    else None
-                                ),
-                                apply_tanh,
-                            ),
-                        )
-                    except Exception as error:
-                        print(
-                            f"WARNING: Evaluation for Policy_{version} failed: {error}",
-                            flush=True,
-                        )
             assert agent is not None
             rollout_state, transitions = rollout_state.rollout(
                 agent,
@@ -274,6 +252,58 @@ def run_async_collector(
                 })
     finally:
         rollout_state.close()
+
+
+def run_async_evaluator(
+    pipeline_root: str,
+    stop_file: str,
+    max_version: int,
+    poll_seconds: float = 2.0,
+    metrics_file: str | None = None,
+    evaluation_dir: str | None = None,
+) -> None:
+    """Evaluate every Policy_n exactly once and strictly in version order."""
+    if max_version < 0:
+        raise ValueError("max_version must be non-negative")
+
+    config = TrainingConfig().to_dict() | EnvConfig().to_dict()
+    manager = VersionManager(pipeline_root)
+    stop = Path(stop_file)
+    env = RobomimicEnv(
+        dataset_path=config["dataset_path"], reward_shaping=config["dense_reward"]
+    )
+    video_interval = max(1, int(config["wandb_video_interval_evals"]))
+    try:
+        # Waiting for an explicit version, rather than latest_policy(), ensures
+        # that a quickly advancing trainer cannot skip evaluations.
+        for version in range(max_version + 1):
+            encoder_path = manager.wait_component(
+                "encoder", version, poll_seconds, stop
+            )
+            decoder_path = manager.wait_component(
+                "decoder", version, poll_seconds, stop
+            )
+            agent, apply_tanh = _load_policy_pair(
+                encoder_path, decoder_path, env, config
+            )
+            record_video = (version + 1) % video_interval == 0
+            metrics = _record_policy_evaluation(
+                agent,
+                config,
+                version,
+                (
+                    Path(evaluation_dir) / f"policy_{version:04d}.mp4"
+                    if record_video and evaluation_dir is not None
+                    else None
+                ),
+                apply_tanh,
+            )
+            if metrics_file:
+                append_metrics(metrics_file, metrics)
+            print(f"Evaluation completed for Policy_{version}.", flush=True)
+    finally:
+        env.close()
+
 
 def main(
     ppo_z_checkpoint_path: str | None = None,

@@ -156,6 +156,19 @@ def _collector_worker(settings: dict) -> None:
         rollout_steps=settings["collector_rollout_steps"],
         replay_capacity=settings["replay_capacity"],
         metrics_file=settings["metrics_file"],
+    )
+
+
+def _evaluator_worker(settings: dict) -> None:
+    _configure_worker_gpu("evaluator", settings["evaluator_gpu_id"])
+    from scripts.components.collect_data_fm import run_async_evaluator
+
+    run_async_evaluator(
+        pipeline_root=settings["versions_dir"],
+        stop_file=settings["stop_file"],
+        max_version=settings["max_version"],
+        poll_seconds=settings["poll_seconds"],
+        metrics_file=settings["metrics_file"],
         evaluation_dir=settings["evaluation_dir"],
     )
 
@@ -205,10 +218,11 @@ def run_async_pipeline(
     poll_seconds: float = 1.0,
     collector_gpu_id: int = 0,
     encoder_gpu_id: int = 0,
+    evaluator_gpu_id: int = 0,
     decoder_gpu_id: int = 0,
     parent_gpu_id: int = 0,
 ) -> None:
-    """Run Collector, Encoder Trainer and Decoder Trainer as independent processes."""
+    """Run collection, evaluation, and both trainers as independent processes."""
     if not np.isclose(encoder_demo_ratio + encoder_replay_ratio, 1.0):
         raise ValueError("encoder demo/replay ratios must sum to 1.0")
     if num_versions < 1:
@@ -218,6 +232,7 @@ def run_async_pipeline(
     worker_gpu_ids = {
         "collector": collector_gpu_id,
         "encoder": encoder_gpu_id,
+        "evaluator": evaluator_gpu_id,
         "decoder": decoder_gpu_id,
     }
     invalid_gpu_ids = {
@@ -284,6 +299,7 @@ def run_async_pipeline(
         "poll_seconds": poll_seconds,
         "collector_gpu_id": collector_gpu_id,
         "encoder_gpu_id": encoder_gpu_id,
+        "evaluator_gpu_id": evaluator_gpu_id,
         "decoder_gpu_id": decoder_gpu_id,
         "parent_gpu_id": parent_gpu_id,
     }
@@ -292,6 +308,7 @@ def run_async_pipeline(
         "Asynchronous GPU assignment: "
         f"collector=cuda:{collector_gpu_id}, "
         f"encoder=cuda:{encoder_gpu_id}, decoder=cuda:{decoder_gpu_id}; "
+        f"evaluator=cuda:{evaluator_gpu_id}, "
         f"parent validation=cuda:{parent_gpu_id}"
     )
     metrics_file = Path(settings["metrics_file"])
@@ -323,11 +340,17 @@ def run_async_pipeline(
         wandb_run.log({"pipeline/version": 0, "pipeline/started": 1})
     metrics_offset = 0
     context = mp.get_context("spawn")
-    processes = [
-        context.Process(name="data-collector", target=_collector_worker, args=(settings,)),
+    collector_process = context.Process(
+        name="data-collector", target=_collector_worker, args=(settings,)
+    )
+    evaluator_process = context.Process(
+        name="policy-evaluator", target=_evaluator_worker, args=(settings,)
+    )
+    trainer_processes = [
         context.Process(name="encoder-trainer", target=_encoder_worker, args=(settings,)),
         context.Process(name="decoder-trainer", target=_decoder_worker, args=(settings,)),
     ]
+    processes = [collector_process, evaluator_process, *trainer_processes]
     for process in processes:
         process.start()
     pipeline_error: BaseException | None = None
@@ -336,8 +359,12 @@ def run_async_pipeline(
             failed = next((p for p in processes if p.exitcode not in (None, 0)), None)
             if failed is not None:
                 raise RuntimeError(f"{failed.name} exited with code {failed.exitcode}")
-            # Trainers finish after num_versions; collector is intentionally endless.
-            if all(not p.is_alive() for p in processes[1:]):
+            # Collection is intentionally endless. Even after both trainers
+            # finish, keep the pipeline alive until every policy is evaluated.
+            if (
+                all(not process.is_alive() for process in trainer_processes)
+                and not evaluator_process.is_alive()
+            ):
                 break
             if wandb_run is not None:
                 metrics_offset = _forward_metrics(metrics_file, wandb_run, metrics_offset)
@@ -357,7 +384,9 @@ def run_async_pipeline(
         if wandb_run is not None:
             _forward_metrics(metrics_file, wandb_run, metrics_offset)
     failures = {
-        p.name: p.exitcode for p in processes[1:] if p.exitcode not in (0, None)
+        process.name: process.exitcode
+        for process in [evaluator_process, *trainer_processes]
+        if process.exitcode not in (0, None)
     }
     if pipeline_error is not None or failures:
         if wandb_run is not None:
@@ -465,19 +494,20 @@ def main(
     offline_checkpoint_path: str,
     demo_buffer_path: str,
     run_dir: str | None = None,
-    num_versions: int = 24,
-    encoder_train_env_steps: int = 250,
-    decoder_train_steps: int = 500,
+    num_versions: int = 50,
+    encoder_train_env_steps: int = 50,
+    decoder_train_steps: int = 50,
     encoder_demo_ratio: float = 0.5,
     encoder_replay_ratio: float = 0.5,
-    minimum_replay_size: int = 49152,
+    minimum_replay_size: int = 8192,#49152,
     replay_capacity: int | None = 200000,
     collector_rollout_steps: int = 32,
     poll_seconds: float = 1.0,
-    collector_gpu_id: int = 0,
-    encoder_gpu_id: int = 0,
-    decoder_gpu_id: int = 0,
-    parent_gpu_id: int = 0,
+    collector_gpu_id: int = 1,
+    encoder_gpu_id: int = 1,
+    decoder_gpu_id: int = 1,
+    parent_gpu_id: int = 1,
+    evaluator_gpu_id: int = 1,
 ) -> None:
     """Run the asynchronous RLPD encoder + FM decoder training pipeline."""
     run_async_pipeline(
@@ -497,6 +527,7 @@ def main(
         encoder_gpu_id=encoder_gpu_id,
         decoder_gpu_id=decoder_gpu_id,
         parent_gpu_id=parent_gpu_id,
+        evaluator_gpu_id=evaluator_gpu_id,
     )
 
 
