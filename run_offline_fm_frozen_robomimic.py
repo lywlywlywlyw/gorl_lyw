@@ -30,12 +30,16 @@ are sourced from ``envs.robomimic.offline_config``.
 from __future__ import annotations
 
 import json
+import os
 import pickle
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+# Allow JAX to grow its GPU allocation instead of reserving most VRAM upfront.
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 # Allow this root-level script to import the local ``src/flow_policy`` package
 # when invoked directly with ``python run_offline_fm_frozen_robomimic.py``.
@@ -875,8 +879,9 @@ def save_offline_checkpoint(
         "rlpd_z_actor_params": actor_params,
         "rlpd_z_critic_params": critic_params,
         "rlpd_z_target_critic_params": target_critic_params,
+        "rlpd_temperature_parameterization": "softplus_raw",
         "rlpd_z_log_temperature": jnp.log(
-            jnp.asarray(rlpd_config.initial_temperature)
+            jnp.expm1(jnp.asarray(rlpd_config.initial_temperature))
         ),
         "rlpd_z_obs_stats": encoder_obs_stats,
         # Offline-only training state/metadata.

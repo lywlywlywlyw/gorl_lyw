@@ -310,6 +310,7 @@ def _checkpoint(
         "rlpd_z_actor_params": state.actor_params,
         "rlpd_z_critic_params": state.critic_params,
         "rlpd_z_target_critic_params": state.target_critic_params,
+        "rlpd_temperature_parameterization": "softplus_raw",
         "rlpd_z_log_temperature": state.log_temperature,
         "rlpd_z_actor_opt_state": state.actor_opt_state,
         "rlpd_z_critic_opt_state": state.critic_opt_state,
@@ -412,7 +413,11 @@ def train_async_stage(
         encoder_state.actor_params = previous["rlpd_z_actor_params"]
         encoder_state.critic_params = previous["rlpd_z_critic_params"]
         encoder_state.target_critic_params = previous["rlpd_z_target_critic_params"]
-        if encoder_config.learn_temperature:
+        previous_is_legacy_offline = bool(
+            previous.get("is_frozen_offline", False)
+            or previous.get("offline_checkpoint_type") is not None
+        ) and previous.get("rlpd_temperature_parameterization") != "softplus_raw"
+        if encoder_config.learn_temperature and not previous_is_legacy_offline:
             encoder_state.log_temperature = previous["rlpd_z_log_temperature"]
         encoder_state.obs_stats = previous["rlpd_z_obs_stats"]
         if inherit_optimizer_state:
@@ -613,7 +618,13 @@ def main(
             state.actor_params = encoder_checkpoint["rlpd_z_actor_params"]
             state.critic_params = encoder_checkpoint["rlpd_z_critic_params"]
             state.target_critic_params = encoder_checkpoint["rlpd_z_target_critic_params"]
-            if encoder_config.learn_temperature:
+            has_current_temperature_format = (
+                encoder_checkpoint.get("rlpd_temperature_parameterization")
+                == "softplus_raw"
+            )
+            if encoder_config.learn_temperature and (
+                has_current_temperature_format or not encoder_checkpoint_is_offline
+            ):
                 state.log_temperature = encoder_checkpoint["rlpd_z_log_temperature"]
             state.obs_stats = encoder_checkpoint["rlpd_z_obs_stats"]
             # Never inherit an offline optimizer. Online-to-online continuation

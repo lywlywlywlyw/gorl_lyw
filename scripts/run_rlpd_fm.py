@@ -4,6 +4,9 @@ import datetime
 import json
 import os
 import pickle
+
+# Inherited by the parent and every spawned worker before any JAX import.
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 import sys
 import time
 import multiprocessing as mp
@@ -54,6 +57,7 @@ def _configure_worker_gpu(role: str, gpu_id: int) -> None:
     physical GPU is exposed to that worker as local device 0.
     """
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["MUJOCO_GL"] = "egl"
     os.environ["PYOPENGL_PLATFORM"] = "egl"
     # EGL enumerates physical devices independently of CUDA's local numbering.
@@ -200,9 +204,9 @@ def run_async_pipeline(
     collector_rollout_steps: int = 32,
     poll_seconds: float = 1.0,
     collector_gpu_id: int = 0,
-    encoder_gpu_id: int = 1,
-    decoder_gpu_id: int = 2,
-    parent_gpu_id: int = 3,
+    encoder_gpu_id: int = 0,
+    decoder_gpu_id: int = 0,
+    parent_gpu_id: int = 0,
 ) -> None:
     """Run Collector, Encoder Trainer and Decoder Trainer as independent processes."""
     if not np.isclose(encoder_demo_ratio + encoder_replay_ratio, 1.0):
@@ -221,22 +225,13 @@ def run_async_pipeline(
     }
     if invalid_gpu_ids:
         raise ValueError(f"async worker GPU IDs must be non-negative: {invalid_gpu_ids}")
-    if len(set(worker_gpu_ids.values())) != len(worker_gpu_ids):
-        raise ValueError(
-            "async collector, encoder and decoder must use different GPUs; "
-            f"received {worker_gpu_ids}"
-        )
     if parent_gpu_id < 0:
         raise ValueError("parent_gpu_id must be non-negative")
-    if parent_gpu_id in worker_gpu_ids.values():
-        raise ValueError(
-            "the async parent validation process must not share a worker GPU; "
-            f"parent={parent_gpu_id}, workers={worker_gpu_ids}"
-        )
 
-    # The parent imports JAX below to validate environment dimensions. Pin it to
-    # the spare GPU before that first import so it cannot reserve worker memory.
+    # The parent imports JAX below to validate environment dimensions. It may
+    # share a physical GPU with every worker; preallocation is disabled globally.
     os.environ["CUDA_VISIBLE_DEVICES"] = str(parent_gpu_id)
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["MUJOCO_GL"] = "egl"
     os.environ["PYOPENGL_PLATFORM"] = "egl"
     os.environ["MUJOCO_EGL_DEVICE_ID"] = str(parent_gpu_id)
@@ -471,7 +466,7 @@ def main(
     demo_buffer_path: str,
     run_dir: str | None = None,
     num_versions: int = 24,
-    encoder_train_env_steps: int = 1000,
+    encoder_train_env_steps: int = 250,
     decoder_train_steps: int = 500,
     encoder_demo_ratio: float = 0.5,
     encoder_replay_ratio: float = 0.5,
@@ -480,9 +475,9 @@ def main(
     collector_rollout_steps: int = 32,
     poll_seconds: float = 1.0,
     collector_gpu_id: int = 0,
-    encoder_gpu_id: int = 1,
-    decoder_gpu_id: int = 2,
-    parent_gpu_id: int = 3,
+    encoder_gpu_id: int = 0,
+    decoder_gpu_id: int = 0,
+    parent_gpu_id: int = 0,
 ) -> None:
     """Run the asynchronous RLPD encoder + FM decoder training pipeline."""
     run_async_pipeline(
