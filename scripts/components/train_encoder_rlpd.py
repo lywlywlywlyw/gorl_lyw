@@ -171,13 +171,16 @@ def _inverse_decoder_batch(
     actions: np.ndarray,
 ) -> np.ndarray:
     """Call the frozen decoder's own environment-action inversion method."""
-    latent = decoder.inverse_fm_batch(
-        jnp.asarray(observations),
-        jnp.asarray(actions),
-        decoder.config.inverse_steps
-        if isinstance(decoder, Decoder1StepFMState)
-        else decoder.config.flow_steps,
-    )
+    if isinstance(decoder, Decoder1StepFMState):
+        latent = decoder.inverse_fm_batch(
+            jnp.asarray(observations), jnp.asarray(actions)
+        )
+    else:
+        latent = decoder.inverse_fm_batch(
+            jnp.asarray(observations),
+            jnp.asarray(actions),
+            decoder.config.flow_steps,
+        )
     return np.asarray(jax.device_get(latent), dtype=np.float32)
 
 

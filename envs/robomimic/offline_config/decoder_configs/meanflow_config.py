@@ -14,7 +14,6 @@ class MeanFlowConfig:
     meanflow_validation_split: float = 0.05
     meanflow_min_delta: float = 1e-4
     meanflow_eval_batches: int = 32
-    meanflow_latent_inverse_steps: int = 32
     # Match the Flow Matching decoder's 8-d timestep embedding and 64-wide
     # four-layer MLP capacity.
     meanflow_timestep_embed_dim: int = 8

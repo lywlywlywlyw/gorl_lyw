@@ -134,8 +134,6 @@ class ConditionalResidualMLP(nn.Module):
 
 @jdc.pytree_dataclass
 class Decoder1StepFMConfig:
-    flow_steps: jdc.Static[int] = 1
-    inverse_steps: jdc.Static[int] = 32
     timestep_embed_dim: jdc.Static[int] = 128
     hidden_dim: jdc.Static[int] = 512
     num_res_blocks: jdc.Static[int] = 4
@@ -149,9 +147,6 @@ class Decoder1StepFMConfig:
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 1e-6
     batch_size: jdc.Static[int] = 128
-    num_epochs: jdc.Static[int] = 50
-    # Retained only so older command lines/checkpoints remain readable.
-    n_samples_per_action: jdc.Static[int] = 1
 
     normalize_observations: jdc.Static[bool] = True
     normalization_mode: jdc.Static[str] = "limits"
@@ -386,7 +381,6 @@ class Decoder1StepFMState:
         self,
         observations: Array,
         actions: Array,
-        num_steps: int | None = None,
     ) -> Array:
         """Invert actions with ``z <- action + u(obs, z, 1, 0)``.
 
@@ -401,13 +395,10 @@ class Decoder1StepFMState:
             raise ValueError(
                 "MeanFlow inversion observations and actions must share a batch size."
             )
-        steps = self.config.inverse_steps if num_steps is None else num_steps
-        if steps <= 0:
-            raise ValueError("MeanFlow inversion num_steps must be positive.")
-
         obs_norm = self._normalize_obs(observations)
         t = jnp.zeros((actions.shape[0], 1))
         r = jnp.ones((actions.shape[0], 1))
+        steps = 1
         return jax.lax.fori_loop(
             0,
             steps,

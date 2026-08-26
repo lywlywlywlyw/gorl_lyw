@@ -99,11 +99,11 @@ def build_config(training_config: TrainingConfig | None = None) -> ConfigView:
         "decoder_checkpoint_interval": "checkpoint_interval", "decoder_validation_fraction": "validation_split",
         "timestep_embed_dim": "timestep_embed_dim", "decoder_min_epochs": "min_epochs",
         "decoder_patience": "patience", "decoder_min_delta": "min_delta",
-        "decoder_eval_batches": "eval_batches", "latent_inverse_steps": "latent_inverse_steps",
+        "decoder_eval_batches": "eval_batches",
     }
     for target, suffix in aliases.items(): config[target] = config[f"{prefix}_{suffix}"]
     if prefix == "fm":
-        config.update(decoder_hidden_size=config["fm_hidden_size"], decoder_num_layers=config["fm_num_layers"], flow_steps=config["fm_flow_steps"], n_fm_samples_per_action=config["fm_n_samples_per_action"])
+        config.update(decoder_hidden_size=config["fm_hidden_size"], decoder_num_layers=config["fm_num_layers"], flow_steps=config["fm_flow_steps"], latent_inverse_steps=config["fm_latent_inverse_steps"], n_fm_samples_per_action=config["fm_n_samples_per_action"])
     return config
 
 
@@ -244,7 +244,6 @@ def validate_config(config: ConfigView) -> None:
         config.batch_size,
         config.decoder_batch_size,
         config.encoder_iql_steps,
-        config.latent_inverse_steps,
         config.comparison_samples,
         config.checkpoint_interval,
         config.decoder_checkpoint_interval,
@@ -254,6 +253,8 @@ def validate_config(config: ConfigView) -> None:
         config.early_stopping_patience,
     ) < 1:
         raise ValueError("Batch sizes and step/sample counts must be positive.")
+    if config.decoder_type == "flow_matching" and config.latent_inverse_steps < 1:
+        raise ValueError("latent_inverse_steps must be positive for Flow Matching.")
     if config.max_grad_norm <= 0.0:
         raise ValueError("max_grad_norm must be positive.")
     if config.early_stopping_min_delta < 0.0:
@@ -342,11 +343,16 @@ def build_latent_targets(
     decoder: Any,
     buffer: ReplayBuffer,
     batch_size: int,
-    inverse_steps: int,
+    inverse_steps: int | None,
 ) -> np.ndarray:
-    invert = jax.jit(
-        lambda obs, act: decoder.inverse_fm_batch(obs, act, inverse_steps)
-    )
+    if isinstance(decoder, Decoder1StepFMState):
+        invert = jax.jit(decoder.inverse_fm_batch)
+    else:
+        if inverse_steps is None:
+            raise ValueError("Flow Matching inversion requires inverse_steps.")
+        invert = jax.jit(
+            lambda obs, act: decoder.inverse_fm_batch(obs, act, inverse_steps)
+        )
     chunks = []
     for start in trange(
         0, len(buffer), batch_size, desc="Invert actions", leave=False
@@ -396,13 +402,18 @@ def decoder_metrics(
     decoder: Any,
     buffer: ReplayBuffer,
     indices: np.ndarray,
-    inverse_steps: int,
+    inverse_steps: int | None,
 ) -> tuple[dict[str, float], np.ndarray]:
     obs = jnp.asarray(buffer.observations[indices])
     actions = jnp.asarray(buffer.actions[indices])
-    latents = jax.jit(
-        lambda o, a: decoder.inverse_fm_batch(o, a, inverse_steps)
-    )(obs, actions)
+    if isinstance(decoder, Decoder1StepFMState):
+        latents = jax.jit(decoder.inverse_fm_batch)(obs, actions)
+    else:
+        if inverse_steps is None:
+            raise ValueError("Flow Matching inversion requires inverse_steps.")
+        latents = jax.jit(
+            lambda o, a: decoder.inverse_fm_batch(o, a, inverse_steps)
+        )(obs, actions)
     reconstructed = jax.jit(
         lambda o, z: forward_fm_batch(decoder, o, z)
     )(obs, latents)
@@ -933,10 +944,10 @@ def main(config: ConfigView) -> None:
                 hidden_dim=config.meanflow_hidden_dim, num_res_blocks=config.meanflow_num_res_blocks,
                 mlp_expansion=config.meanflow_mlp_expansion,
                 policy_output_scale=config.meanflow_policy_output_scale, learning_rate=config.decoder_learning_rate,
-                batch_size=config.decoder_batch_size, num_epochs=config.decoder_max_epochs,
+                batch_size=config.decoder_batch_size,
                 normalize_observations=config.meanflow_normalize_observations,
                 flow_ratio=config.meanflow_flow_ratio,
-                inverse_steps=config.latent_inverse_steps, guidance_scale=config.meanflow_guidance_scale, use_dispersive=config.use_dispersive, dispersive_loss_weight=config.meanflow_dispersive_loss_weight,
+                guidance_scale=config.meanflow_guidance_scale, use_dispersive=config.use_dispersive, dispersive_loss_weight=config.meanflow_dispersive_loss_weight,
             )
             decoder = Decoder1StepFMState.init(decoder_key, obs_dim, action_dim, decoder_config)
             with jdc.copy_and_mutate(decoder) as decoder:
@@ -1096,7 +1107,9 @@ def main(config: ConfigView) -> None:
                 decoder,
                 buffer,
                 comparison_indices,
-                config.latent_inverse_steps,
+                config.latent_inverse_steps
+                if config.decoder_type == "flow_matching"
+                else None,
             )
             comparison["latent/drift_mse"] = (
                 0.0
@@ -1185,13 +1198,17 @@ def main(config: ConfigView) -> None:
             decoder,
             buffer,
             config.decoder_batch_size,
-            config.latent_inverse_steps,
+            config.latent_inverse_steps
+            if config.decoder_type == "flow_matching"
+            else None,
         )
         frozen_metrics, _ = decoder_metrics(
             decoder,
             buffer,
             comparison_indices,
-            config.latent_inverse_steps,
+            config.latent_inverse_steps
+            if config.decoder_type == "flow_matching"
+            else None,
         )
         frozen_record = {
             "method": "frozen_decoder",

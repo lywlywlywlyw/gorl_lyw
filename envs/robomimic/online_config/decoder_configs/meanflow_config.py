@@ -18,6 +18,5 @@ class MeanFlowConfig:
     meanflow_guidance_scale: float = 2.0
     use_dispersive: bool = False
     meanflow_dispersive_loss_weight: float = 0.5
-    meanflow_latent_inverse_steps: int = 32
     def to_dict(self) -> dict:
         return asdict(self)
