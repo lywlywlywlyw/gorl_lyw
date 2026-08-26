@@ -72,6 +72,7 @@ class LoadedPolicy:
     normalize_actor_observations: bool
     apply_tanh: bool
     encoder_algorithm: str
+    decoder_type: str
     episode_length: int
     checkpoint_kind: str
 
@@ -175,7 +176,8 @@ def _decoder_fields(
     parameter_checkpoint: Mapping[str, Any],
     config_checkpoint: Mapping[str, Any],
     env: Any,
-) -> tuple[Any, Any, Any, int, int]:
+) -> tuple[Any, Any, Any, int, int, str]:
+    from flow_policy.decoder_1step_fm_residualMLP import Decoder1StepFMConfig
     from flow_policy.decoder_fm import DecoderFMConfig
 
     params = parameter_checkpoint.get(
@@ -205,13 +207,41 @@ def _decoder_fields(
     ]
     if missing:
         raise KeyError("Checkpoint is missing decoder fields: " + ", ".join(missing))
-    if not isinstance(decoder_config, DecoderFMConfig):
+
+    if isinstance(decoder_config, Decoder1StepFMConfig):
+        config_decoder_type = "meanflow"
+    elif isinstance(decoder_config, DecoderFMConfig):
+        config_decoder_type = "flow_matching"
+    else:
         raise TypeError(
-            "Decoder checkpoint 'config' is not DecoderFMConfig. For a GoRL "
-            "encoder final_checkpoint.pkl, also pass its stage fm_model_*.pkl "
-            "through --decoder-checkpoint."
+            "Decoder checkpoint 'config' must be Decoder1StepFMConfig "
+            "(meanflow) or DecoderFMConfig (flow_matching), got "
+            f"{type(decoder_config).__name__}."
         )
-    return params, obs_stats, decoder_config, int(obs_dim), int(action_dim)
+    checkpoint_decoder_type = config_checkpoint.get("decoder_type")
+    if checkpoint_decoder_type is None:
+        checkpoint_decoder_type = config_decoder_type
+    if checkpoint_decoder_type == "fm":
+        checkpoint_decoder_type = "flow_matching"
+    if checkpoint_decoder_type not in ("meanflow", "flow_matching"):
+        raise ValueError(
+            "Unsupported decoder_type in checkpoint: "
+            f"{checkpoint_decoder_type!r}. Expected 'meanflow' or 'flow_matching'."
+        )
+    if checkpoint_decoder_type != config_decoder_type:
+        raise ValueError(
+            "Decoder checkpoint decoder_type does not match its config: "
+            f"decoder_type={checkpoint_decoder_type!r}, "
+            f"config={config_decoder_type!r}."
+        )
+    return (
+        params,
+        obs_stats,
+        decoder_config,
+        int(obs_dim),
+        int(action_dim),
+        checkpoint_decoder_type,
+    )
 
 
 def _actor_params(checkpoint: Mapping[str, Any]) -> Any:
@@ -263,9 +293,12 @@ def _has_encoder(checkpoint: Mapping[str, Any]) -> bool:
 
 
 def _has_decoder_config(checkpoint: Mapping[str, Any]) -> bool:
+    from flow_policy.decoder_1step_fm_residualMLP import Decoder1StepFMConfig
     from flow_policy.decoder_fm import DecoderFMConfig
 
-    return isinstance(checkpoint.get("config"), DecoderFMConfig)
+    return isinstance(
+        checkpoint.get("config"), (Decoder1StepFMConfig, DecoderFMConfig)
+    )
 
 
 def _select_checkpoint_roles(
@@ -300,7 +333,7 @@ def _select_checkpoint_roles(
             decoder_path, decoder = primary_path, primary
         else:
             raise TypeError(
-                "No DecoderFMConfig was found. If --checkpoint is a GoRL "
+                "No supported decoder config was found. If --checkpoint is a GoRL "
                 "encoder best/final_checkpoint.pkl, pass the matching stage "
                 "fm_model_*.pkl through --decoder-checkpoint."
             )
@@ -309,6 +342,7 @@ def _select_checkpoint_roles(
 
 def load_policy(config: EvaluationConfig) -> LoadedPolicy:
     from flow_policy import networks
+    from flow_policy.decoder_1step_fm_residualMLP import Decoder1StepFMState
     from flow_policy.decoder_fm import DecoderFMState
 
     (
@@ -338,7 +372,14 @@ def load_policy(config: EvaluationConfig) -> LoadedPolicy:
         if "fm_params" in encoder_checkpoint
         else decoder_checkpoint
     )
-    params, obs_stats, decoder_config, obs_dim, action_dim = _decoder_fields(
+    (
+        params,
+        obs_stats,
+        decoder_config,
+        obs_dim,
+        action_dim,
+        decoder_type,
+    ) = _decoder_fields(
         decoder_parameter_checkpoint, decoder_checkpoint, env
     )
     if (obs_dim, action_dim) != (env.observation_size, env.action_size):
@@ -348,7 +389,10 @@ def load_policy(config: EvaluationConfig) -> LoadedPolicy:
             f"environment=({env.observation_size}, {env.action_size})."
         )
 
-    decoder = DecoderFMState.init(
+    decoder_state_cls = (
+        Decoder1StepFMState if decoder_type == "meanflow" else DecoderFMState
+    )
+    decoder = decoder_state_cls.init(
         jax.random.key(config.seed + 1), obs_dim, action_dim, decoder_config
     )
     with jdc.copy_and_mutate(decoder) as decoder:
@@ -414,6 +458,7 @@ def load_policy(config: EvaluationConfig) -> LoadedPolicy:
         normalize_actor_observations=normalize_actor_observations,
         apply_tanh=apply_tanh,
         encoder_algorithm=_encoder_algorithm(encoder_checkpoint),
+        decoder_type=decoder_type,
         episode_length=episode_length,
         checkpoint_kind=_checkpoint_kind(encoder_checkpoint),
     )
@@ -606,6 +651,7 @@ def evaluate(config: EvaluationConfig) -> dict[str, Any]:
         "decoder_checkpoint": str(policy.decoder_checkpoint_path),
         "checkpoint_kind": policy.checkpoint_kind,
         "encoder_algorithm": policy.encoder_algorithm,
+        "decoder_type": policy.decoder_type,
         "dataset_path": policy.env.dataset_path,
         "episodes": config.episodes,
         "episode_length_limit": policy.episode_length,
