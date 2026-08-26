@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 class MeanFlowConfig:
     """MP1 one-step MeanFlow decoder settings."""
     meanflow_learning_rate: float = 1e-4
-    meanflow_batch_size: int = 512
+    meanflow_batch_size: int = 8192
     meanflow_num_epochs: int = 2_000_000
     meanflow_checkpoint_interval: int = 10_000
     meanflow_max_samples: int | None = None

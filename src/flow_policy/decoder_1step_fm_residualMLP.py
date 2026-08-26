@@ -405,8 +405,8 @@ class Decoder1StepFMState:
             raise ValueError("MeanFlow inversion num_steps must be positive.")
 
         obs_norm = self._normalize_obs(observations)
-        t = jnp.ones((actions.shape[0], 1))
-        r = jnp.zeros((actions.shape[0], 1))
+        t = jnp.zeros((actions.shape[0], 1))
+        r = jnp.ones((actions.shape[0], 1))
         return jax.lax.fori_loop(
             0,
             steps,

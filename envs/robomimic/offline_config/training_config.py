@@ -17,7 +17,7 @@ class TrainingConfig:
         "results/offline_fm_frozen_robomimic_"
         + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     )
-    decoder_type: str = "flow_matching"
+    decoder_type: str = "meanflow"#"flow_matching"
     encoder_type: str = "iql"
     # Optional offline checkpoint produced by run_offline_fm_frozen_robomimic.py.
     # Decoder-only checkpoints resume decoder training; combined checkpoints

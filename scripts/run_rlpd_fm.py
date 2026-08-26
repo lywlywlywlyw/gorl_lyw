@@ -225,9 +225,10 @@ def run_async_pipeline(
     evaluator_gpu_id: int = 0,
     decoder_gpu_id: int = 0,
     parent_gpu_id: int = 0,
-    decoder_type: str = "flow_matching",
 ) -> None:
     """Run collection, evaluation, and both trainers as independent processes."""
+    config = TrainingConfig().to_dict() | EnvConfig().to_dict()
+    decoder_type = config["decoder_type"]
     if decoder_type not in ("flow_matching", "meanflow"):
         raise ValueError("decoder_type must be 'flow_matching' or 'meanflow'.")
     if not np.isclose(encoder_demo_ratio + encoder_replay_ratio, 1.0):
@@ -257,7 +258,6 @@ def run_async_pipeline(
     os.environ["MUJOCO_GL"] = "egl"
     os.environ["PYOPENGL_PLATFORM"] = "egl"
     os.environ["MUJOCO_EGL_DEVICE_ID"] = str(parent_gpu_id)
-    config = TrainingConfig().to_dict() | EnvConfig().to_dict()
     from envs.robomimic.RobomimicEnv import RobomimicEnv
     env = RobomimicEnv(dataset_path=config["dataset_path"], reward_shaping=config["dense_reward"])
     obs_dim = int(env.observation_size)
@@ -442,7 +442,7 @@ def _validate_offline_checkpoint(
     expected_action_dim: int,
     expected_env_name: str,
     require_rlpd_state: bool = False,
-    decoder_type: str = "flow_matching",
+    decoder_type: str | None = None,
 ) -> Path:
     """Validate an offline FM decoder checkpoint before starting the pipeline."""
     checkpoint_path = checkpoint_path.expanduser().resolve()
@@ -505,8 +505,8 @@ def main(
     demo_buffer_path: str,
     run_dir: str | None = None,
     num_versions: int = 50,
-    encoder_train_env_steps: int = 50,
-    decoder_train_steps: int = 50,
+    encoder_train_env_steps: int = 250,
+    decoder_train_steps: int = 250,
     encoder_demo_ratio: float = 0.5,
     encoder_replay_ratio: float = 0.5,
     minimum_replay_size: int = 8192,#49152,
@@ -518,7 +518,6 @@ def main(
     decoder_gpu_id: int = 1,
     parent_gpu_id: int = 1,
     evaluator_gpu_id: int = 1,
-    decoder_type: str = "flow_matching",
 ) -> None:
     """Run the asynchronous RLPD encoder + FM decoder training pipeline."""
     run_async_pipeline(
@@ -539,7 +538,6 @@ def main(
         decoder_gpu_id=decoder_gpu_id,
         parent_gpu_id=parent_gpu_id,
         evaluator_gpu_id=evaluator_gpu_id,
-        decoder_type=decoder_type,
     )
 
 
