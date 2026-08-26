@@ -154,7 +154,6 @@ def train_fm(
         num_epochs=num_epochs,
         n_samples_per_action=1,
         normalize_observations=True,
-        normalize_actions=True,
         feather_std=0.0,
     )
 
@@ -163,7 +162,6 @@ def train_fm(
 
     with jdc.copy_and_mutate(fm_state) as fm_state:
         fm_state.obs_stats = fm_state.obs_stats.update(jnp.array(train_states))
-        fm_state.action_stats = fm_state.action_stats.update(jnp.array(train_actions))
 
     n_batches = n_train // batch_size
     best_val_loss = float("inf")
@@ -225,7 +223,6 @@ def train_fm(
             checkpoint = {
                 "params": fm_state.params,
                 "obs_stats": fm_state.obs_stats,
-                "action_stats": fm_state.action_stats,
                 "config": config,
                 "epoch": epoch + 1,
                 "train_loss": train_loss,
@@ -248,7 +245,6 @@ def train_fm(
     final_checkpoint = {
         "params": fm_state.params,
         "obs_stats": fm_state.obs_stats,
-        "action_stats": fm_state.action_stats,
         "config": config,
         "epoch": num_epochs,
         "train_loss": train_losses[-1],

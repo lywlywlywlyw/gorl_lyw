@@ -150,12 +150,9 @@ def _actor_policy_params(checkpoint: dict[str, Any]) -> Any:
 
 def _decoder_checkpoint_fields(
     checkpoint: dict[str, Any],
-) -> tuple[Any, Any, Any, Any, int, int]:
+) -> tuple[Any, Any, Any, int, int]:
     params = checkpoint.get("fm_params", checkpoint.get("params"))
     obs_stats = checkpoint.get("fm_obs_stats", checkpoint.get("obs_stats"))
-    action_stats = checkpoint.get(
-        "fm_action_stats", checkpoint.get("action_stats")
-    )
     decoder_config = checkpoint.get("config")
     obs_dim = checkpoint.get("obs_dim")
     action_dim = checkpoint.get("action_dim", checkpoint.get("z_dim"))
@@ -165,7 +162,6 @@ def _decoder_checkpoint_fields(
         for name, value in (
             ("fm_params/params", params),
             ("fm_obs_stats/obs_stats", obs_stats),
-            ("fm_action_stats/action_stats", action_stats),
             ("config", decoder_config),
             ("obs_dim", obs_dim),
             ("action_dim/z_dim", action_dim),
@@ -174,7 +170,7 @@ def _decoder_checkpoint_fields(
     ]
     if missing:
         raise KeyError("Checkpoint is missing decoder fields: " + ", ".join(missing))
-    return params, obs_stats, action_stats, decoder_config, int(obs_dim), int(action_dim)
+    return params, obs_stats, decoder_config, int(obs_dim), int(action_dim)
 
 
 def load_policy(config: Config) -> LoadedPolicy:
@@ -184,7 +180,6 @@ def load_policy(config: Config) -> LoadedPolicy:
     (
         decoder_params,
         decoder_obs_stats,
-        decoder_action_stats,
         decoder_config,
         obs_dim,
         action_dim,
@@ -207,7 +202,6 @@ def load_policy(config: Config) -> LoadedPolicy:
     with jdc.copy_and_mutate(decoder) as decoder:
         decoder.params = decoder_params
         decoder.obs_stats = decoder_obs_stats
-        decoder.action_stats = decoder_action_stats
 
     offline_config = _offline_config(checkpoint)
     online_config = checkpoint.get("online_encoder_config")

@@ -316,23 +316,6 @@ def split_indices(
     validation_size = min(size - 1, max(1, int(size * validation_fraction)))
     return permutation[validation_size:], permutation[:validation_size]
 
-
-def inverse_fm_batch(decoder: Any, observations: Array, actions: Array, num_steps: int) -> Array:
-    if isinstance(decoder, Decoder1StepFMState):
-        # MP1 MeanFlow has a one-step implicit decoder: a = z - u(z, 1, 0).
-        # Its inverse is consequently fixed-point solving z = a + u(z, 1, 0),
-        # rather than reverse integration of an FM ODE.
-        obs_norm, action = decoder._normalize_obs(observations), decoder._normalize_action(actions)
-        t, r = jnp.ones((actions.shape[0], 1)), jnp.zeros((actions.shape[0], 1))
-        return jax.lax.fori_loop(0, num_steps, lambda _, z: action + decoder.meanflow_forward(obs_norm, z, t, r), action)
-    obs_norm = (observations - decoder.obs_stats.mean) / (decoder.obs_stats.std + 1e-8)
-    times = jnp.linspace(0.0, 1.0, num_steps + 1)
-    def step(x_t: Array, pair: tuple[Array, Array]) -> tuple[Array, None]:
-        current, following = pair
-        t = jnp.full((*x_t.shape[:-1], 1), current)
-        return x_t + (following-current) * decoder.flow_forward(obs_norm, x_t, decoder.embed_timestep(t)), None
-    return jax.lax.scan(step, actions, (times[:-1], times[1:]))[0]
-
 def forward_fm_batch(
     decoder: Any, observations: Array, latents: Array
 ) -> Array:
@@ -362,7 +345,7 @@ def build_latent_targets(
     inverse_steps: int,
 ) -> np.ndarray:
     invert = jax.jit(
-        lambda obs, act: inverse_fm_batch(decoder, obs, act, inverse_steps)
+        lambda obs, act: decoder.inverse_fm_batch(obs, act, inverse_steps)
     )
     chunks = []
     for start in trange(
@@ -418,7 +401,7 @@ def decoder_metrics(
     obs = jnp.asarray(buffer.observations[indices])
     actions = jnp.asarray(buffer.actions[indices])
     latents = jax.jit(
-        lambda o, a: inverse_fm_batch(decoder, o, a, inverse_steps)
+        lambda o, a: decoder.inverse_fm_batch(o, a, inverse_steps)
     )(obs, actions)
     reconstructed = jax.jit(
         lambda o, z: forward_fm_batch(decoder, o, z)
@@ -758,11 +741,6 @@ def restore_decoder(
     with jdc.copy_and_mutate(decoder) as restored:
         restored.params = params
         restored.obs_stats = obs_stats
-        if isinstance(restored, Decoder1StepFMState):
-            action_stats = checkpoint.get("action_stats")
-            if action_stats is None:
-                raise KeyError("MeanFlow checkpoint is missing action_stats.")
-            restored.action_stats = action_stats
         if "decoder_opt_state" in checkpoint:
             restored.opt_state = checkpoint["decoder_opt_state"]
         if "decoder_prng" in checkpoint:
@@ -793,7 +771,6 @@ def save_decoder_checkpoint(
         # Keep the standard standalone decoder fields for interoperability.
         "params": decoder.params,
         "obs_stats": decoder.obs_stats,
-        "action_stats": getattr(decoder, "action_stats", None),
         "config": decoder.config,
         "obs_dim": int(decoder.obs_stats.mean.shape[-1]),
         "action_dim": action_dim,
@@ -853,7 +830,6 @@ def save_offline_checkpoint(
         # Frozen FM decoder loaded by the RLPD training component.
         "params": decoder.params,
         "obs_stats": decoder.obs_stats,
-        "action_stats": getattr(decoder, "action_stats", None),
         "config": decoder.config,
         "obs_dim": obs_dim,
         "action_dim": action_dim,
@@ -959,13 +935,12 @@ def main(config: ConfigView) -> None:
                 policy_output_scale=config.meanflow_policy_output_scale, learning_rate=config.decoder_learning_rate,
                 batch_size=config.decoder_batch_size, num_epochs=config.decoder_max_epochs,
                 normalize_observations=config.meanflow_normalize_observations,
-                normalize_actions=config.meanflow_normalize_actions, flow_ratio=config.meanflow_flow_ratio,
+                flow_ratio=config.meanflow_flow_ratio,
                 inverse_steps=config.latent_inverse_steps, guidance_scale=config.meanflow_guidance_scale, dispersive_loss_weight=config.meanflow_dispersive_loss_weight,
             )
             decoder = Decoder1StepFMState.init(decoder_key, obs_dim, action_dim, decoder_config)
             with jdc.copy_and_mutate(decoder) as decoder:
                 decoder.obs_stats = decoder.obs_stats.update(jnp.asarray(buffer.observations))
-                decoder.action_stats = decoder.action_stats.update(jnp.asarray(buffer.actions))
         else:
             decoder_config = DecoderFMConfig(flow_steps=config.flow_steps, timestep_embed_dim=config.timestep_embed_dim,
                 hidden_dims=(config.decoder_hidden_size,) * config.decoder_num_layers,

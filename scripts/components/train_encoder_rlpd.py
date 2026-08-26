@@ -165,36 +165,20 @@ def _load_encoder_demo_buffer(path: str | None, obs_dim: int, action_dim: int):
     return arrays
 
 
-def _inverse_fm_batch(
-    decoder: DecoderFMState,
+def _inverse_decoder_batch(
+    decoder: DecoderFMState | Decoder1StepFMState,
     observations: np.ndarray,
     actions: np.ndarray,
 ) -> np.ndarray:
-    """Map environment actions back to the fixed decoder's input latent ``z``.
-
-    ``DecoderFMState.sample_action_from_z`` integrates the learned flow from
-    ``t=1`` (latent) to ``t=0`` (environment action).  Encoder training needs
-    actions expressed in exactly that decoder's latent coordinates, so this
-    function integrates the same vector field in the opposite direction.
-    """
-    obs = jnp.asarray(observations)
-    x = jnp.asarray(actions)
-    if obs.ndim != 2 or x.ndim != 2:
-        raise ValueError("Inverse FM expects batched rank-2 observations and actions.")
-    if obs.shape[0] != x.shape[0]:
-        raise ValueError("Inverse FM observations and actions must have equal batch size.")
-    if isinstance(decoder, Decoder1StepFMState):
-        obs_norm, action = decoder._normalize_obs(obs), decoder._normalize_action(x)
-        t, r = jnp.ones((x.shape[0], 1)), jnp.zeros((x.shape[0], 1))
-        latent = jax.lax.fori_loop(0, decoder.config.inverse_steps, lambda _, z: action + decoder.meanflow_forward(obs_norm, z, t, r), action)
-        return np.asarray(jax.device_get(latent), dtype=np.float32)
-    obs_norm = ((obs - decoder.obs_stats.mean) / (decoder.obs_stats.std + 1e-8) if decoder.config.normalize_observations else obs)
-    times = jnp.linspace(0.0, 1.0, decoder.config.flow_steps + 1)
-    def step(x_t, pair):
-        current, following = pair
-        t = jnp.full((*x_t.shape[:-1], 1), current)
-        return x_t + (following-current) * decoder.flow_forward(obs_norm, x_t, decoder.embed_timestep(t)), None
-    return np.asarray(jax.device_get(jax.lax.scan(step, x, (times[:-1], times[1:]))[0]), dtype=np.float32)
+    """Call the frozen decoder's own environment-action inversion method."""
+    latent = decoder.inverse_fm_batch(
+        jnp.asarray(observations),
+        jnp.asarray(actions),
+        decoder.config.inverse_steps
+        if isinstance(decoder, Decoder1StepFMState)
+        else decoder.config.flow_steps,
+    )
+    return np.asarray(jax.device_get(latent), dtype=np.float32)
 
 
 def _sample_mixed_batch(
@@ -227,7 +211,7 @@ def _sample_mixed_batch(
         # Even a freshly collected latent was produced before this optimizer
         # update and must not bypass the fixed decoder coordinate transform.
         pieces["actions"].append(
-            _inverse_fm_batch(
+            _inverse_decoder_batch(
                 decoder, sampled["observations"], sampled["actions"]
             )
         )
@@ -240,7 +224,7 @@ def _sample_mixed_batch(
         demo_obs = demo["observations"][indices]
         pieces["observations"].append(demo_obs)
         pieces["actions"].append(
-            _inverse_fm_batch(decoder, demo_obs, demo["env_actions"][indices])
+            _inverse_decoder_batch(decoder, demo_obs, demo["env_actions"][indices])
         )
         for key in ("rewards", "next_observations", "masks"):
             pieces[key].append(demo[key][indices])
@@ -286,7 +270,7 @@ def _sample_async_mixed_batch(
         # Deliberately reconstruct every latent, including fresh replay data.
         # Thus no latent from a collector or an older stage is treated as GT.
         pieces["actions"].append(
-            _inverse_fm_batch(decoder, sampled["observations"], sampled["actions"])
+            _inverse_decoder_batch(decoder, sampled["observations"], sampled["actions"])
         )
         for key in ("rewards", "next_observations", "masks"):
             pieces[key].append(sampled[key])
@@ -321,7 +305,6 @@ def _checkpoint(
         "config": encoder_config,
         "env_name": config["env_name"],
         "decoder_type": config["decoder_type"],
-        "action_stats": getattr(agent.fm_state, "action_stats", None),
         "final_iteration": iteration,
         "best_reward": best_reward,
         "z_dim": z_dim,
@@ -437,7 +420,6 @@ def train_async_stage(
     decoder_state = state_cls.init(jax.random.PRNGKey(config["seed"] + 1000 + version), decoder_checkpoint["obs_dim"], decoder_checkpoint["action_dim"], decoder_checkpoint["config"])
     with jdc.copy_and_mutate(decoder_state) as decoder_state:
         decoder_state.params, decoder_state.obs_stats = decoder_checkpoint["params"], decoder_checkpoint["obs_stats"]
-        if decoder_type == "meanflow": decoder_state.action_stats = decoder_checkpoint["action_stats"]
 
     demo = load_transition_data(demo_buffer_path)
     replay = load_transition_data(replay_snapshot_path)
@@ -661,7 +643,6 @@ def main(
     decoder_state = state_cls.init(jax.random.PRNGKey(config["seed"] + 1000), decoder_checkpoint["obs_dim"], decoder_checkpoint["action_dim"], decoder_checkpoint["config"])
     with jdc.copy_and_mutate(decoder_state) as state:
         state.params, state.obs_stats = decoder_checkpoint["params"], decoder_checkpoint["obs_stats"]
-        if decoder_type == "meanflow": state.action_stats = decoder_checkpoint["action_stats"]
     agent = EncoderFMAgent(ppo_z_state=encoder_state, fm_state=decoder_state)
     rollout_state = BatchedRolloutStateEncoderFM.init(
         env, jax.random.key(config["seed"] + 1), config["num_envs"]

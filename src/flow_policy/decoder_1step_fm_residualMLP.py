@@ -154,7 +154,6 @@ class Decoder1StepFMConfig:
     n_samples_per_action: jdc.Static[int] = 1
 
     normalize_observations: jdc.Static[bool] = True
-    normalize_actions: jdc.Static[bool] = False
     normalization_mode: jdc.Static[str] = "limits"
     flow_ratio: float = 0.5
     time_dist: jdc.Static[str] = "lognorm"
@@ -225,7 +224,6 @@ class Decoder1StepFMState:
     config: Decoder1StepFMConfig
     params: Any
     obs_stats: NormalizationStats
-    action_stats: NormalizationStats
     obs_dim: jdc.Static[int]
     action_dim: jdc.Static[int]
     opt: jdc.Static[optax.GradientTransformation]
@@ -267,7 +265,6 @@ class Decoder1StepFMState:
             config=config,
             params=params,
             obs_stats=NormalizationStats.init((obs_dim,)),
-            action_stats=NormalizationStats.init((action_dim,)),
             obs_dim=obs_dim,
             action_dim=action_dim,
             opt=opt,
@@ -330,23 +327,6 @@ class Decoder1StepFMState:
             return self._normalize_with_stats(obs, self.obs_stats)
         return obs
 
-    def _normalize_action(self, action: Array) -> Array:
-        if self.config.normalize_actions:
-            return self._normalize_with_stats(action, self.action_stats)
-        return action
-
-    def _unnormalize_action(self, action: Array) -> Array:
-        if self.config.normalize_actions:
-            stats = self.action_stats
-            if self.config.normalization_mode == "gaussian":
-                return action * (stats.std + 1e-8) + stats.mean
-            data_range = stats.maximum - stats.minimum
-            regular = data_range >= 1e-4
-            scale = jnp.where(regular, 2.0 / data_range, 1.0)
-            offset = jnp.where(regular, -1.0 - scale * stats.minimum, -stats.minimum)
-            return (action - offset) / scale
-        return action
-
     def _normalize_with_stats(
         self, value: Array, stats: NormalizationStats
     ) -> Array:
@@ -373,7 +353,6 @@ class Decoder1StepFMState:
         prng_sample, prng_feather = jax.random.split(prng)
         z = jax.random.normal(prng_sample, (batch_size, self.action_dim))
         action = self._decode_normalized(obs_norm, z)
-        action = self._unnormalize_action(action)
         if not deterministic:
             action += (
                 jax.random.normal(prng_feather, action.shape)
@@ -397,10 +376,44 @@ class Decoder1StepFMState:
         single_obs = obs.ndim == 1
         if single_obs:
             obs_norm, z = obs_norm[None, :], z[None, :]
-        action = self._unnormalize_action(self._decode_normalized(obs_norm, z))
+        action = self._decode_normalized(obs_norm, z)
         if not deterministic:
             action += jax.random.normal(prng, action.shape) * self.config.feather_std
         return action[0] if single_obs else action
+
+    def inverse_fm_batch(
+        self,
+        observations: Array,
+        actions: Array,
+        num_steps: int | None = None,
+    ) -> Array:
+        """Invert actions with ``z <- action + u(obs, z, 1, 0)``.
+
+        MeanFlow and the original FM decoder both operate directly in the
+        environment action coordinate system; no action statistics are used.
+        """
+        if observations.ndim != 2 or actions.ndim != 2:
+            raise ValueError(
+                "MeanFlow inversion expects rank-2 observations and actions."
+            )
+        if observations.shape[0] != actions.shape[0]:
+            raise ValueError(
+                "MeanFlow inversion observations and actions must share a batch size."
+            )
+        steps = self.config.inverse_steps if num_steps is None else num_steps
+        if steps <= 0:
+            raise ValueError("MeanFlow inversion num_steps must be positive.")
+
+        obs_norm = self._normalize_obs(observations)
+        t = jnp.ones((actions.shape[0], 1))
+        r = jnp.zeros((actions.shape[0], 1))
+        return jax.lax.fori_loop(
+            0,
+            steps,
+            lambda _, latent: actions
+            + self.meanflow_forward(obs_norm, latent, t, r),
+            actions,
+        )
 
     def sample_t_r(
         self, prng: Array, batch_size: int
@@ -527,10 +540,9 @@ class Decoder1StepFMState:
         params: Any | None = None,
     ) -> tuple[Array, Array, Array, Array]:
         params = self.params if params is None else params
-        action_norm = self._normalize_action(action)
-        x_t = t * eps + (1.0 - t) * action_norm
-        x_r = r * eps + (1.0 - r) * action_norm
-        v = eps - action_norm
+        x_t = t * eps + (1.0 - t) * action
+        x_r = r * eps + (1.0 - r) * action
+        v = eps - action
 
         def model_fn(
             z_arg: Array, t_arg: Array, r_arg: Array

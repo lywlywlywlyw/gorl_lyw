@@ -73,7 +73,6 @@ def _load_policy_pair(
     decoder_state = state_cls.init(jax.random.PRNGKey(config["seed"] + 1000), decoder_checkpoint["obs_dim"], decoder_checkpoint["action_dim"], decoder_checkpoint["config"])
     with jdc.copy_and_mutate(decoder_state) as decoder_state:
         decoder_state.params, decoder_state.obs_stats = decoder_checkpoint["params"], decoder_checkpoint["obs_stats"]
-        if decoder_type == "meanflow": decoder_state.action_stats = decoder_checkpoint["action_stats"]
     return EncoderFMAgent(ppo_z_state=encoder_state, fm_state=decoder_state), bool(
         encoder_config.apply_tanh_in_rollout
     )

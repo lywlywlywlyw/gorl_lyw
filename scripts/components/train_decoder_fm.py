@@ -86,10 +86,6 @@ def train_async_stage(
     with jdc.copy_and_mutate(fm_state) as fm_state:
         fm_state.params = previous["params"]
         fm_state.obs_stats = previous["obs_stats"]
-        if decoder_type == "meanflow":
-            if previous.get("action_stats") is None:
-                raise ValueError("MeanFlow checkpoint is missing action_stats.")
-            fm_state.action_stats = previous["action_stats"]
         if inherit_optimizer_state:
             fm_state.opt_state = previous["decoder_opt_state"]
         if "decoder_prng" in previous:
@@ -97,7 +93,6 @@ def train_async_stage(
         if "decoder_steps" in previous:
             fm_state.steps = previous["decoder_steps"]
         fm_state.obs_stats = fm_state.obs_stats.update(jnp.asarray(states))
-        if decoder_type == "meanflow": fm_state.action_stats = fm_state.action_stats.update(jnp.asarray(actions))
 
     rng = np.random.default_rng(config["seed"] + version)
     batch_size = int(decoder_config.batch_size)
@@ -126,7 +121,6 @@ def train_async_stage(
         "decoder_opt_state": fm_state.opt_state,
         "decoder_prng": fm_state.prng,
         "decoder_steps": fm_state.steps,
-        "action_stats": getattr(fm_state, "action_stats", None),
         "config": decoder_config,
         "obs_dim": int(previous["obs_dim"]),
         "action_dim": int(previous["action_dim"]),

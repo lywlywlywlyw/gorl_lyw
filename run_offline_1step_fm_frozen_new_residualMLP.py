@@ -849,7 +849,6 @@ def save_compatible_checkpoint(
         # Standalone FM schema loaded by train_encoder_ppo.py.
         "params": decoder.params,
         "obs_stats": decoder.obs_stats,
-        "action_stats": decoder.action_stats,
         "config": decoder.config,
         "obs_dim": obs_dim,
         "action_dim": action_dim,
@@ -863,7 +862,6 @@ def save_compatible_checkpoint(
         "z_dim": action_dim,
         "fm_params": decoder.params,
         "fm_obs_stats": decoder.obs_stats,
-        "fm_action_stats": decoder.action_stats,
         "online_encoder_config": online_config,
         # Offline-only training state/metadata.
         "offline_config": asdict(config),
@@ -900,7 +898,6 @@ def save_encoder_checkpoint(
         "z_dim": decoder.action_dim,
         "fm_params": decoder.params,
         "fm_obs_stats": decoder.obs_stats,
-        "fm_action_stats": decoder.action_stats,
     }
     with open(path, "wb") as file:
         pickle.dump(checkpoint, file)
@@ -970,7 +967,6 @@ def main(config: FrozenOfflineConfig) -> None:
             n_samples_per_action=config.n_fm_samples_per_action,
             dispersive_chunk_size=config.decoder_dispersive_chunk_size,
             normalize_observations=True,
-            normalize_actions=False,
             use_lbifm=config.use_lbifm,
             feather_std=0.0,
         )
@@ -980,9 +976,6 @@ def main(config: FrozenOfflineConfig) -> None:
         with jdc.copy_and_mutate(decoder) as decoder:
             decoder.obs_stats = decoder.obs_stats.update(
                 jnp.asarray(buffer.observations)
-            )
-            decoder.action_stats = decoder.action_stats.update(
-                jnp.asarray(buffer.actions)
             )
 
         # Keep the same policy/value layer layouts used by EncoderState.init,

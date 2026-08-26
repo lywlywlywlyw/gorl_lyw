@@ -466,8 +466,6 @@ def _validate_offline_checkpoint(
     checkpoint_type = checkpoint.get("decoder_type", "flow_matching")
     if checkpoint_type != decoder_type:
         raise ValueError(f"Checkpoint decoder_type={checkpoint_type!r} does not match {decoder_type!r}: {checkpoint_path}")
-    if checkpoint_type == "meanflow" and checkpoint.get("action_stats") is None:
-        raise ValueError(f"MeanFlow checkpoint is missing action_stats: {checkpoint_path}")
     if int(checkpoint["obs_dim"]) != expected_obs_dim:
         raise ValueError(
             f"Checkpoint obs_dim={checkpoint['obs_dim']} does not match online "

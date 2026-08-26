@@ -50,7 +50,6 @@ def main(
         num_epochs=1,
         n_samples_per_action=1,
         normalize_observations=True,
-        normalize_actions=True,
         feather_std=0.0,
     )
 
@@ -66,7 +65,6 @@ def main(
     checkpoint = {
         "params": fm_state.params,
         "obs_stats": fm_state.obs_stats,
-        "action_stats": fm_state.action_stats,
         "config": config,
         "obs_dim": obs_dim,
         "action_dim": action_dim,

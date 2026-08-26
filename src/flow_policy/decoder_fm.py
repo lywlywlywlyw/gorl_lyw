@@ -111,6 +111,53 @@ class DecoderFMState:
         scaled_t = t * (2 ** freqs[None, :])
         return jnp.concatenate([jnp.cos(scaled_t), jnp.sin(scaled_t)], axis=-1)
 
+    def inverse_fm_batch(
+        self,
+        observations: Array,
+        actions: Array,
+        num_steps: int | None = None,
+    ) -> Array:
+        """Map environment actions back to this decoder's input latent ``z``.
+
+        ``sample_action_from_z`` integrates the learned flow from ``t=1``
+        (latent) to ``t=0`` (environment action). This method integrates the
+        same vector field in the opposite direction. ``num_steps`` is retained
+        for compatibility with existing callers; when omitted, the decoder's
+        configured number of flow steps is used.
+        """
+        observations = jnp.asarray(observations)
+        actions = jnp.asarray(actions)
+        if observations.ndim != 2 or actions.ndim != 2:
+            raise ValueError(
+                "Inverse FM expects batched rank-2 observations and actions."
+            )
+        if observations.shape[0] != actions.shape[0]:
+            raise ValueError(
+                "Inverse FM observations and actions must have equal batch size."
+            )
+        if num_steps is None:
+            num_steps = self.config.flow_steps
+        if num_steps <= 0:
+            raise ValueError("Inverse FM num_steps must be positive.")
+
+        obs_norm = (
+            (observations - self.obs_stats.mean) / (self.obs_stats.std + 1e-8)
+            if self.config.normalize_observations
+            else observations
+        )
+        times = jnp.linspace(0.0, 1.0, num_steps + 1)
+
+        def step(x_t: Array, pair: tuple[Array, Array]) -> tuple[Array, None]:
+            current, following = pair
+            t = jnp.full((*x_t.shape[:-1], 1), current)
+            velocity = self.flow_forward(
+                obs_norm, x_t, self.embed_timestep(t)
+            )
+            return x_t + (following - current) * velocity, None
+
+        latent, _ = jax.lax.scan(step, actions, (times[:-1], times[1:]))
+        return latent
+
     def flow_forward(
         self,
         obs_norm: Array,

@@ -12,7 +12,6 @@ class MeanFlowConfig:
     meanflow_mlp_expansion: int = 2
     meanflow_policy_output_scale: float = 1.0
     meanflow_normalize_observations: bool = True
-    meanflow_normalize_actions: bool = False
     meanflow_flow_ratio: float = 0.5
     meanflow_guidance_scale: float = 2.0
     meanflow_dispersive_loss_weight: float = 0.5

@@ -439,8 +439,6 @@ def load_states(
     with jdc.copy_and_mutate(decoder) as decoder:
         decoder.params = checkpoint["params"]
         decoder.obs_stats = checkpoint["obs_stats"]
-        if "action_stats" in checkpoint:
-            decoder.action_stats = checkpoint["action_stats"]
         decoder.config = jdc.replace(
             decoder.config,
             learning_rate=config.fm_learning_rate,
@@ -530,7 +528,6 @@ def save_checkpoint(
     payload = {
         "params": decoder.params,
         "obs_stats": decoder.obs_stats,
-        "action_stats": decoder.action_stats,
         "config": decoder.config,
         "obs_dim": int(decoder.obs_stats.mean.shape[-1]),
         "action_dim": decoder.action_dim,
@@ -538,7 +535,6 @@ def save_checkpoint(
         "ppo_z_obs_stats": agent.ppo_z_state.obs_stats,
         "fm_params": decoder.params,
         "fm_obs_stats": decoder.obs_stats,
-        "fm_action_stats": decoder.action_stats,
         "env_name": source_env,
         "d4rl_dataset": config.d4rl_dataset,
         "decoder_type": "1step_fm",
@@ -781,9 +777,6 @@ def train_decoder(
     decoder = agent.fm_state
     with jdc.copy_and_mutate(decoder) as decoder:
         decoder.obs_stats = decoder.obs_stats.update(jnp.asarray(obs[train_rows]))
-        decoder.action_stats = decoder.action_stats.update(
-            jnp.asarray(actions[train_rows])
-        )
     best_params = jax.tree.map(jnp.copy, decoder.params)
     best_opt_state = jax.tree.map(jnp.copy, decoder.opt_state)
     best_steps = jnp.copy(decoder.steps)
