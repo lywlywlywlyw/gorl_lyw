@@ -936,7 +936,7 @@ def main(config: ConfigView) -> None:
                 batch_size=config.decoder_batch_size, num_epochs=config.decoder_max_epochs,
                 normalize_observations=config.meanflow_normalize_observations,
                 flow_ratio=config.meanflow_flow_ratio,
-                inverse_steps=config.latent_inverse_steps, guidance_scale=config.meanflow_guidance_scale, dispersive_loss_weight=config.meanflow_dispersive_loss_weight,
+                inverse_steps=config.latent_inverse_steps, guidance_scale=config.meanflow_guidance_scale, use_dispersive=config.use_dispersive, dispersive_loss_weight=config.meanflow_dispersive_loss_weight,
             )
             decoder = Decoder1StepFMState.init(decoder_key, obs_dim, action_dim, decoder_config)
             with jdc.copy_and_mutate(decoder) as decoder:

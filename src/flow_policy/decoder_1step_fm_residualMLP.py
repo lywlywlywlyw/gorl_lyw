@@ -162,6 +162,7 @@ class Decoder1StepFMConfig:
     adaptive_loss_gamma: float = 0.5
     adaptive_loss_c: float = 1e-3
     guidance_scale: float = 2.0
+    use_dispersive: jdc.Static[bool] = False
     dispersive_loss_weight: float = 0.5
     bifm_loss_weight: float = 0.05
     warm_up_epoch = 2000
@@ -562,10 +563,13 @@ class Decoder1StepFMState:
         )
         target = jax.lax.stop_gradient(v_hat - (t - r) * dudt)
         meanflow_loss = self.adaptive_l2_loss(u - target)
-        dis_loss = sum(
-            (self.dispersive_loss(feature) for feature in features),
-            start=jnp.zeros(()),
-        )
+        if self.config.use_dispersive:
+            dis_loss = sum(
+                (self.dispersive_loss(feature) for feature in features),
+                start=jnp.zeros(()),
+            )
+        else:
+            dis_loss = jnp.zeros(())
         bifm_loss = jnp.zeros(())
         if self.config.use_lbifm:
             backward_u, _ = model_fn(x_r, r, t)
