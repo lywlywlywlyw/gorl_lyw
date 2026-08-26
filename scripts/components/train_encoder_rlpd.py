@@ -25,6 +25,7 @@ from envs.robomimic.online_config.training_config import TrainingConfig
 from flow_policy import encoder_rlpd
 from flow_policy.agent import EncoderFMAgent
 from flow_policy.decoder_fm import DecoderFMState
+from flow_policy.decoder_1step_fm_residualMLP import Decoder1StepFMState
 from flow_policy.rollout_encoder import (
     BatchedRolloutStateEncoderFM,
     eval_policy_encoder_fm,
@@ -182,21 +183,18 @@ def _inverse_fm_batch(
         raise ValueError("Inverse FM expects batched rank-2 observations and actions.")
     if obs.shape[0] != x.shape[0]:
         raise ValueError("Inverse FM observations and actions must have equal batch size.")
-    obs_norm = (
-        (obs - decoder.obs_stats.mean) / (decoder.obs_stats.std + 1e-8)
-        if decoder.config.normalize_observations
-        else obs
-    )
+    if isinstance(decoder, Decoder1StepFMState):
+        obs_norm, action = decoder._normalize_obs(obs), decoder._normalize_action(x)
+        t, r = jnp.ones((x.shape[0], 1)), jnp.zeros((x.shape[0], 1))
+        latent = jax.lax.fori_loop(0, decoder.config.inverse_steps, lambda _, z: action + decoder.meanflow_forward(obs_norm, z, t, r), action)
+        return np.asarray(jax.device_get(latent), dtype=np.float32)
+    obs_norm = ((obs - decoder.obs_stats.mean) / (decoder.obs_stats.std + 1e-8) if decoder.config.normalize_observations else obs)
     times = jnp.linspace(0.0, 1.0, decoder.config.flow_steps + 1)
-
     def step(x_t, pair):
         current, following = pair
         t = jnp.full((*x_t.shape[:-1], 1), current)
-        velocity = decoder.flow_forward(obs_norm, x_t, decoder.embed_timestep(t))
-        return x_t + (following - current) * velocity, None
-
-    latent, _ = jax.lax.scan(step, x, (times[:-1], times[1:]))
-    return np.asarray(jax.device_get(latent), dtype=np.float32)
+        return x_t + (following-current) * decoder.flow_forward(obs_norm, x_t, decoder.embed_timestep(t)), None
+    return np.asarray(jax.device_get(jax.lax.scan(step, x, (times[:-1], times[1:]))[0]), dtype=np.float32)
 
 
 def _sample_mixed_batch(
@@ -322,7 +320,8 @@ def _checkpoint(
         "fm_obs_stats": agent.fm_state.obs_stats,
         "config": encoder_config,
         "env_name": config["env_name"],
-        "decoder_type": "fm",
+        "decoder_type": config["decoder_type"],
+        "action_stats": getattr(agent.fm_state, "action_stats", None),
         "final_iteration": iteration,
         "best_reward": best_reward,
         "z_dim": z_dim,
@@ -341,6 +340,7 @@ def train_async_stage(
     replay_ratio: float = 0.5,
     metrics_file: str | None = None,
     inherit_optimizer_state: bool = True,
+    decoder_type: str = "flow_matching",
 ) -> None:
     """Train one immutable Encoder_n stage without collecting environment data.
 
@@ -354,6 +354,7 @@ def train_async_stage(
         raise ValueError("encoder demo/replay ratios must sum to 1.0.")
 
     config = TrainingConfig().to_dict() | EnvConfig().to_dict()
+    config["decoder_type"] = decoder_type
     env = RobomimicEnv(
         dataset_path=config["dataset_path"], reward_shaping=config["dense_reward"]
     )
@@ -430,14 +431,13 @@ def train_async_stage(
 
     with Path(decoder_checkpoint_path).expanduser().open("rb") as file:
         decoder_checkpoint = pickle.load(file)
-    decoder_state = DecoderFMState.init(
-        jax.random.PRNGKey(config["seed"] + 1000 + version),
-        decoder_checkpoint["obs_dim"], decoder_checkpoint["action_dim"],
-        decoder_checkpoint["config"],
-    )
+    checkpoint_type = decoder_checkpoint.get("decoder_type", "flow_matching")
+    if checkpoint_type != decoder_type: raise ValueError("Fixed decoder type does not match pipeline type.")
+    state_cls = Decoder1StepFMState if decoder_type == "meanflow" else DecoderFMState
+    decoder_state = state_cls.init(jax.random.PRNGKey(config["seed"] + 1000 + version), decoder_checkpoint["obs_dim"], decoder_checkpoint["action_dim"], decoder_checkpoint["config"])
     with jdc.copy_and_mutate(decoder_state) as decoder_state:
-        decoder_state.params = decoder_checkpoint["params"]
-        decoder_state.obs_stats = decoder_checkpoint["obs_stats"]
+        decoder_state.params, decoder_state.obs_stats = decoder_checkpoint["params"], decoder_checkpoint["obs_stats"]
+        if decoder_type == "meanflow": decoder_state.action_stats = decoder_checkpoint["action_stats"]
 
     demo = load_transition_data(demo_buffer_path)
     replay = load_transition_data(replay_snapshot_path)
@@ -527,8 +527,8 @@ def main(
     replay_buffer_path: str | None = None,
 ) -> None:
     config = TrainingConfig().to_dict() | EnvConfig().to_dict()
-    if config["decoder_type"] != "fm":
-        raise ValueError("train_encoder_rlpd.py currently supports the FM decoder only.")
+    if config["decoder_type"] not in ("flow_matching", "meanflow"):
+        raise ValueError("decoder_type must be 'flow_matching' or 'meanflow'.")
     total_timesteps = config["encoder_num_timesteps"] if num_timesteps is None else num_timesteps
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     results_dir = Path("results") / f"encoder_rlpd_fm_{config['env_name']}_{exp_name}_{timestamp}"
@@ -654,15 +654,14 @@ def main(
             f"offline IQL checkpoint: {encoder_model_path}"
         )
 
-    decoder_state = DecoderFMState.init(
-        jax.random.PRNGKey(config["seed"] + 1000),
-        decoder_checkpoint["obs_dim"],
-        decoder_checkpoint["action_dim"],
-        decoder_checkpoint["config"],
-    )
+    decoder_type = decoder_checkpoint.get("decoder_type", config["decoder_type"])
+    if decoder_type != config["decoder_type"]:
+        raise ValueError("Decoder checkpoint type does not match configured decoder_type.")
+    state_cls = Decoder1StepFMState if decoder_type == "meanflow" else DecoderFMState
+    decoder_state = state_cls.init(jax.random.PRNGKey(config["seed"] + 1000), decoder_checkpoint["obs_dim"], decoder_checkpoint["action_dim"], decoder_checkpoint["config"])
     with jdc.copy_and_mutate(decoder_state) as state:
-        state.params = decoder_checkpoint["params"]
-        state.obs_stats = decoder_checkpoint["obs_stats"]
+        state.params, state.obs_stats = decoder_checkpoint["params"], decoder_checkpoint["obs_stats"]
+        if decoder_type == "meanflow": state.action_stats = decoder_checkpoint["action_stats"]
     agent = EncoderFMAgent(ppo_z_state=encoder_state, fm_state=decoder_state)
     rollout_state = BatchedRolloutStateEncoderFM.init(
         env, jax.random.key(config["seed"] + 1), config["num_envs"]

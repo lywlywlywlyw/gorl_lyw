@@ -21,6 +21,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from flow_policy import encoder_ppo, encoder_rlpd
 from flow_policy.decoder_fm import DecoderFMState
+from flow_policy.decoder_1step_fm_residualMLP import Decoder1StepFMState
 from flow_policy.agent import EncoderFMAgent
 from flow_policy.rollout_encoder import (
     BatchedRolloutStateEncoderFM,
@@ -66,14 +67,13 @@ def _load_policy_pair(
             key = f"rlpd_z_{name}"
             if key in encoder_checkpoint:
                 setattr(encoder_state, name, encoder_checkpoint[key])
-    decoder_state = DecoderFMState.init(
-        jax.random.PRNGKey(config["seed"] + 1000),
-        decoder_checkpoint["obs_dim"], decoder_checkpoint["action_dim"],
-        decoder_checkpoint["config"],
-    )
+    decoder_type = decoder_checkpoint.get("decoder_type", config["decoder_type"])
+    if decoder_type != config["decoder_type"]: raise ValueError("Policy checkpoint decoder type does not match pipeline type.")
+    state_cls = Decoder1StepFMState if decoder_type == "meanflow" else DecoderFMState
+    decoder_state = state_cls.init(jax.random.PRNGKey(config["seed"] + 1000), decoder_checkpoint["obs_dim"], decoder_checkpoint["action_dim"], decoder_checkpoint["config"])
     with jdc.copy_and_mutate(decoder_state) as decoder_state:
-        decoder_state.params = decoder_checkpoint["params"]
-        decoder_state.obs_stats = decoder_checkpoint["obs_stats"]
+        decoder_state.params, decoder_state.obs_stats = decoder_checkpoint["params"], decoder_checkpoint["obs_stats"]
+        if decoder_type == "meanflow": decoder_state.action_stats = decoder_checkpoint["action_stats"]
     return EncoderFMAgent(ppo_z_state=encoder_state, fm_state=decoder_state), bool(
         encoder_config.apply_tanh_in_rollout
     )
@@ -181,6 +181,7 @@ def run_async_collector(
     rollout_steps: int = 100,
     replay_capacity: int | None = None,
     metrics_file: str | None = None,
+    decoder_type: str = "flow_matching",
 ) -> None:
     """Continuously collect transitions with the latest complete Policy_n.
 
@@ -188,6 +189,7 @@ def run_async_collector(
     cannot block collection or skip intermediate policy versions.
     """
     config = TrainingConfig().to_dict() | EnvConfig().to_dict()
+    config["decoder_type"] = decoder_type
     manager = VersionManager(pipeline_root)
     replay = ChunkReplayBuffer(replay_buffer_dir, replay_capacity)
     stop = Path(stop_file)
@@ -261,12 +263,14 @@ def run_async_evaluator(
     poll_seconds: float = 2.0,
     metrics_file: str | None = None,
     evaluation_dir: str | None = None,
+    decoder_type: str = "flow_matching",
 ) -> None:
     """Evaluate every Policy_n exactly once and strictly in version order."""
     if max_version < 0:
         raise ValueError("max_version must be non-negative")
 
     config = TrainingConfig().to_dict() | EnvConfig().to_dict()
+    config["decoder_type"] = decoder_type
     manager = VersionManager(pipeline_root)
     stop = Path(stop_file)
     env = RobomimicEnv(

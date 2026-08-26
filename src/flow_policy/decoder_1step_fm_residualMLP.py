@@ -135,6 +135,7 @@ class ConditionalResidualMLP(nn.Module):
 @jdc.pytree_dataclass
 class Decoder1StepFMConfig:
     flow_steps: jdc.Static[int] = 1
+    inverse_steps: jdc.Static[int] = 32
     timestep_embed_dim: jdc.Static[int] = 128
     hidden_dim: jdc.Static[int] = 512
     num_res_blocks: jdc.Static[int] = 4

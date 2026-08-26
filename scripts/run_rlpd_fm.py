@@ -95,6 +95,7 @@ def _encoder_worker(settings: dict) -> None:
             replay_ratio=settings["encoder_replay_ratio"],
             metrics_file=settings["metrics_file"],
             inherit_optimizer_state=version > 1,
+            decoder_type=settings["decoder_type"],
         )
         manager.publish_component("encoder", version, temporary_output, {
             "version": version,
@@ -131,6 +132,7 @@ def _decoder_worker(settings: dict) -> None:
             train_steps=settings["decoder_train_steps"],
             metrics_file=settings["metrics_file"],
             inherit_optimizer_state=version > 1,
+            decoder_type=settings["decoder_type"],
         )
         manager.publish_component("decoder", version, temporary_output, {
             "version": version,
@@ -156,6 +158,7 @@ def _collector_worker(settings: dict) -> None:
         rollout_steps=settings["collector_rollout_steps"],
         replay_capacity=settings["replay_capacity"],
         metrics_file=settings["metrics_file"],
+        decoder_type=settings["decoder_type"],
     )
 
 
@@ -169,6 +172,7 @@ def _evaluator_worker(settings: dict) -> None:
         max_version=settings["max_version"],
         poll_seconds=settings["poll_seconds"],
         metrics_file=settings["metrics_file"],
+        decoder_type=settings["decoder_type"],
         evaluation_dir=settings["evaluation_dir"],
     )
 
@@ -221,8 +225,11 @@ def run_async_pipeline(
     evaluator_gpu_id: int = 0,
     decoder_gpu_id: int = 0,
     parent_gpu_id: int = 0,
+    decoder_type: str = "flow_matching",
 ) -> None:
     """Run collection, evaluation, and both trainers as independent processes."""
+    if decoder_type not in ("flow_matching", "meanflow"):
+        raise ValueError("decoder_type must be 'flow_matching' or 'meanflow'.")
     if not np.isclose(encoder_demo_ratio + encoder_replay_ratio, 1.0):
         raise ValueError("encoder demo/replay ratios must sum to 1.0")
     if num_versions < 1:
@@ -257,7 +264,7 @@ def run_async_pipeline(
     action_dim = int(env.action_size)
     checkpoint = _validate_offline_checkpoint(
         Path(offline_checkpoint_path), obs_dim, action_dim,
-        config["env_name"], require_rlpd_state=True,
+        config["env_name"], require_rlpd_state=True, decoder_type=decoder_type,
     )
     env.close()
     # Validate and canonicalize the successful demonstrations before processes start.
@@ -302,6 +309,7 @@ def run_async_pipeline(
         "evaluator_gpu_id": evaluator_gpu_id,
         "decoder_gpu_id": decoder_gpu_id,
         "parent_gpu_id": parent_gpu_id,
+        "decoder_type": decoder_type,
     }
     atomic_pickle_dump(settings, root / "pipeline_settings.pkl")
     print(
@@ -434,6 +442,7 @@ def _validate_offline_checkpoint(
     expected_action_dim: int,
     expected_env_name: str,
     require_rlpd_state: bool = False,
+    decoder_type: str = "flow_matching",
 ) -> Path:
     """Validate an offline FM decoder checkpoint before starting the pipeline."""
     checkpoint_path = checkpoint_path.expanduser().resolve()
@@ -454,8 +463,11 @@ def _validate_offline_checkpoint(
             "checkpoint_final.pkl or checkpoint_step_*.pkl produced by "
             "run_offline_fm_frozen_robomimic.py."
         )
-    if checkpoint.get("decoder_type", "fm") != "fm":
-        raise ValueError(f"Checkpoint decoder_type is not 'fm': {checkpoint_path}")
+    checkpoint_type = checkpoint.get("decoder_type", "flow_matching")
+    if checkpoint_type != decoder_type:
+        raise ValueError(f"Checkpoint decoder_type={checkpoint_type!r} does not match {decoder_type!r}: {checkpoint_path}")
+    if checkpoint_type == "meanflow" and checkpoint.get("action_stats") is None:
+        raise ValueError(f"MeanFlow checkpoint is missing action_stats: {checkpoint_path}")
     if int(checkpoint["obs_dim"]) != expected_obs_dim:
         raise ValueError(
             f"Checkpoint obs_dim={checkpoint['obs_dim']} does not match online "
@@ -508,6 +520,7 @@ def main(
     decoder_gpu_id: int = 1,
     parent_gpu_id: int = 1,
     evaluator_gpu_id: int = 1,
+    decoder_type: str = "flow_matching",
 ) -> None:
     """Run the asynchronous RLPD encoder + FM decoder training pipeline."""
     run_async_pipeline(
@@ -528,6 +541,7 @@ def main(
         decoder_gpu_id=decoder_gpu_id,
         parent_gpu_id=parent_gpu_id,
         evaluator_gpu_id=evaluator_gpu_id,
+        decoder_type=decoder_type,
     )
 
 

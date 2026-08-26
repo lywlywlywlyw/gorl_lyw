@@ -16,6 +16,7 @@ from tqdm import tqdm
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from flow_policy.decoder_fm import DecoderFMConfig, DecoderFMState
+from flow_policy.decoder_1step_fm_residualMLP import Decoder1StepFMConfig, Decoder1StepFMState
 from envs.robomimic.online_config.training_config import TrainingConfig
 from envs.robomimic.online_config.env_config import EnvConfig
 try:
@@ -35,6 +36,7 @@ def train_async_stage(
     train_steps: int,
     metrics_file: str | None = None,
     inherit_optimizer_state: bool = True,
+    decoder_type: str = "flow_matching",
 ) -> None:
     """Train one Decoder_n from an immutable replay snapshot.
 
@@ -47,6 +49,8 @@ def train_async_stage(
     if train_steps <= 0:
         raise ValueError("train_steps must be positive.")
     config = TrainingConfig().to_dict() | EnvConfig().to_dict()
+    if decoder_type not in ("flow_matching", "meanflow"):
+        raise ValueError("decoder_type must be 'flow_matching' or 'meanflow'.")
     with Path(encoder_checkpoint_path).expanduser().open("rb") as file:
         encoder_checkpoint = pickle.load(file)
     required_encoder = {"rlpd_z_actor_params", "rlpd_z_obs_stats", "config"}
@@ -72,38 +76,43 @@ def train_async_stage(
         raise ValueError("Replay action dimension does not match decoder.")
 
     decoder_config = previous["config"]
-    if inherit_optimizer_state and "fm_opt_state" not in previous:
-        raise ValueError(
-            "Online decoder continuation requires optimizer state; "
-            "missing field: fm_opt_state"
-        )
-    fm_state = DecoderFMState.init(
-        jax.random.PRNGKey(config["seed"] + 2000 + version),
-        int(previous["obs_dim"]), int(previous["action_dim"]), decoder_config,
-    )
+    state_cls = Decoder1StepFMState if decoder_type == "meanflow" else DecoderFMState
+    expected_config = Decoder1StepFMConfig if decoder_type == "meanflow" else DecoderFMConfig
+    if not isinstance(decoder_config, expected_config):
+        raise ValueError(f"Checkpoint config is not compatible with {decoder_type}.")
+    if inherit_optimizer_state and "decoder_opt_state" not in previous:
+        raise ValueError("Online decoder continuation requires optimizer state.")
+    fm_state = state_cls.init(jax.random.PRNGKey(config["seed"] + 2000 + version), int(previous["obs_dim"]), int(previous["action_dim"]), decoder_config)
     with jdc.copy_and_mutate(fm_state) as fm_state:
         fm_state.params = previous["params"]
         fm_state.obs_stats = previous["obs_stats"]
-        # Decoder_1 inherits Decoder_0 parameters but intentionally starts with
-        # a fresh online optimizer. Decoder_2+ continue the complete online
-        # training state from the preceding decoder version.
+        if decoder_type == "meanflow":
+            if previous.get("action_stats") is None:
+                raise ValueError("MeanFlow checkpoint is missing action_stats.")
+            fm_state.action_stats = previous["action_stats"]
         if inherit_optimizer_state:
-            fm_state.opt_state = previous["fm_opt_state"]
-        if "fm_prng" in previous:
-            fm_state.prng = previous["fm_prng"]
-        if "fm_steps" in previous:
-            fm_state.steps = previous["fm_steps"]
+            fm_state.opt_state = previous["decoder_opt_state"]
+        if "decoder_prng" in previous:
+            fm_state.prng = previous["decoder_prng"]
+        if "decoder_steps" in previous:
+            fm_state.steps = previous["decoder_steps"]
         fm_state.obs_stats = fm_state.obs_stats.update(jnp.asarray(states))
+        if decoder_type == "meanflow": fm_state.action_stats = fm_state.action_stats.update(jnp.asarray(actions))
 
     rng = np.random.default_rng(config["seed"] + version)
-    batch_size = int(config["fm_batch_size"])
+    batch_size = int(decoder_config.batch_size)
     started = time.time()
     metrics: dict[str, Any] = {}
     for step in tqdm(range(train_steps), desc=f"Decoder {version}"):
         indices = rng.integers(0, len(states), size=batch_size)
-        fm_state, metrics = fm_state.train_step(
-            jnp.asarray(states[indices]), jnp.asarray(actions[indices])
-        )
+        if decoder_type == "meanflow":
+            fm_state, metrics = fm_state.train_step(
+                fm_state.steps, jnp.asarray(states[indices]), jnp.asarray(actions[indices])
+            )
+        else:
+            fm_state, metrics = fm_state.train_step(
+                jnp.asarray(states[indices]), jnp.asarray(actions[indices])
+            )
         if metrics_file and ((step + 1) % 100 == 0 or step + 1 == train_steps):
             append_metrics(metrics_file, {
                 "pipeline/version": version,
@@ -114,14 +123,15 @@ def train_async_stage(
     checkpoint = {
         "params": fm_state.params,
         "obs_stats": fm_state.obs_stats,
-        "fm_opt_state": fm_state.opt_state,
-        "fm_prng": fm_state.prng,
-        "fm_steps": fm_state.steps,
+        "decoder_opt_state": fm_state.opt_state,
+        "decoder_prng": fm_state.prng,
+        "decoder_steps": fm_state.steps,
+        "action_stats": getattr(fm_state, "action_stats", None),
         "config": decoder_config,
         "obs_dim": int(previous["obs_dim"]),
         "action_dim": int(previous["action_dim"]),
         "env_name": config["env_name"],
-        "decoder_type": "fm",
+        "decoder_type": decoder_type,
         "version": version,
         "fixed_encoder_checkpoint": str(Path(encoder_checkpoint_path).resolve()),
         "previous_decoder_checkpoint": str(Path(previous_decoder_checkpoint_path).resolve()),
@@ -395,12 +405,12 @@ def train_fm(
             fm_state.obs_stats = resume_checkpoint["obs_stats"]
             # Offline optimizer state is never inherited. A previous online
             # stage may retain its own optimizer when continuation is requested.
-            if not resume_is_offline and "fm_opt_state" in resume_checkpoint:
-                fm_state.opt_state = resume_checkpoint["fm_opt_state"]
-            if not resume_is_offline and "fm_prng" in resume_checkpoint:
-                fm_state.prng = resume_checkpoint["fm_prng"]
-            if not resume_is_offline and "fm_steps" in resume_checkpoint:
-                fm_state.steps = resume_checkpoint["fm_steps"]
+            if not resume_is_offline and "decoder_opt_state" in resume_checkpoint:
+                fm_state.opt_state = resume_checkpoint["decoder_opt_state"]
+            if not resume_is_offline and "decoder_prng" in resume_checkpoint:
+                fm_state.prng = resume_checkpoint["decoder_prng"]
+            if not resume_is_offline and "decoder_steps" in resume_checkpoint:
+                fm_state.steps = resume_checkpoint["decoder_steps"]
         fm_state.obs_stats = fm_state.obs_stats.update(jnp.array(train_states))
 
     # Preserve the encoder train state in decoder checkpoints. The pipeline only
@@ -560,9 +570,9 @@ def train_fm(
             checkpoint = {
                 "params": fm_state.params,  # Only save parameters
                 "obs_stats": fm_state.obs_stats,
-                "fm_opt_state": fm_state.opt_state,
-                "fm_prng": fm_state.prng,
-                "fm_steps": fm_state.steps,
+                "decoder_opt_state": fm_state.opt_state,
+                "decoder_prng": fm_state.prng,
+                "decoder_steps": fm_state.steps,
                 "config": decoder_config,
                 "epoch": epoch + 1,
                 "train_loss": train_loss,
@@ -607,9 +617,9 @@ def train_fm(
     final_checkpoint = {
         "params": fm_state.params,  # Only save parameters
         "obs_stats": fm_state.obs_stats,
-        "fm_opt_state": fm_state.opt_state,
-        "fm_prng": fm_state.prng,
-        "fm_steps": fm_state.steps,
+        "decoder_opt_state": fm_state.opt_state,
+        "decoder_prng": fm_state.prng,
+        "decoder_steps": fm_state.steps,
         "config": decoder_config,
         "epoch": config['fm_num_epochs'],
         "train_loss": train_losses[-1],

@@ -1,5 +1,6 @@
 from dataclasses import dataclass, asdict
 from envs.robomimic.online_config.decoder_configs.fm_config import FlowMatchingConfig
+from envs.robomimic.online_config.decoder_configs.meanflow_config import MeanFlowConfig
 from envs.robomimic.online_config.encoder_configs.ppo_config import PPOConfig
 from envs.robomimic.online_config.encoder_configs.rlpd_config import RLPDConfig
 
@@ -20,7 +21,7 @@ class TrainingConfig:
     encoder_type: str = "rlpd"
 
     # decoder training config
-    decoder_type: str = "fm"
+    decoder_type: str = "flow_matching"
 
     # Weights & Biases logging
     wandb_enabled: bool = True
@@ -42,6 +43,10 @@ class TrainingConfig:
             encoder_config = RLPDConfig().to_dict()
 
             
-        if self.decoder_type == "fm":
+        if self.decoder_type == "flow_matching":
             decoder_config = FlowMatchingConfig().to_dict()
+        elif self.decoder_type == "meanflow":
+            decoder_config = MeanFlowConfig().to_dict()
+        else:
+            raise ValueError("decoder_type must be 'flow_matching' or 'meanflow'.")
         return asdict(self) | encoder_config | decoder_config

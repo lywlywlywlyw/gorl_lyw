@@ -60,6 +60,7 @@ from envs.robomimic.offline_config.training_config import TrainingConfig
 from envs.robomimic.online_config.encoder_configs.rlpd_config import RLPDConfig
 from flow_policy import encoder_rlpd, math_utils, networks
 from flow_policy.decoder_fm import DecoderFMConfig, DecoderFMState
+from flow_policy.decoder_1step_fm_residualMLP import Decoder1StepFMConfig, Decoder1StepFMState
 
 
 PyTree = Any
@@ -86,24 +87,23 @@ def build_config(training_config: TrainingConfig | None = None) -> ConfigView:
     )
     # Internal aliases keep the implementation names aligned with the generic
     # reference script while all values remain owned by offline_config.
-    config.update(
-        max_samples=config["fm_max_samples"],
-        decoder_learning_rate=config["fm_learning_rate"],
-        decoder_hidden_size=config["fm_hidden_size"],
-        decoder_num_layers=config["fm_num_layers"],
-        decoder_batch_size=config["fm_batch_size"],
-        decoder_max_epochs=config["fm_num_epochs"],
-        decoder_checkpoint_interval=config["fm_checkpoint_interval"],
-        decoder_validation_fraction=config["fm_validation_split"],
-        flow_steps=config["fm_flow_steps"],
-        timestep_embed_dim=config["fm_timestep_embed_dim"],
-        n_fm_samples_per_action=config["fm_n_samples_per_action"],
-        decoder_min_epochs=config["fm_min_epochs"],
-        decoder_patience=config["fm_patience"],
-        decoder_min_delta=config["fm_min_delta"],
-        decoder_eval_batches=config["fm_eval_batches"],
-        latent_inverse_steps=config["fm_latent_inverse_steps"],
-    )
+    if config["decoder_type"] == "flow_matching":
+        prefix = "fm"
+    elif config["decoder_type"] == "meanflow":
+        prefix = "meanflow"
+    else:
+        raise ValueError("decoder_type must be 'flow_matching' or 'meanflow'.")
+    aliases = {
+        "max_samples": "max_samples", "decoder_learning_rate": "learning_rate",
+        "decoder_batch_size": "batch_size", "decoder_max_epochs": "num_epochs",
+        "decoder_checkpoint_interval": "checkpoint_interval", "decoder_validation_fraction": "validation_split",
+        "timestep_embed_dim": "timestep_embed_dim", "decoder_min_epochs": "min_epochs",
+        "decoder_patience": "patience", "decoder_min_delta": "min_delta",
+        "decoder_eval_batches": "eval_batches", "latent_inverse_steps": "latent_inverse_steps",
+    }
+    for target, suffix in aliases.items(): config[target] = config[f"{prefix}_{suffix}"]
+    if prefix == "fm":
+        config.update(decoder_hidden_size=config["fm_hidden_size"], decoder_num_layers=config["fm_num_layers"], flow_steps=config["fm_flow_steps"], n_fm_samples_per_action=config["fm_n_samples_per_action"])
     return config
 
 
@@ -317,32 +317,27 @@ def split_indices(
     return permutation[validation_size:], permutation[:validation_size]
 
 
-def inverse_fm_batch(
-    decoder: DecoderFMState,
-    observations: Array,
-    actions: Array,
-    num_steps: int,
-) -> Array:
-    obs_norm = (observations - decoder.obs_stats.mean) / (
-        decoder.obs_stats.std + 1e-8
-    )
+def inverse_fm_batch(decoder: Any, observations: Array, actions: Array, num_steps: int) -> Array:
+    if isinstance(decoder, Decoder1StepFMState):
+        # MP1 MeanFlow has a one-step implicit decoder: a = z - u(z, 1, 0).
+        # Its inverse is consequently fixed-point solving z = a + u(z, 1, 0),
+        # rather than reverse integration of an FM ODE.
+        obs_norm, action = decoder._normalize_obs(observations), decoder._normalize_action(actions)
+        t, r = jnp.ones((actions.shape[0], 1)), jnp.zeros((actions.shape[0], 1))
+        return jax.lax.fori_loop(0, num_steps, lambda _, z: action + decoder.meanflow_forward(obs_norm, z, t, r), action)
+    obs_norm = (observations - decoder.obs_stats.mean) / (decoder.obs_stats.std + 1e-8)
     times = jnp.linspace(0.0, 1.0, num_steps + 1)
-
     def step(x_t: Array, pair: tuple[Array, Array]) -> tuple[Array, None]:
         current, following = pair
         t = jnp.full((*x_t.shape[:-1], 1), current)
-        velocity = decoder.flow_forward(obs_norm, x_t, decoder.embed_timestep(t))
-        return x_t + (following - current) * velocity, None
-
-    latent, _ = jax.lax.scan(
-        step, actions, (times[:-1], times[1:])
-    )
-    return latent
-
+        return x_t + (following-current) * decoder.flow_forward(obs_norm, x_t, decoder.embed_timestep(t)), None
+    return jax.lax.scan(step, actions, (times[:-1], times[1:]))[0]
 
 def forward_fm_batch(
-    decoder: DecoderFMState, observations: Array, latents: Array
+    decoder: Any, observations: Array, latents: Array
 ) -> Array:
+    if isinstance(decoder, Decoder1StepFMState):
+        return decoder.sample_action_from_z(observations, latents, jax.random.PRNGKey(0), deterministic=True)
     obs_norm = (observations - decoder.obs_stats.mean) / (
         decoder.obs_stats.std + 1e-8
     )
@@ -361,7 +356,7 @@ def forward_fm_batch(
 
 
 def build_latent_targets(
-    decoder: DecoderFMState,
+    decoder: Any,
     buffer: ReplayBuffer,
     batch_size: int,
     inverse_steps: int,
@@ -386,7 +381,7 @@ def build_latent_targets(
 
 
 def decoder_validation_loss(
-    decoder: DecoderFMState,
+    decoder: Any,
     buffer: ReplayBuffer,
     indices: np.ndarray,
     max_batches: int,
@@ -401,25 +396,21 @@ def decoder_validation_loss(
         batch = indices[start : start + decoder.config.batch_size]
         obs = jnp.asarray(buffer.observations[batch])
         actions = jnp.asarray(buffer.actions[batch])
-        obs_norm = (obs - decoder.obs_stats.mean) / (
-            decoder.obs_stats.std + 1e-8
-        )
         key, eps_key, time_key = jax.random.split(key, 3)
-        eps = jax.random.normal(
-            eps_key,
-            (len(batch), decoder.config.n_samples_per_action, actions.shape[-1]),
-        )
-        times = jax.random.uniform(
-            time_key, (len(batch), decoder.config.n_samples_per_action, 1)
-        )
-        losses.append(
-            float(jnp.mean(decoder.compute_cfm_loss(obs_norm, actions, eps, times)))
-        )
+        if isinstance(decoder, Decoder1StepFMState):
+            eps = jax.random.normal(eps_key, actions.shape)
+            times, starts = decoder.sample_t_r(time_key, len(batch))
+            losses.append(float(decoder.compute_meanflow_loss(decoder.steps, decoder._normalize_obs(obs), actions, eps, times, starts)[0]))
+        else:
+            obs_norm = (obs - decoder.obs_stats.mean) / (decoder.obs_stats.std + 1e-8)
+            eps = jax.random.normal(eps_key, (len(batch), decoder.config.n_samples_per_action, actions.shape[-1]))
+            times = jax.random.uniform(time_key, (len(batch), decoder.config.n_samples_per_action, 1))
+            losses.append(float(jnp.mean(decoder.compute_cfm_loss(obs_norm, actions, eps, times))))
     return float(np.mean(losses)), key
 
 
 def decoder_metrics(
-    decoder: DecoderFMState,
+    decoder: Any,
     buffer: ReplayBuffer,
     indices: np.ndarray,
     inverse_steps: int,
@@ -660,7 +651,7 @@ def policy_metrics(
     q1_params: PyTree,
     q2_params: PyTree,
     value_params: PyTree,
-    decoder: DecoderFMState,
+    decoder: Any,
     buffer: ReplayBuffer,
     normalized_observations: np.ndarray,
     indices: np.ndarray,
@@ -758,15 +749,20 @@ def is_combined_checkpoint(checkpoint: dict[str, Any]) -> bool:
 
 
 def restore_decoder(
-    decoder: DecoderFMState, checkpoint: dict[str, Any]
+    decoder: Any, checkpoint: dict[str, Any]
 ) -> DecoderFMState:
-    params = checkpoint.get("params", checkpoint.get("fm_params"))
-    obs_stats = checkpoint.get("obs_stats", checkpoint.get("fm_obs_stats"))
+    params = checkpoint.get("params")
+    obs_stats = checkpoint.get("obs_stats")
     if params is None or obs_stats is None:
         raise KeyError("Checkpoint is missing decoder params or observation stats.")
     with jdc.copy_and_mutate(decoder) as restored:
         restored.params = params
         restored.obs_stats = obs_stats
+        if isinstance(restored, Decoder1StepFMState):
+            action_stats = checkpoint.get("action_stats")
+            if action_stats is None:
+                raise KeyError("MeanFlow checkpoint is missing action_stats.")
+            restored.action_stats = action_stats
         if "decoder_opt_state" in checkpoint:
             restored.opt_state = checkpoint["decoder_opt_state"]
         if "decoder_prng" in checkpoint:
@@ -779,7 +775,7 @@ def restore_decoder(
 def save_decoder_checkpoint(
     path: Path,
     config: ConfigView,
-    decoder: DecoderFMState,
+    decoder: Any,
     decoder_epoch: int,
     global_step: int,
     best_params: PyTree,
@@ -788,7 +784,7 @@ def save_decoder_checkpoint(
     rng: np.random.Generator,
     key: Array,
 ) -> None:
-    action_dim = int(decoder.params[-1][0].shape[-1])
+    action_dim = int(decoder.action_dim if hasattr(decoder, "action_dim") else decoder.params[-1][0].shape[-1])
     checkpoint = {
         "checkpoint_format": "gorl_offline_fm_decoder",
         "checkpoint_version": 2,
@@ -797,6 +793,7 @@ def save_decoder_checkpoint(
         # Keep the standard standalone decoder fields for interoperability.
         "params": decoder.params,
         "obs_stats": decoder.obs_stats,
+        "action_stats": getattr(decoder, "action_stats", None),
         "config": decoder.config,
         "obs_dim": int(decoder.obs_stats.mean.shape[-1]),
         "action_dim": action_dim,
@@ -822,7 +819,7 @@ def save_offline_checkpoint(
     path: Path,
     config: ConfigView,
     rlpd_config: encoder_rlpd.EncoderConfig,
-    decoder: DecoderFMState,
+    decoder: Any,
     actor_params: PyTree,
     encoder_obs_stats: Any,
     q1_params: PyTree,
@@ -839,7 +836,7 @@ def save_offline_checkpoint(
     key: Array,
 ) -> None:
     obs_dim = int(decoder.obs_stats.mean.shape[-1])
-    action_dim = int(decoder.params[-1][0].shape[-1])
+    action_dim = int(decoder.action_dim if hasattr(decoder, "action_dim") else decoder.params[-1][0].shape[-1])
     critic_params = tuple(
         q1_params if member % 2 == 0 else q2_params
         for member in range(rlpd_config.critic_ensemble_size)
@@ -856,6 +853,7 @@ def save_offline_checkpoint(
         # Frozen FM decoder loaded by the RLPD training component.
         "params": decoder.params,
         "obs_stats": decoder.obs_stats,
+        "action_stats": getattr(decoder, "action_stats", None),
         "config": decoder.config,
         "obs_dim": obs_dim,
         "action_dim": action_dim,
@@ -865,7 +863,7 @@ def save_offline_checkpoint(
         "is_frozen_offline": True,
         "env_name": config.env_name,
         "dataset_path": str(Path(config.dataset_path).expanduser().resolve()),
-        "decoder_type": "fm",
+        "decoder_type": config.decoder_type,
         "z_dim": action_dim,
         "fm_params": decoder.params,
         "fm_obs_stats": decoder.obs_stats,
@@ -885,6 +883,7 @@ def save_offline_checkpoint(
         ),
         "rlpd_z_obs_stats": encoder_obs_stats,
         # Offline-only training state/metadata.
+        "decoder_type": config.decoder_type,
         "offline_config": dict(config),
         "q1_params": q1_params,
         "q2_params": q2_params,
@@ -952,27 +951,31 @@ def main(config: ConfigView) -> None:
         key, decoder_key, actor_key, value_key, q1_key, q2_key = (
             jax.random.split(key, 6)
         )
-        decoder_config = DecoderFMConfig(
-            flow_steps=config.flow_steps,
-            timestep_embed_dim=config.timestep_embed_dim,
-            hidden_dims=(config.decoder_hidden_size,)
-            * config.decoder_num_layers,
-            policy_output_scale=config.fm_policy_output_scale,
-            learning_rate=config.decoder_learning_rate,
-            batch_size=config.decoder_batch_size,
-            num_epochs=config.decoder_max_epochs,
-            n_samples_per_action=config.n_fm_samples_per_action,
-            normalize_observations=config.fm_normalize_observations,
-            sde_sigma=config.fm_sde_sigma,
-            feather_std=config.fm_feather_std,
-        )
-        decoder = DecoderFMState.init(
-            decoder_key, obs_dim, action_dim, decoder_config
-        )
-        with jdc.copy_and_mutate(decoder) as decoder:
-            decoder.obs_stats = decoder.obs_stats.update(
-                jnp.asarray(buffer.observations)
+        if config.decoder_type == "meanflow":
+            decoder_config = Decoder1StepFMConfig(
+                timestep_embed_dim=config.meanflow_timestep_embed_dim,
+                hidden_dim=config.meanflow_hidden_dim, num_res_blocks=config.meanflow_num_res_blocks,
+                mlp_expansion=config.meanflow_mlp_expansion,
+                policy_output_scale=config.meanflow_policy_output_scale, learning_rate=config.decoder_learning_rate,
+                batch_size=config.decoder_batch_size, num_epochs=config.decoder_max_epochs,
+                normalize_observations=config.meanflow_normalize_observations,
+                normalize_actions=config.meanflow_normalize_actions, flow_ratio=config.meanflow_flow_ratio,
+                inverse_steps=config.latent_inverse_steps, guidance_scale=config.meanflow_guidance_scale, dispersive_loss_weight=config.meanflow_dispersive_loss_weight,
             )
+            decoder = Decoder1StepFMState.init(decoder_key, obs_dim, action_dim, decoder_config)
+            with jdc.copy_and_mutate(decoder) as decoder:
+                decoder.obs_stats = decoder.obs_stats.update(jnp.asarray(buffer.observations))
+                decoder.action_stats = decoder.action_stats.update(jnp.asarray(buffer.actions))
+        else:
+            decoder_config = DecoderFMConfig(flow_steps=config.flow_steps, timestep_embed_dim=config.timestep_embed_dim,
+                hidden_dims=(config.decoder_hidden_size,) * config.decoder_num_layers,
+                policy_output_scale=config.fm_policy_output_scale, learning_rate=config.decoder_learning_rate,
+                batch_size=config.decoder_batch_size, num_epochs=config.decoder_max_epochs,
+                n_samples_per_action=config.n_fm_samples_per_action, normalize_observations=config.fm_normalize_observations,
+                sde_sigma=config.fm_sde_sigma, feather_std=config.fm_feather_std)
+            decoder = DecoderFMState.init(decoder_key, obs_dim, action_dim, decoder_config)
+            with jdc.copy_and_mutate(decoder) as decoder:
+                decoder.obs_stats = decoder.obs_stats.update(jnp.asarray(buffer.observations))
         if resume_checkpoint is not None:
             decoder = restore_decoder(decoder, resume_checkpoint)
 
@@ -1094,12 +1097,17 @@ def main(config: ConfigView) -> None:
             permutation = rng.permutation(train_indices)
             for start in range(0, len(permutation), config.decoder_batch_size):
                 batch = permutation[start : start + config.decoder_batch_size]
-                decoder, metrics = decoder.train_step(
-                    jnp.asarray(buffer.observations[batch]),
-                    # Train directly on dataset (s, a). Dataset actions are
-                    # already the targets; never apply atanh/arctanh here.
-                    jnp.asarray(buffer.actions[batch]),
-                )
+                if isinstance(decoder, Decoder1StepFMState):
+                    decoder, metrics = decoder.train_step(
+                        epoch, jnp.asarray(buffer.observations[batch]), jnp.asarray(buffer.actions[batch])
+                    )
+                else:
+                    decoder, metrics = decoder.train_step(
+                        jnp.asarray(buffer.observations[batch]),
+                        # Train directly on dataset (s, a). Dataset actions are
+                        # already the targets; never apply atanh/arctanh here.
+                        jnp.asarray(buffer.actions[batch]),
+                    )
                 losses.append(float(metrics["loss"]))
                 global_step += 1
             validation_loss, key = decoder_validation_loss(
