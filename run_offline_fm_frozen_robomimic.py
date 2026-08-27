@@ -946,6 +946,7 @@ def main(config: ConfigView) -> None:
                 policy_output_scale=config.meanflow_policy_output_scale, learning_rate=config.decoder_learning_rate,
                 batch_size=config.decoder_batch_size,
                 normalize_observations=config.meanflow_normalize_observations,
+                normalization_mode="gaussian",
                 flow_ratio=config.meanflow_flow_ratio,
                 guidance_scale=config.meanflow_guidance_scale, use_dispersive=config.use_dispersive, dispersive_loss_weight=config.meanflow_dispersive_loss_weight,
             )

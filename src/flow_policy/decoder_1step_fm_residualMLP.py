@@ -149,7 +149,7 @@ class Decoder1StepFMConfig:
     batch_size: jdc.Static[int] = 128
 
     normalize_observations: jdc.Static[bool] = True
-    normalization_mode: jdc.Static[str] = "limits"
+    normalization_mode: jdc.Static[str] = "gaussian"
     flow_ratio: float = 0.5
     time_dist: jdc.Static[str] = "lognorm"
     lognorm_mu: float = -0.4
@@ -354,6 +354,7 @@ class Decoder1StepFMState:
                 jax.random.normal(prng_feather, action.shape)
                 * self.config.feather_std
             )
+        action = jnp.clip(action, -1.0, 1.0)
         return action[0] if single_obs else action
 
     def _decode_normalized(self, obs_norm: Array, z: Array) -> Array:
@@ -375,6 +376,7 @@ class Decoder1StepFMState:
         action = self._decode_normalized(obs_norm, z)
         if not deterministic:
             action += jax.random.normal(prng, action.shape) * self.config.feather_std
+        action = jnp.clip(action, -1.0, 1.0)
         return action[0] if single_obs else action
 
     def inverse_fm_batch(
