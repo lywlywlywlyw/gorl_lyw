@@ -160,11 +160,12 @@ class Decoder1StepFMConfig:
     use_dispersive: jdc.Static[bool] = False
     dispersive_loss_weight: float = 0.5
     bifm_loss_weight: float = 0.05
-    warm_up_epoch = 2000
+    warm_up_epoch = 0
     dispersive_tau: float = 1.0
     dispersive_chunk_size: jdc.Static[int] = 512
     use_lbifm: jdc.Static[bool] = False
     feather_std: float = 0.0
+    latent_kl_weight: float = 1.0
 
 
 @jdc.pytree_dataclass
@@ -397,7 +398,18 @@ class Decoder1StepFMState:
             raise ValueError(
                 "MeanFlow inversion observations and actions must share a batch size."
             )
-        obs_norm = self._normalize_obs(observations)
+        return self._inverse_fm_batch_normalized(
+            self._normalize_obs(observations), actions
+        )
+
+    def _inverse_fm_batch_normalized(
+        self,
+        obs_norm: Array,
+        actions: Array,
+        params: Any | None = None,
+    ) -> Array:
+        """Invert normalized actions using the supplied decoder parameters."""
+        params = self.params if params is None else params
         t = jnp.zeros((actions.shape[0], 1))
         r = jnp.ones((actions.shape[0], 1))
         steps = 1
@@ -405,31 +417,29 @@ class Decoder1StepFMState:
             0,
             steps,
             lambda _, latent: actions
-            + self.meanflow_forward(obs_norm, latent, t, r),
+            + self._forward(params, obs_norm, latent, t, r)[0],
             actions,
         )
 
     def sample_t_r(
         self, prng: Array, batch_size: int
     ) -> tuple[Array, Array]:
-        prng_time, prng_flow = jax.random.split(prng)
-        if self.config.time_dist == "uniform":
-            samples = jax.random.uniform(prng_time, (batch_size, 2))
-        elif self.config.time_dist == "lognorm":
-            samples = jax.nn.sigmoid(
-                jax.random.normal(prng_time, (batch_size, 2))
-                * self.config.lognorm_sigma
-                + self.config.lognorm_mu
-            )
-        else:
-            raise ValueError(f"Unsupported time_dist: {self.config.time_dist}")
-        t = jnp.maximum(samples[:, 0], samples[:, 1])
-        r = jnp.minimum(samples[:, 0], samples[:, 1])
-        mask = (
-            jax.random.uniform(prng_flow, (batch_size,))
-            < self.config.flow_ratio
+        time_key, relation_key, less_key, greater_key = jax.random.split(prng, 4)
+        # Sample the three (r, t) relations with equal probability:
+        #   1/3: t ~ Uniform(0, 1), r ~ Uniform(0, t)
+        #   1/3: t ~ Uniform(0, 1), r ~ Uniform(t, 1)
+        #   1/3: t ~ Uniform(0, 1), r = t
+        # Using one t per example keeps the requested conditional relations
+        # exact while the independent relation draw provides the 1/3 mixture.
+        t = jax.random.uniform(time_key, (batch_size,))
+        relation = jax.random.uniform(relation_key, (batch_size,))
+        r_less = t * jax.random.uniform(less_key, (batch_size,))
+        r_greater = t + (1.0 - t) * jax.random.uniform(greater_key, (batch_size,))
+        r = jnp.where(
+            relation < 1.0 / 3.0,
+            r_less,
+            jnp.where(relation < 2.0 / 3.0, r_greater, t),
         )
-        r = jnp.where(mask, t, r)
         return t[:, None], r[:, None]
 
     def adaptive_l2_loss(
@@ -508,7 +518,7 @@ class Decoder1StepFMState:
         r: Array,
         params: Any | None = None
     ) -> tuple[Array, Array, Array]:
-        loss, meanflow_loss, dis_loss, _ = self._compute_training_losses(
+        loss, meanflow_loss, dis_loss, _, _ = self._compute_training_losses(
             epoch, obs_norm, action, eps, t, r, params=params
         )
         return loss, meanflow_loss, dis_loss
@@ -532,7 +542,7 @@ class Decoder1StepFMState:
         t: Array,
         r: Array,
         params: Any | None = None,
-    ) -> tuple[Array, Array, Array, Array]:
+    ) -> tuple[Array, Array, Array, Array, Array]:
         params = self.params if params is None else params
         x_t = t * eps + (1.0 - t) * action
         x_r = r * eps + (1.0 - r) * action
@@ -563,6 +573,21 @@ class Decoder1StepFMState:
             )
         else:
             dis_loss = jnp.zeros(())
+        inverse_latents = self._inverse_fm_batch_normalized(
+            obs_norm, action, params=params
+        )
+        latent_mean = jnp.mean(inverse_latents, axis=0)
+        latent_std = jnp.maximum(
+            jnp.std(inverse_latents, axis=0), 1e-6
+        )
+        # Analytic KL[N(mu, sigma^2) || N(0, I)] for the empirical
+        # distribution of latents obtained by inverting this action batch.
+        prior_kl = 0.5 * jnp.sum(
+            jnp.square(latent_mean)
+            + jnp.square(latent_std)
+            - 1.0
+            - 2.0 * jnp.log(latent_std)
+        )
         bifm_loss = jnp.zeros(())
         if self.config.use_lbifm:
             backward_u, _ = model_fn(x_r, r, t)
@@ -574,8 +599,9 @@ class Decoder1StepFMState:
             meanflow_loss
             + self.config.dispersive_loss_weight * dis_loss
             + self.compute_warm_up_bifm_weight(epoch) * bifm_loss
+            + self.config.latent_kl_weight * prior_kl
         )
-        return loss, meanflow_loss, dis_loss, bifm_loss
+        return loss, meanflow_loss, dis_loss, bifm_loss, prior_kl
 
     @jax.jit
     def train_step(
@@ -588,7 +614,7 @@ class Decoder1StepFMState:
         t, r = self.sample_t_r(prng_tr, batch_size)
 
         def loss_fn(params: Any):
-            loss, meanflow_loss, dis_loss, bifm_loss = (
+            loss, meanflow_loss, dis_loss, bifm_loss, prior_kl = (
                 self._compute_training_losses(
                     epoch, obs_norm, batch_actions, eps, t, r, params=params
                 )
@@ -598,6 +624,7 @@ class Decoder1StepFMState:
                 "meanflow_loss": meanflow_loss,
                 "dis_loss": dis_loss,
                 "bifm_loss": bifm_loss,
+                "latent_prior_kl": prior_kl,
                 "t_mean": jnp.mean(t),
                 "r_mean": jnp.mean(r),
             }

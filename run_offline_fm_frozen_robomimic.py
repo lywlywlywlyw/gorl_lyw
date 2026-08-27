@@ -949,6 +949,7 @@ def main(config: ConfigView) -> None:
                 normalization_mode="gaussian",
                 flow_ratio=config.meanflow_flow_ratio,
                 guidance_scale=config.meanflow_guidance_scale, use_dispersive=config.use_dispersive, dispersive_loss_weight=config.meanflow_dispersive_loss_weight,
+                latent_kl_weight=config.rlpd_latent_kl_weight,
             )
             decoder = Decoder1StepFMState.init(decoder_key, obs_dim, action_dim, decoder_config)
             with jdc.copy_and_mutate(decoder) as decoder:

@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 @dataclass
 class MeanFlowConfig:
     """MP1 one-step MeanFlow decoder settings used by async RLPD."""
-    meanflow_learning_rate: float = 1e-4
+    meanflow_learning_rate: float = 3e-4
     meanflow_batch_size: int = 8192
     # Match the Flow Matching decoder's 8-d timestep embedding and 64-wide
     # four-layer MLP capacity.

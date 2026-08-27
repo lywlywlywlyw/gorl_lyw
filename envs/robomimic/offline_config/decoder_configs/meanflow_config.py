@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 @dataclass
 class MeanFlowConfig:
     """MP1 one-step MeanFlow decoder settings."""
-    meanflow_learning_rate: float = 1e-4
+    meanflow_learning_rate: float = 3e-4
     meanflow_batch_size: int = 8192
     meanflow_num_epochs: int = 2_000_000
     meanflow_checkpoint_interval: int = 10_000
@@ -23,7 +23,7 @@ class MeanFlowConfig:
     meanflow_policy_output_scale: float = 1.0
     meanflow_normalize_observations: bool = True
     meanflow_flow_ratio: float = 0.5
-    meanflow_guidance_scale: float = 2.0
+    meanflow_guidance_scale: float = 1.0
     use_dispersive: bool = False
     meanflow_dispersive_loss_weight: float = 0.5
     def to_dict(self) -> dict:
