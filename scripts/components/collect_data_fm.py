@@ -193,10 +193,25 @@ def _record_q_gap_evaluation(
     if states is None:
         warnings.warn("Skipping Q-gap evaluation because replay has no env_states.")
         return {}
-    valid = [index for index, state in enumerate(states) if state is not None]
+    valid = [
+        index
+        for index, state in enumerate(states)
+        if isinstance(state, dict)
+        and "qpos" in state
+        and "qvel" in state
+        and "time" in state
+    ]
     if not valid:
-        warnings.warn("Skipping Q-gap evaluation because replay has no valid env_states.")
+        warnings.warn(
+            "Skipping Q-gap evaluation because replay has no valid MuJoCo env_states."
+        )
         return {}
+
+    invalid_count = len(states) - len(valid)
+    if invalid_count:
+        warnings.warn(
+            f"Skipping {invalid_count} replay entries with missing or invalid env_states."
+        )
 
     sample_count = min(30, len(valid))
     rng = onp.random.default_rng(int(config["seed"]) + version)

@@ -84,7 +84,16 @@ def load_transition_data(path: str | Path) -> dict[str, np.ndarray]:
     for target, candidates in aliases.items():
         value = next((raw[name] for name in candidates if name in raw), None)
         if value is not None:
-            result[target] = np.asarray(value)
+            if target == "env_states":
+                # Simulator states are heterogeneous dictionaries; constructing
+                # the object array element-by-element prevents NumPy from trying
+                # to broadcast nested qpos/qvel arrays.
+                env_states = np.empty(len(value), dtype=object)
+                for index, state in enumerate(value):
+                    env_states[index] = state
+                result[target] = env_states
+            else:
+                result[target] = np.asarray(value)
 
     if "observations" not in result or "actions" not in result:
         raise KeyError(f"Transition buffer {path} must contain states and actions.")
@@ -109,10 +118,21 @@ def load_transition_data(path: str | Path) -> dict[str, np.ndarray]:
         result["env_states"] = np.empty(size, dtype=object)
         result["env_states"][:] = None
 
+    # ``env_states`` contains dictionaries with heterogeneous MuJoCo arrays.
+    # Never coerce it to bool (the previous implementation accidentally did so
+    # by grouping it with ``dones`` / ``truncations``), and avoid NumPy trying to
+    # recursively broadcast dictionary values into a multidimensional array.
+    env_states = np.empty(size, dtype=object)
+    for index, state in enumerate(result["env_states"]):
+        env_states[index] = state
     result = {
         key: np.asarray(result[key], dtype=np.float32)
         if key not in ("dones", "truncations", "env_states")
-        else np.asarray(result[key], dtype=np.bool_)
+        else (
+            np.asarray(result[key], dtype=np.bool_)
+            if key in ("dones", "truncations")
+            else env_states
+        )
         for key in TRANSITION_KEYS
     }
     if not all(len(value) == size for value in result.values()):
