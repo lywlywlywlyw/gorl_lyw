@@ -108,15 +108,15 @@ class RobomimicEnv(BaseEnv):
             info=info,
         )
 
-    def get_env_state(self) -> dict[str, np.ndarray | float]:
-        """Return a copy of the MuJoCo simulator state for exact restoration."""
+    def get_env_state(self) -> dict[str, np.ndarray | float | int | bool]:
+        """Return the simulator and robosuite episode state for restoration."""
         sim = getattr(self.env, "sim", None)
         if sim is None:
             sim = getattr(getattr(self.env, "env", None), "sim", None)
         if sim is None:
             raise RuntimeError("The robomimic environment does not expose a MuJoCo sim.")
         data = sim.data
-        result: dict[str, np.ndarray | float] = {
+        result: dict[str, np.ndarray | float | int | bool] = {
             "qpos": np.array(data.qpos, copy=True),
             "qvel": np.array(data.qvel, copy=True),
             "time": float(data.time),
@@ -125,9 +125,19 @@ class RobomimicEnv(BaseEnv):
             value = getattr(data, name, None)
             if value is not None:
                 result[name] = np.array(value, copy=True)
+
+        robosuite_env = getattr(self.env, "env", self.env)
+        if hasattr(robosuite_env, "timestep"):
+            result["robosuite_timestep"] = int(robosuite_env.timestep)
+        if hasattr(robosuite_env, "cur_time"):
+            result["robosuite_cur_time"] = float(robosuite_env.cur_time)
+        if hasattr(robosuite_env, "done"):
+            result["robosuite_done"] = bool(robosuite_env.done)
         return result
 
-    def set_env_state(self, state: dict[str, np.ndarray | float]) -> None:
+    def set_env_state(
+        self, state: dict[str, np.ndarray | float | int | bool]
+    ) -> None:
         """Restore a state produced by :meth:`get_env_state`."""
         sim = getattr(self.env, "sim", None)
         if sim is None:
@@ -142,6 +152,24 @@ class RobomimicEnv(BaseEnv):
             if name in state and hasattr(data, name):
                 getattr(data, name)[:] = state[name]
         sim.forward()
+
+        robosuite_env = getattr(self.env, "env", self.env)
+        timestep = state.get("robosuite_timestep", state.get("episode_step"))
+        if timestep is not None and hasattr(robosuite_env, "timestep"):
+            robosuite_env.timestep = int(timestep)
+        if "robosuite_cur_time" in state and hasattr(robosuite_env, "cur_time"):
+            robosuite_env.cur_time = float(state["robosuite_cur_time"])
+        elif timestep is not None and hasattr(robosuite_env, "cur_time"):
+            control_timestep = getattr(robosuite_env, "control_timestep", None)
+            if control_timestep is not None:
+                robosuite_env.cur_time = int(timestep) * float(control_timestep)
+        if "robosuite_done" in state and hasattr(robosuite_env, "done"):
+            robosuite_env.done = bool(state["robosuite_done"])
+        elif timestep is not None and hasattr(robosuite_env, "done"):
+            horizon = getattr(robosuite_env, "horizon", None)
+            ignore_done = bool(getattr(robosuite_env, "ignore_done", False))
+            if horizon is not None:
+                robosuite_env.done = int(timestep) >= int(horizon) and not ignore_done
 
     def is_success(self) -> bool:
         """Return the wrapped Robomimic task-level success signal."""

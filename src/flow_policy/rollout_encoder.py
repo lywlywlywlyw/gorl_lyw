@@ -256,7 +256,16 @@ class BatchedRolloutStateEncoderFM:
             # environment action directly; do not tanh decoder output again.
             env_action = agent_state.map_z_to_action(obs, z)
             responses = self._step_all(np.asarray(jax.device_get(env_action)))
-            transition_env_states.extend(response[4] for response in responses)
+            # Save the rollout-level episode step together with the simulator
+            # state. MuJoCo ``data.time`` is a physics time and is not a robust
+            # substitute for the number of policy/environment steps already
+            # consumed from the configured episode horizon.
+            for env_index, response in enumerate(responses):
+                simulator_state = response[4]
+                if isinstance(simulator_state, dict):
+                    simulator_state = dict(simulator_state)
+                    simulator_state["episode_step"] = int(self.steps[env_index])
+                transition_env_states.append(simulator_state)
             next_states, transition_next_states = [], []
             rewards, truncations, discounts = [], [], []
             reset_indices, reset_keys = [], []

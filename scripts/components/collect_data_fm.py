@@ -185,9 +185,11 @@ def _record_q_gap_evaluation(
     """Compare current-critic estimates with restored-state MC returns.
 
     The first action in each Monte Carlo rollout must be generated from the
-    exact same latent used for the critic estimate.  Also, bind the decoder
-    from this explicitly loaded evaluation agent rather than relying on an
-    agent-level mapping that could accidentally refer to another decoder.
+    exact same latent used for the critic estimate. Each sampled state is
+    rolled out multiple times and its target is the mean discounted return.
+    Also, bind the decoder from this explicitly loaded evaluation agent rather
+    than relying on an agent-level mapping that could accidentally refer to
+    another decoder.
     """
     replay = ChunkReplayBuffer(replay_buffer_dir)
     try:
@@ -233,6 +235,22 @@ def _record_q_gap_evaluation(
     estimated_values: list[float] = []
     true_values: list[float] = []
     gamma = float(config["rlpd_discounting"])
+    rollouts_per_state = int(config.get("q_gap_rollouts_per_state", 5))
+    if rollouts_per_state < 2:
+        raise ValueError("q_gap_rollouts_per_state must be at least 2.")
+    episode_length = int(config["episode_length"])
+
+    # Older replay chunks do not contain ``episode_step``. Keep them usable by
+    # converting MuJoCo physics time to one policy/control step as a fallback.
+    wrapped_env = getattr(eval_env.env, "env", eval_env.env)
+    control_timestep = getattr(wrapped_env, "control_timestep", None)
+    if control_timestep is None:
+        sim = getattr(eval_env.env, "sim", None)
+        if sim is None:
+            sim = getattr(wrapped_env, "sim", None)
+        model_timestep = float(sim.model.opt.timestep) if sim is not None else 0.0
+        n_substeps = int(getattr(sim, "nsubsteps", 1)) if sim is not None else 1
+        control_timestep = model_timestep * n_substeps
     # ``agent`` is loaded by the evaluator from the matching
     # (encoder_version, decoder_version) pair.  Keep this decoder fixed for
     # the whole evaluation, so Q-gap uses Decoder_n rather than any trainer
@@ -252,49 +270,65 @@ def _record_q_gap_evaluation(
                 observation,
                 latent,
             )
-            estimated_values.append(float(onp.asarray(jnp.mean(q_values))))
+            estimated_values.append(float(onp.asarray(jnp.min(q_values))))
 
-            state = State(
-                obs=observation[0],
-                reward=jnp.asarray(0.0),
-                done=jnp.asarray(False),
-                info={},
-            )
-            discounted_return = 0.0
-            discount = 1.0
-            for step in range(int(config["episode_length"])):
-                if step == 0:
-                    # Reuse the latent used by the critic above.  Do not
-                    # sample a second, independent z for the first return
-                    # step, even if the policy is stochastic in the future.
-                    return_latent = latent
-                else:
-                    return_latent, _ = agent.sample_z(
-                        state.obs[None, :],
-                        jax.random.key(
-                            int(config["seed"])
-                            + version * 100000
-                            + int(index) * 1000
-                            + step
-                        ),
-                        deterministic=True,
+            simulator_state = states[index]
+            if "episode_step" in simulator_state:
+                episode_step = int(simulator_state["episode_step"])
+            elif control_timestep and control_timestep > 0.0:
+                episode_step = int(round(float(simulator_state["time"]) / control_timestep))
+            else:
+                if warn:
+                    warnings.warn(
+                        "Could not infer episode step from legacy env_state; "
+                        "using the full Q-gap rollout horizon."
                     )
-                action = evaluation_decoder.sample_action_from_z(
-                    state.obs[None, :],
-                    return_latent,
-                    jax.random.PRNGKey(0),
-                    deterministic=True,
-                )[0]
-                state = eval_env.step(state, action)
-                reward = float(onp.asarray(state.reward))
-                success = eval_env.is_success()
-                if success:
-                    reward += SUCCESS_REWARD_BONUS
-                discounted_return += discount * reward
-                discount *= gamma
-                if bool(onp.asarray(state.done)) or success:
-                    break
-            true_values.append(discounted_return)
+                episode_step = 0
+            remaining_steps = max(0, episode_length - episode_step)
+
+            state_returns: list[float] = []
+            for rollout_index in range(rollouts_per_state):
+                eval_env.set_env_state(simulator_state)
+                state = State(
+                    obs=observation[0],
+                    reward=jnp.asarray(0.0),
+                    done=jnp.asarray(False),
+                    info={},
+                )
+                discounted_return = 0.0
+                discount = 1.0
+                rollout_key = jax.random.key(
+                    int(config["seed"]) + version * 100000 + int(index) * 1000
+                )
+                rollout_key = jax.random.fold_in(rollout_key, rollout_index)
+                for step in range(remaining_steps):
+                    if step == 0:
+                        # Reuse the latent used by the critic above. Do not
+                        # sample a second, independent z for the first action.
+                        return_latent = latent
+                    else:
+                        return_latent, _ = agent.sample_z(
+                            state.obs[None, :],
+                            jax.random.fold_in(rollout_key, step),
+                            deterministic=False,
+                        )
+                    action = evaluation_decoder.sample_action_from_z(
+                        state.obs[None, :],
+                        return_latent,
+                        jax.random.PRNGKey(0),
+                        deterministic=True,
+                    )[0]
+                    state = eval_env.step(state, action)
+                    reward = float(onp.asarray(state.reward))
+                    success = eval_env.is_success()
+                    if success:
+                        reward += SUCCESS_REWARD_BONUS
+                    discounted_return += discount * reward
+                    discount *= gamma
+                    if bool(onp.asarray(state.done)) or success:
+                        break
+                state_returns.append(discounted_return)
+            true_values.append(float(onp.mean(state_returns)))
     finally:
         eval_env.close()
 
@@ -306,6 +340,7 @@ def _record_q_gap_evaluation(
         "true_value": true,
         "q_gap": estimated - true,
         "q_gap/num_samples": sample_count,
+        "q_gap/rollouts_per_state": rollouts_per_state,
     }
 
 
