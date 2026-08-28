@@ -236,39 +236,74 @@ class VersionManager:
             raise
         return final / "checkpoint.pkl"
 
-    def publish_policy(self, version: int) -> Path:
-        if not self.is_component_ready("encoder", version):
-            raise RuntimeError(f"encoder_{version} is not READY")
-        if not self.is_component_ready("decoder", version):
-            raise RuntimeError(f"decoder_{version} is not READY")
+    def latest_component(self, component: str) -> tuple[int, Path] | None:
+        versions = []
+        for path in self.root.glob(f"{component}_*/READY"):
+            try:
+                version = int(path.parent.name.rsplit("_", 1)[1])
+            except (IndexError, ValueError):
+                continue
+            if self.is_component_ready(component, version):
+                versions.append(version)
+        if not versions:
+            return None
+        version = max(versions)
+        return version, self.component_checkpoint(component, version)
+
+    def publish_policy(
+        self,
+        version: int,
+        encoder_version: int | None = None,
+        decoder_version: int | None = None,
+    ) -> Path:
+        encoder_version = version if encoder_version is None else encoder_version
+        decoder_version = version if decoder_version is None else decoder_version
+        if not self.is_component_ready("encoder", encoder_version):
+            raise RuntimeError(f"encoder_{encoder_version} is not READY")
+        if not self.is_component_ready("decoder", decoder_version):
+            raise RuntimeError(f"decoder_{decoder_version} is not READY")
         final = self.component_dir("policy", version)
         if final.exists():
             checkpoint = final / "checkpoint.pkl"
             if not checkpoint.is_file():
                 atomic_pickle_dump(
-                    self._combined_policy_checkpoint(version), checkpoint
+                    self._combined_policy_checkpoint(
+                        version, encoder_version, decoder_version
+                    ),
+                    checkpoint,
                 )
             return final
         temporary = self.root / f".policy_{version}.{uuid.uuid4().hex}.tmp"
         temporary.mkdir()
         metadata = {
             "version": version,
-            "encoder_checkpoint": str(self.component_checkpoint("encoder", version)),
-            "decoder_checkpoint": str(self.component_checkpoint("decoder", version)),
+            "encoder_version": encoder_version,
+            "decoder_version": decoder_version,
+            "encoder_checkpoint": str(
+                self.component_checkpoint("encoder", encoder_version)
+            ),
+            "decoder_checkpoint": str(
+                self.component_checkpoint("decoder", decoder_version)
+            ),
             "created_at": time.time(),
         }
         atomic_pickle_dump(
-            self._combined_policy_checkpoint(version), temporary / "checkpoint.pkl"
+            self._combined_policy_checkpoint(
+                version, encoder_version, decoder_version
+            ),
+            temporary / "checkpoint.pkl",
         )
         atomic_json_dump(metadata, temporary / "metadata.json")
         (temporary / "READY").write_text("ready\n", encoding="utf-8")
         os.replace(temporary, final)
         return final
 
-    def _combined_policy_checkpoint(self, version: int) -> dict[str, Any]:
-        """Build one self-contained Encoder_n + Decoder_n evaluation artifact."""
-        encoder_path = self.component_checkpoint("encoder", version)
-        decoder_path = self.component_checkpoint("decoder", version)
+    def _combined_policy_checkpoint(
+        self, version: int, encoder_version: int, decoder_version: int
+    ) -> dict[str, Any]:
+        """Build one self-contained policy from an explicit encoder/decoder pair."""
+        encoder_path = self.component_checkpoint("encoder", encoder_version)
+        decoder_path = self.component_checkpoint("decoder", decoder_version)
         with encoder_path.open("rb") as file:
             encoder = pickle.load(file)
         with decoder_path.open("rb") as file:
@@ -280,16 +315,16 @@ class VersionManager:
         if encoder_config is None:
             raise KeyError("Encoder checkpoint is missing its RLPD config.")
 
-        # Start with the complete encoder train state, then make Decoder_n the
-        # canonical decoder at the standard top-level fields. In particular,
-        # overwrite fm_params embedded by Encoder_n, which describe the fixed
-        # Decoder_{n-1} used during encoder training rather than Policy_n.
+        # Start with the complete encoder train state, then make the decoder
+        # frozen for that encoder stage canonical at the standard top-level fields.
         combined = dict(encoder)
         combined.update(decoder)
         combined.update({
             "checkpoint_format": "gorl_online_rlpd_fm_policy",
             "checkpoint_version": 1,
             "policy_version": version,
+            "encoder_version": encoder_version,
+            "decoder_version": decoder_version,
             "rlpd_encoder_config": encoder_config,
             "fm_params": decoder["params"],
             "fm_obs_stats": decoder["obs_stats"],
@@ -305,20 +340,53 @@ class VersionManager:
                 version = int(path.parent.name.split("_", 1)[1])
             except (IndexError, ValueError):
                 continue
-            if self.is_component_ready("encoder", version) and self.is_component_ready("decoder", version):
+            if self.policy_components(version) is not None:
                 versions.append(version)
         return sorted(versions)
+
+    def policy_components(self, version: int) -> tuple[Path, Path] | None:
+        directory = self.component_dir("policy", version)
+        if not (directory / "READY").is_file():
+            return None
+        metadata_path = directory / "metadata.json"
+        checkpoint_path = directory / "checkpoint.pkl"
+        if not metadata_path.is_file() or not checkpoint_path.is_file():
+            return None
+        with metadata_path.open("r", encoding="utf-8") as file:
+            metadata = json.load(file)
+        encoder_version = int(metadata.get("encoder_version", version))
+        decoder_version = int(metadata.get("decoder_version", version))
+        if not self.is_component_ready("encoder", encoder_version):
+            return None
+        if not self.is_component_ready("decoder", decoder_version):
+            return None
+        return (
+            self.component_checkpoint("encoder", encoder_version),
+            self.component_checkpoint("decoder", decoder_version),
+        )
 
     def latest_policy(self) -> tuple[int, Path, Path] | None:
         versions = self.ready_policy_versions()
         if not versions:
             return None
         version = versions[-1]
-        return (
-            version,
-            self.component_checkpoint("encoder", version),
-            self.component_checkpoint("decoder", version),
-        )
+        components = self.policy_components(version)
+        assert components is not None
+        return version, *components
+
+    def wait_policy(
+        self,
+        version: int,
+        poll_seconds: float,
+        stop_file: Path | None = None,
+    ) -> tuple[Path, Path]:
+        while True:
+            components = self.policy_components(version)
+            if components is not None:
+                return components
+            if stop_file is not None and stop_file.exists():
+                raise InterruptedError("Pipeline stop requested.")
+            time.sleep(poll_seconds)
 
     def wait_component(self, component: str, version: int, poll_seconds: float, stop_file: Path | None = None) -> Path:
         while not self.is_component_ready(component, version):

@@ -421,11 +421,8 @@ def run_async_evaluator(
         # Waiting for an explicit version, rather than latest_policy(), ensures
         # that a quickly advancing trainer cannot skip evaluations.
         for version in range(max_version + 1):
-            encoder_path = manager.wait_component(
-                "encoder", version, poll_seconds, stop
-            )
-            decoder_path = manager.wait_component(
-                "decoder", version, poll_seconds, stop
+            encoder_path, decoder_path = manager.wait_policy(
+                version, poll_seconds, stop
             )
             agent, apply_tanh = _load_policy_pair(
                 encoder_path, decoder_path, env, config

@@ -77,9 +77,12 @@ def _encoder_worker(settings: dict) -> None:
     replay = ChunkReplayBuffer(settings["replay_dir"], settings["replay_capacity"])
     stop = Path(settings["stop_file"])
     for version in range(settings["start_version"], settings["max_version"] + 1):
-        decoder = manager.wait_component("decoder", version - 1, settings["poll_seconds"], stop)
         previous_encoder = manager.wait_component("encoder", version - 1, settings["poll_seconds"], stop)
         _wait_for_replay(replay, settings["minimum_replay_size"], stop, settings["poll_seconds"])
+        latest_decoder = manager.latest_component("decoder")
+        if latest_decoder is None:
+            raise RuntimeError("No decoder is available for encoder training.")
+        decoder_version, decoder = latest_decoder
         snapshot = Path(settings["snapshots_dir"]) / f"encoder_{version}_replay.pkl"
         _write_replay_snapshot(replay, snapshot)
         temporary_output = Path(settings["work_dir"]) / f"encoder_{version}.pkl"
@@ -99,13 +102,18 @@ def _encoder_worker(settings: dict) -> None:
         )
         manager.publish_component("encoder", version, temporary_output, {
             "version": version,
-            "fixed_decoder_version": version - 1,
+            "fixed_decoder_version": decoder_version,
             "replay_snapshot": str(snapshot),
             "demo_ratio": settings["encoder_demo_ratio"],
             "replay_ratio": settings["encoder_replay_ratio"],
             "train_env_steps": settings["encoder_train_env_steps"],
             "inherited_optimizer_state": version > 1,
         })
+        manager.publish_policy(
+            version,
+            encoder_version=version,
+            decoder_version=decoder_version,
+        )
         temporary_output.unlink(missing_ok=True)
 
 
@@ -117,9 +125,12 @@ def _decoder_worker(settings: dict) -> None:
     replay = ChunkReplayBuffer(settings["replay_dir"], settings["replay_capacity"])
     stop = Path(settings["stop_file"])
     for version in range(settings["start_version"], settings["max_version"] + 1):
-        encoder = manager.wait_component("encoder", version, settings["poll_seconds"], stop)
         previous_decoder = manager.wait_component("decoder", version - 1, settings["poll_seconds"], stop)
         _wait_for_replay(replay, settings["minimum_replay_size"], stop, settings["poll_seconds"])
+        latest_encoder = manager.latest_component("encoder")
+        if latest_encoder is None:
+            raise RuntimeError("No encoder is available for decoder training.")
+        encoder_version, encoder = latest_encoder
         snapshot = Path(settings["snapshots_dir"]) / f"decoder_{version}_replay.pkl"
         _write_replay_snapshot(replay, snapshot)
         temporary_output = Path(settings["work_dir"]) / f"decoder_{version}.pkl"
@@ -136,13 +147,12 @@ def _decoder_worker(settings: dict) -> None:
         )
         manager.publish_component("decoder", version, temporary_output, {
             "version": version,
-            "fixed_encoder_version": version,
+            "fixed_encoder_version": encoder_version,
             "previous_decoder_version": version - 1,
             "replay_snapshot": str(snapshot),
             "train_steps": settings["decoder_train_steps"],
             "inherited_optimizer_state": version > 1,
         })
-        manager.publish_policy(version)
         temporary_output.unlink(missing_ok=True)
 
 

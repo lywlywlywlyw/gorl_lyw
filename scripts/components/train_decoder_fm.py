@@ -41,8 +41,9 @@ def train_async_stage(
     """Train one Decoder_n from an immutable replay snapshot.
 
     This is the existing FM objective (``DecoderFMState.train_step``) without
-    success/reward filtering. ``Encoder_n`` is loaded and validated once at the
-    stage boundary, then recorded in the output checkpoint. The current FM
+    success/reward filtering. The latest published encoder is loaded only for
+    provenance and validation; decoder optimization does not wait for a new
+    encoder version. The current FM
     implementation constructs its own noise latent, so no alternate latent
     target is introduced here.
     """

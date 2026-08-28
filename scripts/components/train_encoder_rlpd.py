@@ -331,8 +331,8 @@ def train_async_stage(
     """Train one immutable Encoder_n stage without collecting environment data.
 
     The caller creates ``replay_snapshot_path`` before launching this function.
-    Both source buffers provide real ``(s, a)`` and the fixed Decoder_{n-1}
-    converts every action to that stage's latent coordinate system.
+    Both source buffers provide real ``(s, a)`` and the decoder selected at the
+    stage boundary converts every action to that decoder's latent coordinates.
     """
     if train_env_steps <= 0:
         raise ValueError("train_env_steps must be positive.")
