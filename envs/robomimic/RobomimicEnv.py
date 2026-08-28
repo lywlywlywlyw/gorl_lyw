@@ -108,6 +108,41 @@ class RobomimicEnv(BaseEnv):
             info=info,
         )
 
+    def get_env_state(self) -> dict[str, np.ndarray | float]:
+        """Return a copy of the MuJoCo simulator state for exact restoration."""
+        sim = getattr(self.env, "sim", None)
+        if sim is None:
+            sim = getattr(getattr(self.env, "env", None), "sim", None)
+        if sim is None:
+            raise RuntimeError("The robomimic environment does not expose a MuJoCo sim.")
+        data = sim.data
+        result: dict[str, np.ndarray | float] = {
+            "qpos": np.array(data.qpos, copy=True),
+            "qvel": np.array(data.qvel, copy=True),
+            "time": float(data.time),
+        }
+        for name in ("act", "qacc_warmstart", "userdata"):
+            value = getattr(data, name, None)
+            if value is not None:
+                result[name] = np.array(value, copy=True)
+        return result
+
+    def set_env_state(self, state: dict[str, np.ndarray | float]) -> None:
+        """Restore a state produced by :meth:`get_env_state`."""
+        sim = getattr(self.env, "sim", None)
+        if sim is None:
+            sim = getattr(getattr(self.env, "env", None), "sim", None)
+        if sim is None:
+            raise RuntimeError("The robomimic environment does not expose a MuJoCo sim.")
+        data = sim.data
+        data.qpos[:] = state["qpos"]
+        data.qvel[:] = state["qvel"]
+        data.time = state["time"]
+        for name in ("act", "qacc_warmstart", "userdata"):
+            if name in state and hasattr(data, name):
+                getattr(data, name)[:] = state[name]
+        sim.forward()
+
     def is_success(self) -> bool:
         """Return the wrapped Robomimic task-level success signal."""
         success = self.env.is_success()

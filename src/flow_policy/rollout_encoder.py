@@ -40,16 +40,18 @@ def _environment_worker(connection: Any, env_type: type, dataset_path: str) -> N
             try:
                 if command == "reset":
                     state = env.reset(payload)
-                    result = (np.asarray(state.obs), 0.0, False, False)
+                    result = (np.asarray(state.obs), 0.0, False, False, None)
                 elif command == "step":
                     if state is None:
                         raise RuntimeError("Environment must be reset before step().")
+                    env_state = env.get_env_state()
                     state = env.step(state, payload)
                     result = (
                         np.asarray(state.obs),
                         float(np.asarray(state.reward)),
                         bool(np.asarray(state.done)),
                         bool(state.info.get("success", False)),
+                        env_state,
                     )
                 elif command == "close":
                     break
@@ -122,6 +124,7 @@ class BatchedRolloutStateEncoderFM:
     terminated: np.ndarray
     num_envs: int
     prng: Array
+    last_transition_env_states: list[Any] | None = None
 
     @classmethod
     def init(
@@ -210,9 +213,7 @@ class BatchedRolloutStateEncoderFM:
         self.connections = []
         self.processes = []
 
-    def _step_all(
-        self, actions: np.ndarray
-    ) -> list[tuple[np.ndarray, float, bool, bool]]:
+    def _step_all(self, actions: np.ndarray) -> list[tuple[np.ndarray, float, bool, bool, Any]]:
         for connection, action in zip(self.connections, actions):
             connection.send(("step", action))
         return [self._receive(connection) for connection in self.connections]
@@ -223,7 +224,7 @@ class BatchedRolloutStateEncoderFM:
         return {index: self._receive(self.connections[index]) for index in indices}
 
     @staticmethod
-    def _receive(connection: Any) -> tuple[np.ndarray, float, bool, bool]:
+    def _receive(connection: Any) -> tuple[np.ndarray, float, bool, bool, Any]:
         ok, payload = connection.recv()
         if not ok:
             raise RuntimeError(f"Robomimic environment worker failed: {payload}")
@@ -231,7 +232,7 @@ class BatchedRolloutStateEncoderFM:
 
     @staticmethod
     def _state(response: tuple[np.ndarray, float, bool, bool]) -> State:
-        obs, reward, done, success = response
+        obs, reward, done, success, _ = response
         return State(
             obs=jnp.asarray(obs),
             reward=jnp.asarray(reward),
@@ -246,6 +247,7 @@ class BatchedRolloutStateEncoderFM:
         if iterations_per_env < 1:
             raise ValueError("iterations_per_env must be positive.")
         transition_steps, prng = [], self.prng
+        transition_env_states: list[Any] = []
         for _ in range(iterations_per_env):
             obs = jnp.stack([jnp.asarray(state.obs) for state in self.env_states])
             prng_z, prng = jax.random.split(prng)
@@ -254,6 +256,7 @@ class BatchedRolloutStateEncoderFM:
             # environment action directly; do not tanh decoder output again.
             env_action = agent_state.map_z_to_action(obs, z)
             responses = self._step_all(np.asarray(jax.device_get(env_action)))
+            transition_env_states.extend(response[4] for response in responses)
             next_states, transition_next_states = [], []
             rewards, truncations, discounts = [], [], []
             reset_indices, reset_keys = [], []
@@ -303,6 +306,7 @@ class BatchedRolloutStateEncoderFM:
                 discount=jnp.asarray(discounts, dtype=jnp.float32)))
             self.env_states = next_states
         self.prng = prng
+        self.last_transition_env_states = transition_env_states
         return self, jax.tree.map(lambda *xs: jnp.stack(xs), *transition_steps)
 
     def rollout_with_actions(self, agent, episode_length: int, iterations_per_env: int,

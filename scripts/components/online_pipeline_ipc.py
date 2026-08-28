@@ -31,6 +31,7 @@ TRANSITION_KEYS = (
     "masks",
     "dones",
     "truncations",
+    "env_states",
 )
 
 
@@ -77,6 +78,7 @@ def load_transition_data(path: str | Path) -> dict[str, np.ndarray]:
         "masks": ("masks", "discounts", "discount"),
         "dones": ("dones", "terminals", "done"),
         "truncations": ("truncations", "timeouts", "truncated"),
+        "env_states": ("env_states", "sim_states"),
     }
     result: dict[str, np.ndarray] = {}
     for target, candidates in aliases.items():
@@ -101,9 +103,15 @@ def load_transition_data(path: str | Path) -> dict[str, np.ndarray]:
     if "masks" not in result:
         result["masks"] = 1.0 - result["dones"].astype(np.float32)
 
+    # Old chunks predate simulator snapshots. They remain valid for training,
+    # but cannot be used for state-restored Q-gap evaluation.
+    if "env_states" not in result:
+        result["env_states"] = np.empty(size, dtype=object)
+        result["env_states"][:] = None
+
     result = {
         key: np.asarray(result[key], dtype=np.float32)
-        if key not in ("dones", "truncations")
+        if key not in ("dones", "truncations", "env_states")
         else np.asarray(result[key], dtype=np.bool_)
         for key in TRANSITION_KEYS
     }
@@ -122,7 +130,18 @@ class ChunkReplayBuffer:
         self.capacity = capacity
 
     def append(self, transitions: dict[str, Any], metadata: dict[str, Any] | None = None) -> Path:
-        arrays = {key: np.asarray(transitions[key]) for key in TRANSITION_KEYS}
+        arrays = {
+            key: np.asarray(transitions[key])
+            for key in TRANSITION_KEYS
+            if key in transitions
+        }
+        if "env_states" not in arrays:
+            size = len(arrays["observations"])
+            arrays["env_states"] = np.empty(size, dtype=object)
+            arrays["env_states"][:] = None
+        missing = set(TRANSITION_KEYS) - set(arrays)
+        if missing:
+            raise KeyError(f"Replay chunk is missing required keys: {sorted(missing)}")
         size = len(arrays["observations"])
         if not size or not all(len(value) == size for value in arrays.values()):
             raise ValueError("Replay chunk arrays must be non-empty and equally sized.")

@@ -4,6 +4,7 @@ import datetime
 import pickle
 import time
 import json
+import warnings
 from pathlib import Path
 from typing import Annotated
 
@@ -27,6 +28,8 @@ from flow_policy.rollout_encoder import (
     BatchedRolloutStateEncoderFM,
     eval_policy_encoder_fm
 )
+from envs.base_env import State
+from flow_policy.rollout_encoder import SUCCESS_REWARD_BONUS
 from envs.robomimic.RobomimicEnv import RobomimicEnv
 from envs.robomimic.online_config.training_config import TrainingConfig
 from envs.robomimic.online_config.env_config import EnvConfig
@@ -172,6 +175,94 @@ def _record_policy_evaluation(
     return metrics
 
 
+def _record_q_gap_evaluation(
+    agent: EncoderFMAgent,
+    config: dict,
+    version: int,
+    replay_buffer_dir: str,
+) -> dict[str, float | int]:
+    """Compare current-critic estimates with restored-state MC returns."""
+    replay = ChunkReplayBuffer(replay_buffer_dir)
+    try:
+        data = replay.load_snapshot()
+    except (FileNotFoundError, ValueError):
+        warnings.warn("Skipping Q-gap evaluation because replay is empty.")
+        return {}
+
+    states = data.get("env_states")
+    if states is None:
+        warnings.warn("Skipping Q-gap evaluation because replay has no env_states.")
+        return {}
+    valid = [index for index, state in enumerate(states) if state is not None]
+    if not valid:
+        warnings.warn("Skipping Q-gap evaluation because replay has no valid env_states.")
+        return {}
+
+    sample_count = min(30, len(valid))
+    rng = onp.random.default_rng(int(config["seed"]) + version)
+    indices = rng.choice(valid, size=sample_count, replace=False)
+    eval_env = RobomimicEnv(
+        dataset_path=config["dataset_path"],
+        reward_shaping=config["dense_reward"],
+    )
+    estimated_values: list[float] = []
+    true_values: list[float] = []
+    gamma = float(config["rlpd_discounting"])
+    try:
+        for index in indices:
+            eval_env.set_env_state(states[index])
+            observation = jnp.asarray(data["observations"][index], dtype=jnp.float32)[None, :]
+            latent, _ = agent.sample_z(
+                observation,
+                jax.random.key(int(config["seed"]) + version * 1000 + int(index)),
+                deterministic=True,
+            )
+            q_values = agent.ppo_z_state._critic_values(
+                agent.ppo_z_state.critic_params,
+                observation,
+                latent,
+            )
+            estimated_values.append(float(onp.asarray(jnp.mean(q_values))))
+
+            state = State(
+                obs=observation[0],
+                reward=jnp.asarray(0.0),
+                done=jnp.asarray(False),
+                info={},
+            )
+            discounted_return = 0.0
+            discount = 1.0
+            for _ in range(int(config["episode_length"])):
+                latent, _ = agent.sample_z(
+                    state.obs[None, :],
+                    jax.random.key(int(config["seed"]) + version * 100000 + int(index)),
+                    deterministic=True,
+                )
+                action = agent.map_z_to_action(state.obs[None, :], latent)[0]
+                state = eval_env.step(state, action)
+                reward = float(onp.asarray(state.reward))
+                success = eval_env.is_success()
+                if success:
+                    reward += SUCCESS_REWARD_BONUS
+                discounted_return += discount * reward
+                discount *= gamma
+                if bool(onp.asarray(state.done)) or success:
+                    break
+            true_values.append(discounted_return)
+    finally:
+        eval_env.close()
+
+    estimated = float(onp.mean(estimated_values))
+    true = float(onp.mean(true_values))
+    return {
+        "pipeline/version": version,
+        "estimated_value": estimated,
+        "true_value": true,
+        "q_gap": estimated - true,
+        "q_gap/num_samples": sample_count,
+    }
+
+
 def run_async_collector(
     pipeline_root: str,
     replay_buffer_dir: str,
@@ -237,6 +328,9 @@ def run_async_collector(
                 "masks": discounts,
                 "dones": (discounts == 0.0),
                 "truncations": truncations,
+                "env_states": onp.asarray(
+                    rollout_state.last_transition_env_states, dtype=object
+                ),
             }
             replay.append(payload, metadata={
                 "policy_version": version,
@@ -262,6 +356,7 @@ def run_async_evaluator(
     poll_seconds: float = 2.0,
     metrics_file: str | None = None,
     evaluation_dir: str | None = None,
+    replay_buffer_dir: str | None = None,
     decoder_type: str = "flow_matching",
 ) -> None:
     """Evaluate every Policy_n exactly once and strictly in version order."""
@@ -301,6 +396,10 @@ def run_async_evaluator(
                 ),
                 apply_tanh,
             )
+            if replay_buffer_dir is not None:
+                metrics.update(_record_q_gap_evaluation(
+                    agent, config, version, replay_buffer_dir
+                ))
             if metrics_file:
                 append_metrics(metrics_file, metrics)
             print(f"Evaluation completed for Policy_{version}.", flush=True)

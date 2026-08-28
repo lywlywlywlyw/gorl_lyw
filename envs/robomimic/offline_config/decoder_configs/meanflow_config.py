@@ -23,7 +23,7 @@ class MeanFlowConfig:
     meanflow_policy_output_scale: float = 1.0
     meanflow_normalize_observations: bool = True
     meanflow_flow_ratio: float = 0.5
-    meanflow_guidance_scale: float = 1.0
+    meanflow_guidance_scale: float = 2.0
     use_dispersive: bool = False
     meanflow_dispersive_loss_weight: float = 0.5
     def to_dict(self) -> dict:

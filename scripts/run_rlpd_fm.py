@@ -174,6 +174,7 @@ def _evaluator_worker(settings: dict) -> None:
         metrics_file=settings["metrics_file"],
         decoder_type=settings["decoder_type"],
         evaluation_dir=settings["evaluation_dir"],
+        replay_buffer_dir=settings["replay_dir"],
     )
 
 
@@ -513,11 +514,11 @@ def main(
     replay_capacity: int | None = 200000,
     collector_rollout_steps: int = 32,
     poll_seconds: float = 1.0,
-    collector_gpu_id: int = 1,
+    collector_gpu_id: int = 0,
     encoder_gpu_id: int = 1,
-    decoder_gpu_id: int = 1,
-    parent_gpu_id: int = 1,
-    evaluator_gpu_id: int = 1,
+    decoder_gpu_id: int = 2,
+    parent_gpu_id: int = 3,
+    evaluator_gpu_id: int = 3,
 ) -> None:
     """Run the asynchronous RLPD encoder + FM decoder training pipeline."""
     run_async_pipeline(

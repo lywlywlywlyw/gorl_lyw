@@ -440,6 +440,16 @@ class Decoder1StepFMState:
             r_less,
             jnp.where(relation < 2.0 / 3.0, r_greater, t),
         )
+        # r = jnp.where(
+        #     relation < 0.25,
+        #     r_less,
+        #     jnp.where(relation < 0.50, r_greater, t),
+        # )
+        # r = jnp.where(
+        #     relation < 0.5,
+        #     r_less,
+        #     jnp.where(relation <= 1.0, r_greater, t),
+        # )
         return t[:, None], r[:, None]
 
     def adaptive_l2_loss(
