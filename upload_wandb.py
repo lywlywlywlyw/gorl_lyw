@@ -241,8 +241,8 @@ def _initialize_wandb(args: argparse.Namespace, run_id: str, run_name: str) -> t
             "external_metrics_uploader": True,
         },
     )
-    # Preserve useful domain-specific x-axes while leaving collector and other
-    # events on W&B's normal event history axis.
+    # Encoder stages write a cumulative online optimizer step; a stage-local
+    # step would make W&B merge/overwrite train points from different versions.
     run.define_metric("pipeline/encoder_step")
     run.define_metric("train/*", step_metric="pipeline/encoder_step")
     run.define_metric("pipeline/decoder_step")

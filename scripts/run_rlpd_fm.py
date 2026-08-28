@@ -344,6 +344,15 @@ def run_async_pipeline(
             },
         )
         wandb_run.define_metric("pipeline/version")
+        # Training Q diagnostics use the cumulative online encoder optimizer
+        # step. Evaluation diagnostics, including q_gap for the offline Policy_0
+        # checkpoint, use policy version just like eval/success_rate.
+        wandb_run.define_metric("pipeline/encoder_step")
+        wandb_run.define_metric("train/*", step_metric="pipeline/encoder_step")
+        wandb_run.define_metric("q_gap", step_metric="pipeline/version")
+        wandb_run.define_metric("q_gap/*", step_metric="pipeline/version")
+        wandb_run.define_metric("estimated_value", step_metric="pipeline/version")
+        wandb_run.define_metric("true_value", step_metric="pipeline/version")
         for namespace in ("collector", "encoder", "decoder", "eval", "video"):
             wandb_run.define_metric(f"{namespace}/*", step_metric="pipeline/version")
         wandb_run.log({"pipeline/version": 0, "pipeline/started": 1})

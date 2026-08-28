@@ -180,18 +180,21 @@ def _record_q_gap_evaluation(
     config: dict,
     version: int,
     replay_buffer_dir: str,
+    warn: bool = True,
 ) -> dict[str, float | int]:
     """Compare current-critic estimates with restored-state MC returns."""
     replay = ChunkReplayBuffer(replay_buffer_dir)
     try:
         data = replay.load_snapshot()
     except (FileNotFoundError, ValueError):
-        warnings.warn("Skipping Q-gap evaluation because replay is empty.")
+        if warn:
+            warnings.warn("Skipping Q-gap evaluation because replay is empty.")
         return {}
 
     states = data.get("env_states")
     if states is None:
-        warnings.warn("Skipping Q-gap evaluation because replay has no env_states.")
+        if warn:
+            warnings.warn("Skipping Q-gap evaluation because replay has no env_states.")
         return {}
     valid = [
         index
@@ -202,13 +205,14 @@ def _record_q_gap_evaluation(
         and "time" in state
     ]
     if not valid:
-        warnings.warn(
-            "Skipping Q-gap evaluation because replay has no valid MuJoCo env_states."
-        )
+        if warn:
+            warnings.warn(
+                "Skipping Q-gap evaluation because replay has no valid MuJoCo env_states."
+            )
         return {}
 
     invalid_count = len(states) - len(valid)
-    if invalid_count:
+    if invalid_count and warn:
         warnings.warn(
             f"Skipping {invalid_count} replay entries with missing or invalid env_states."
         )
@@ -412,9 +416,24 @@ def run_async_evaluator(
                 apply_tanh,
             )
             if replay_buffer_dir is not None:
-                metrics.update(_record_q_gap_evaluation(
-                    agent, config, version, replay_buffer_dir
-                ))
+                # The evaluator starts concurrently with the collector.  In
+                # particular, Policy_0 is the offline checkpoint and its q-gap
+                # must wait for the first restored simulator states instead of
+                # being permanently skipped because replay is still empty.
+                q_gap_deadline = time.monotonic() + 300.0
+                while not stop.exists():
+                    q_gap = _record_q_gap_evaluation(
+                        agent, config, version, replay_buffer_dir, warn=False
+                    )
+                    if q_gap:
+                        metrics.update(q_gap)
+                        break
+                    if time.monotonic() >= q_gap_deadline:
+                        metrics.update(_record_q_gap_evaluation(
+                            agent, config, version, replay_buffer_dir, warn=True
+                        ))
+                        break
+                    time.sleep(poll_seconds)
             if metrics_file:
                 append_metrics(metrics_file, metrics)
             print(f"Evaluation completed for Policy_{version}.", flush=True)

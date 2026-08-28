@@ -382,6 +382,9 @@ def train_async_stage(
     missing = sorted(required_encoder.difference(previous))
     if missing:
         raise ValueError(f"Previous encoder checkpoint is missing fields: {missing}")
+    online_encoder_updates = int(previous.get("online_encoder_updates", 0))
+    if online_encoder_updates < 0:
+        raise ValueError("Previous encoder checkpoint has negative online_encoder_updates.")
     optimizer_keys = {
         "actor_opt_state": "rlpd_z_actor_opt_state",
         "critic_opt_state": "rlpd_z_critic_opt_state",
@@ -442,6 +445,19 @@ def train_async_stage(
             replay, demo, demo_ratio, config["rlpd_batch_size"], rng, decoder_state
         )
         if update == 0:
+            # Record the checkpoint critic before any online state mutation,
+            # including the first observation-statistics update.
+            initial_critic_metrics = encoder_state.evaluate_critic(batch)
+            if metrics_file:
+                append_metrics(metrics_file, {
+                    "pipeline/version": version,
+                    "pipeline/encoder_step": online_encoder_updates,
+                    **{
+                        f"train/{key}": float(np.asarray(value))
+                        for key, value in initial_critic_metrics.items()
+                        if key in ("predicted_qs", "target_qs")
+                    },
+                })
             encoder_state = encoder_state.update_observation_stats(
                 jnp.concatenate([batch.observations, batch.next_observations], axis=0)
             )
@@ -453,7 +469,10 @@ def train_async_stage(
         if metrics_file and ((update + 1) % 100 == 0 or update + 1 == updates):
             append_metrics(metrics_file, {
                 "pipeline/version": version,
-                "pipeline/encoder_step": update + 1,
+                # W&B custom step metrics must be monotonic across immutable
+                # Encoder_n stages. A stage-local update would repeatedly write
+                # x=0..updates and collapse all train curves onto the last stage.
+                "pipeline/encoder_step": online_encoder_updates + update + 1,
                 **{f"train/{key}": float(np.asarray(value)) for key, value in metrics.items()},
             })
 
@@ -465,6 +484,7 @@ def train_async_stage(
         "previous_encoder_checkpoint": str(Path(previous_encoder_checkpoint_path).resolve()),
         "train_env_steps": train_env_steps,
         "train_updates": updates,
+        "online_encoder_updates": online_encoder_updates + updates,
         "demo_ratio": demo_ratio,
         "replay_ratio": replay_ratio,
         "inherited_optimizer_state": inherit_optimizer_state,

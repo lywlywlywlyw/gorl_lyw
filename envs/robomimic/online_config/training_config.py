@@ -21,7 +21,7 @@ class TrainingConfig:
     encoder_type: str = "rlpd"
 
     # decoder training config
-    decoder_type: str = "meanflow"#"flow_matching"
+    decoder_type: str = "flow_matching"
 
     # Weights & Biases logging
     wandb_enabled: bool = True
