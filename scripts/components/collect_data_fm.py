@@ -182,7 +182,13 @@ def _record_q_gap_evaluation(
     replay_buffer_dir: str,
     warn: bool = True,
 ) -> dict[str, float | int]:
-    """Compare current-critic estimates with restored-state MC returns."""
+    """Compare current-critic estimates with restored-state MC returns.
+
+    The first action in each Monte Carlo rollout must be generated from the
+    exact same latent used for the critic estimate.  Also, bind the decoder
+    from this explicitly loaded evaluation agent rather than relying on an
+    agent-level mapping that could accidentally refer to another decoder.
+    """
     replay = ChunkReplayBuffer(replay_buffer_dir)
     try:
         data = replay.load_snapshot()
@@ -227,6 +233,11 @@ def _record_q_gap_evaluation(
     estimated_values: list[float] = []
     true_values: list[float] = []
     gamma = float(config["rlpd_discounting"])
+    # ``agent`` is loaded by the evaluator from the matching
+    # (encoder_version, decoder_version) pair.  Keep this decoder fixed for
+    # the whole evaluation, so Q-gap uses Decoder_n rather than any trainer
+    # state or a subsequently updated decoder.
+    evaluation_decoder = agent.fm_state
     try:
         for index in indices:
             eval_env.set_env_state(states[index])
@@ -251,13 +262,29 @@ def _record_q_gap_evaluation(
             )
             discounted_return = 0.0
             discount = 1.0
-            for _ in range(int(config["episode_length"])):
-                latent, _ = agent.sample_z(
+            for step in range(int(config["episode_length"])):
+                if step == 0:
+                    # Reuse the latent used by the critic above.  Do not
+                    # sample a second, independent z for the first return
+                    # step, even if the policy is stochastic in the future.
+                    return_latent = latent
+                else:
+                    return_latent, _ = agent.sample_z(
+                        state.obs[None, :],
+                        jax.random.key(
+                            int(config["seed"])
+                            + version * 100000
+                            + int(index) * 1000
+                            + step
+                        ),
+                        deterministic=True,
+                    )
+                action = evaluation_decoder.sample_action_from_z(
                     state.obs[None, :],
-                    jax.random.key(int(config["seed"]) + version * 100000 + int(index)),
+                    return_latent,
+                    jax.random.PRNGKey(0),
                     deterministic=True,
-                )
-                action = agent.map_z_to_action(state.obs[None, :], latent)[0]
+                )[0]
                 state = eval_env.step(state, action)
                 reward = float(onp.asarray(state.reward))
                 success = eval_env.is_success()
