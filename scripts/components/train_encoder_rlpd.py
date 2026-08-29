@@ -300,6 +300,7 @@ def _checkpoint(
         "rlpd_z_actor_opt_state": state.actor_opt_state,
         "rlpd_z_critic_opt_state": state.critic_opt_state,
         "rlpd_z_temperature_opt_state": state.temperature_opt_state,
+        "rlpd_z_latent_kl_multiplier": state.latent_kl_multiplier,
         "rlpd_z_obs_stats": state.obs_stats,
         "rlpd_z_prng": state.prng,
         "rlpd_z_steps": state.steps,
@@ -367,6 +368,8 @@ def train_async_stage(
         reward_bias=config["rlpd_reward_bias"],
         max_grad_norm=config["rlpd_max_grad_norm"],
         latent_kl_weight=config["rlpd_latent_kl_weight"],
+        latent_kl_threshold=config["rlpd_latent_kl_threshold"],
+        latent_kl_dual_learning_rate=config["rlpd_latent_kl_dual_learning_rate"],
         policy_update_period=config["rlpd_policy_update_period"],
         apply_tanh_in_rollout=config["rlpd_apply_tanh_in_rollout"],
     )
@@ -410,6 +413,9 @@ def train_async_stage(
         if encoder_config.learn_temperature and not previous_is_legacy_offline:
             encoder_state.log_temperature = previous["rlpd_z_log_temperature"]
         encoder_state.obs_stats = previous["rlpd_z_obs_stats"]
+        encoder_state.latent_kl_multiplier = previous.get(
+            "rlpd_z_latent_kl_multiplier", encoder_state.latent_kl_multiplier
+        )
         if inherit_optimizer_state:
             for name, key in optimizer_keys.items():
                 setattr(encoder_state, name, previous[key])
@@ -589,6 +595,8 @@ def main(
         reward_bias=config["rlpd_reward_bias"],
         max_grad_norm=config["rlpd_max_grad_norm"],
         latent_kl_weight=config["rlpd_latent_kl_weight"],
+        latent_kl_threshold=config["rlpd_latent_kl_threshold"],
+        latent_kl_dual_learning_rate=config["rlpd_latent_kl_dual_learning_rate"],
         policy_update_period=config["rlpd_policy_update_period"],
         apply_tanh_in_rollout=config["rlpd_apply_tanh_in_rollout"],
     )
@@ -632,6 +640,9 @@ def main(
             ):
                 state.log_temperature = encoder_checkpoint["rlpd_z_log_temperature"]
             state.obs_stats = encoder_checkpoint["rlpd_z_obs_stats"]
+            state.latent_kl_multiplier = encoder_checkpoint.get(
+                "rlpd_z_latent_kl_multiplier", state.latent_kl_multiplier
+            )
             # Never inherit an offline optimizer. Online-to-online continuation
             # may preserve optimizer/PRNG/step state as before.
             if not encoder_checkpoint_is_offline:

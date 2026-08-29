@@ -66,7 +66,10 @@ def _load_policy_pair(
         encoder_state.target_critic_params = encoder_checkpoint["rlpd_z_target_critic_params"]
         encoder_state.log_temperature = encoder_checkpoint["rlpd_z_log_temperature"]
         encoder_state.obs_stats = encoder_checkpoint["rlpd_z_obs_stats"]
-        for name in ("actor_opt_state", "critic_opt_state", "temperature_opt_state", "prng", "steps"):
+        for name in (
+            "actor_opt_state", "critic_opt_state", "temperature_opt_state",
+            "latent_kl_multiplier", "prng", "steps",
+        ):
             key = f"rlpd_z_{name}"
             if key in encoder_checkpoint:
                 setattr(encoder_state, name, encoder_checkpoint[key])
@@ -602,6 +605,7 @@ def main(
                 "actor_opt_state",
                 "critic_opt_state",
                 "temperature_opt_state",
+                "latent_kl_multiplier",
                 "prng",
                 "steps",
             ):

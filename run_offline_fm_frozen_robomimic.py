@@ -303,6 +303,8 @@ def make_rlpd_encoder_config(
         reward_bias=config.rlpd_reward_bias,
         max_grad_norm=config.rlpd_max_grad_norm,
         latent_kl_weight=config.rlpd_latent_kl_weight,
+        latent_kl_threshold=config.rlpd_latent_kl_threshold,
+        latent_kl_dual_learning_rate=config.rlpd_latent_kl_dual_learning_rate,
         policy_update_period=config.rlpd_policy_update_period,
         apply_tanh_in_rollout=config.rlpd_apply_tanh_in_rollout,
     )
@@ -867,6 +869,9 @@ def save_offline_checkpoint(
         "rlpd_temperature_parameterization": "softplus_raw",
         "rlpd_z_log_temperature": jnp.log(
             jnp.expm1(jnp.asarray(rlpd_config.initial_temperature))
+        ),
+        "rlpd_z_latent_kl_multiplier": jnp.asarray(
+            rlpd_config.latent_kl_weight
         ),
         "rlpd_z_obs_stats": encoder_obs_stats,
         # Offline-only training state/metadata.

@@ -36,6 +36,8 @@ class EncoderConfig:
     reward_bias: float = 0.0
     max_grad_norm: float = 10.0
     latent_kl_weight: float = 0.1
+    latent_kl_threshold: float = 0.1
+    latent_kl_dual_learning_rate: float = 1e-3
     learn_temperature: jdc.Static[bool] = False
     policy_update_period: jdc.Static[int] = 20
     apply_tanh_in_rollout: jdc.Static[bool] = True
@@ -71,6 +73,7 @@ class EncoderState:
     actor_opt_state: optax.OptState
     critic_opt_state: optax.OptState
     temperature_opt_state: optax.OptState
+    latent_kl_multiplier: Array
     obs_stats: math_utils.RunningStats
     prng: Array
     steps: Array
@@ -83,6 +86,10 @@ class EncoderState:
             raise ValueError("initial_temperature must be positive")
         if config.latent_kl_weight < 0.0:
             raise ValueError("latent_kl_weight must be non-negative")
+        if config.latent_kl_threshold < 0.0:
+            raise ValueError("latent_kl_threshold must be non-negative")
+        if config.latent_kl_dual_learning_rate < 0.0:
+            raise ValueError("latent_kl_dual_learning_rate must be non-negative")
         obs_dim = int(env.observation_size)
         actor_key, critic_key, prng = jax.random.split(prng, 3)
         actor_dims = (obs_dim,) + (config.hidden_size,) * config.hidden_layers + (
@@ -115,6 +122,7 @@ class EncoderState:
             actor_opt_state=actor_optimizer.init(actor_params),
             critic_opt_state=critic_optimizer.init(critic_params),
             temperature_opt_state=temperature_optimizer.init(log_temperature),
+            latent_kl_multiplier=jnp.asarray(config.latent_kl_weight),
             obs_stats=math_utils.RunningStats.init((obs_dim,)),
             prng=prng,
             steps=jnp.zeros((), dtype=jnp.int32),
@@ -316,10 +324,15 @@ class EncoderState:
                 jnp.square(mean) + jnp.square(std) - 1.0 - 2.0 * jnp.log(std),
                 axis=-1,
             )
-            loss = jnp.mean(
-                temperature * log_probs
-                - q
-                + self.config.latent_kl_weight * prior_kl
+            # z_dim equals the environment action dimension in this pipeline.
+            # Per-dimension normalization keeps kappa invariant to that size.
+            constrained_kl = jnp.mean(prior_kl) / float(self.config.z_dim)
+            kl_violation = jax.nn.relu(
+                constrained_kl - self.config.latent_kl_threshold
+            )
+            loss = jnp.mean(temperature * log_probs - q) + (
+                jax.lax.stop_gradient(self.latent_kl_multiplier)
+                * jnp.square(kl_violation)
             )
             return loss, (
                 jnp.mean(-log_probs),
@@ -333,6 +346,8 @@ class EncoderState:
                 jnp.max(std),
                 jnp.mean(jnp.linalg.norm(actions, axis=-1)),
                 jnp.max(jnp.abs(actions)),
+                constrained_kl,
+                kl_violation,
             )
 
         (actor_loss, actor_aux), actor_grads = jax.value_and_grad(
@@ -350,6 +365,8 @@ class EncoderState:
             latent_std_max,
             latent_norm,
             latent_max_abs,
+            constrained_kl,
+            latent_kl_violation,
         ) = actor_aux
         actor_optimizer = optax.chain(
             optax.clip_by_global_norm(self.config.max_grad_norm),
@@ -359,6 +376,17 @@ class EncoderState:
             actor_grads, self.actor_opt_state, self.actor_params
         )
         actor_params = optax.apply_updates(self.actor_params, actor_updates)
+
+        # Projected dual ascent for C_KL <= kappa. This changes only lambda;
+        # the actor receives no KL gradient while it is inside the dead zone.
+        latent_kl_multiplier = jnp.maximum(
+            0.0,
+            self.latent_kl_multiplier
+            + self.config.latent_kl_dual_learning_rate
+            * jax.lax.stop_gradient(
+                constrained_kl - self.config.latent_kl_threshold
+            ),
+        )
 
         # Temperature is fixed by default while the explicit decoder-prior KL
         # regularizes the actor. Keep the old update path behind a config flag
@@ -396,6 +424,7 @@ class EncoderState:
             log_temperature=log_temperature,
             actor_opt_state=actor_opt_state,
             temperature_opt_state=temperature_opt_state,
+            latent_kl_multiplier=latent_kl_multiplier,
             prng=rng,
         )
         return state, {
@@ -406,6 +435,9 @@ class EncoderState:
             "temperature_loss": temperature_loss,
             "actor_grad_norm": _global_norm(actor_grads),
             "latent_prior_kl": latent_prior_kl,
+            "latent_constrained_kl": constrained_kl,
+            "latent_kl_violation": latent_kl_violation,
+            "latent_kl_multiplier": latent_kl_multiplier,
             "latent_mean": latent_mean,
             "latent_mean_abs": latent_mean_abs,
             "latent_std": latent_std,

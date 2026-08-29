@@ -2,6 +2,7 @@
 
 import datetime
 import json
+import math
 import os
 import pickle
 
@@ -124,36 +125,80 @@ def _decoder_worker(settings: dict) -> None:
     manager = VersionManager(settings["versions_dir"])
     replay = ChunkReplayBuffer(settings["replay_dir"], settings["replay_capacity"])
     stop = Path(settings["stop_file"])
+    last_accepted_replay_size = 0
+    last_attempt_replay_size = 0
     for version in range(settings["start_version"], settings["max_version"] + 1):
         previous_decoder = manager.wait_component("decoder", version - 1, settings["poll_seconds"], stop)
-        _wait_for_replay(replay, settings["minimum_replay_size"], stop, settings["poll_seconds"])
-        latest_encoder = manager.latest_component("encoder")
-        if latest_encoder is None:
-            raise RuntimeError("No encoder is available for decoder training.")
-        encoder_version, encoder = latest_encoder
-        snapshot = Path(settings["snapshots_dir"]) / f"decoder_{version}_replay.pkl"
-        _write_replay_snapshot(replay, snapshot)
-        temporary_output = Path(settings["work_dir"]) / f"decoder_{version}.pkl"
-        train_async_stage(
-            encoder_checkpoint_path=str(encoder),
-            previous_decoder_checkpoint_path=str(previous_decoder),
-            replay_snapshot_path=str(snapshot),
-            output_checkpoint_path=str(temporary_output),
-            version=version,
-            train_steps=settings["decoder_train_steps"],
-            metrics_file=settings["metrics_file"],
-            inherit_optimizer_state=version > 1,
-            decoder_type=settings["decoder_type"],
-        )
-        manager.publish_component("decoder", version, temporary_output, {
-            "version": version,
-            "fixed_encoder_version": encoder_version,
-            "previous_decoder_version": version - 1,
-            "replay_snapshot": str(snapshot),
-            "train_steps": settings["decoder_train_steps"],
-            "inherited_optimizer_state": version > 1,
-        })
-        temporary_output.unlink(missing_ok=True)
+        while True:
+            required_size = max(
+                settings["minimum_replay_size"],
+                last_attempt_replay_size
+                + settings["decoder_new_data_threshold"] + 1,
+            )
+            _wait_for_replay(replay, required_size, stop, settings["poll_seconds"])
+            replay_size = replay.size()
+            new_samples = replay_size - last_accepted_replay_size
+            latest_encoder = manager.latest_component("encoder")
+            if latest_encoder is None:
+                raise RuntimeError("No encoder is available for decoder training.")
+            encoder_version, encoder = latest_encoder
+            snapshot = Path(settings["snapshots_dir"]) / (
+                f"decoder_{version}_replay_{replay_size}.pkl"
+            )
+            _write_replay_snapshot(replay, snapshot)
+            with previous_decoder.open("rb") as file:
+                decoder_checkpoint = pickle.load(file)
+            decoder_batch_size = int(decoder_checkpoint["config"].batch_size)
+            train_steps = min(
+                settings["decoder_train_steps"],
+                max(
+                    1,
+                    math.ceil(
+                        settings["decoder_epoch_coefficient"]
+                        * new_samples / decoder_batch_size
+                    ),
+                ),
+            )
+            temporary_output = Path(settings["work_dir"]) / f"decoder_{version}.pkl"
+            acceptance = train_async_stage(
+                encoder_checkpoint_path=str(encoder),
+                previous_decoder_checkpoint_path=str(previous_decoder),
+                replay_snapshot_path=str(snapshot),
+                output_checkpoint_path=str(temporary_output),
+                version=version,
+                train_steps=train_steps,
+                metrics_file=settings["metrics_file"],
+                inherit_optimizer_state=version > 1,
+                decoder_type=settings["decoder_type"],
+                validation_fraction=settings["decoder_validation_fraction"],
+                validation_batches=settings["decoder_validation_batches"],
+                meanflow_min_improvement=settings["decoder_meanflow_min_improvement"],
+                cycle_error_tolerance=settings["decoder_cycle_error_tolerance"],
+            )
+            last_attempt_replay_size = replay_size
+            if not acceptance["accepted"]:
+                temporary_output.unlink(missing_ok=True)
+                snapshot.unlink(missing_ok=True)
+                print(
+                    f"[decoder] rejected candidate {version}: {acceptance}",
+                    flush=True,
+                )
+                continue
+            manager.publish_component("decoder", version, temporary_output, {
+                "version": version,
+                "fixed_encoder_version": encoder_version,
+                "previous_decoder_version": version - 1,
+                "replay_snapshot": str(snapshot),
+                "replay_size": replay_size,
+                "new_samples_since_last_decoder": new_samples,
+                "train_steps": train_steps,
+                "epoch_coefficient": settings["decoder_epoch_coefficient"],
+                "acceptance": acceptance,
+                "inherited_optimizer_state": version > 1,
+            })
+            last_accepted_replay_size = replay_size
+            temporary_output.unlink(missing_ok=True)
+            break
 
 
 def _collector_worker(settings: dict) -> None:
@@ -224,7 +269,15 @@ def run_async_pipeline(
     run_dir: str | None = None,
     num_versions: int = 24,
     encoder_train_env_steps: int = 1000,
+    # Maximum decoder optimizer steps per accepted candidate. The actual count
+    # is ceil(c * N_new / B_D), capped by this value.
     decoder_train_steps: int = 500,
+    decoder_new_data_threshold: int = 32_768,
+    decoder_epoch_coefficient: float = 1.0,
+    decoder_meanflow_min_improvement: float = 1e-4,
+    decoder_cycle_error_tolerance: float = 1e-6,
+    decoder_validation_fraction: float = 0.1,
+    decoder_validation_batches: int = 4,
     encoder_demo_ratio: float = 0.5,
     encoder_replay_ratio: float = 0.5,
     minimum_replay_size: int = 49152,
@@ -248,6 +301,16 @@ def run_async_pipeline(
         raise ValueError("num_versions must be at least 1")
     if minimum_replay_size < 1:
         raise ValueError("minimum_replay_size must be positive")
+    if decoder_train_steps < 1 or decoder_new_data_threshold < 1:
+        raise ValueError("Decoder step cap and new-data threshold must be positive")
+    if not 0.5 <= decoder_epoch_coefficient <= 2.0:
+        raise ValueError("decoder_epoch_coefficient must be in [0.5, 2.0]")
+    if decoder_meanflow_min_improvement < 0.0 or decoder_cycle_error_tolerance < 0.0:
+        raise ValueError("Decoder acceptance tolerances must be non-negative")
+    if not 0.0 < decoder_validation_fraction < 1.0:
+        raise ValueError("decoder_validation_fraction must be between 0 and 1")
+    if decoder_validation_batches < 1:
+        raise ValueError("decoder_validation_batches must be positive")
     worker_gpu_ids = {
         "collector": collector_gpu_id,
         "encoder": encoder_gpu_id,
@@ -310,6 +373,12 @@ def run_async_pipeline(
         "start_version": 1, "max_version": num_versions,
         "encoder_train_env_steps": encoder_train_env_steps,
         "decoder_train_steps": decoder_train_steps,
+        "decoder_new_data_threshold": decoder_new_data_threshold,
+        "decoder_epoch_coefficient": decoder_epoch_coefficient,
+        "decoder_meanflow_min_improvement": decoder_meanflow_min_improvement,
+        "decoder_cycle_error_tolerance": decoder_cycle_error_tolerance,
+        "decoder_validation_fraction": decoder_validation_fraction,
+        "decoder_validation_batches": decoder_validation_batches,
         "encoder_demo_ratio": encoder_demo_ratio,
         "encoder_replay_ratio": encoder_replay_ratio,
         "minimum_replay_size": minimum_replay_size,
@@ -525,8 +594,14 @@ def main(
     demo_buffer_path: str,
     run_dir: str | None = None,
     num_versions: int = 50,
-    encoder_train_env_steps: int = 250,
+    encoder_train_env_steps: int = 50,
     decoder_train_steps: int = 250,
+    decoder_new_data_threshold: int = 32_768,
+    decoder_epoch_coefficient: float = 1.0,
+    decoder_meanflow_min_improvement: float = 1e-4,
+    decoder_cycle_error_tolerance: float = 1e-6,
+    decoder_validation_fraction: float = 0.1,
+    decoder_validation_batches: int = 4,
     encoder_demo_ratio: float = 0.5,
     encoder_replay_ratio: float = 0.5,
     minimum_replay_size: int = 8192,#49152,
@@ -547,6 +622,12 @@ def main(
         num_versions=num_versions,
         encoder_train_env_steps=encoder_train_env_steps,
         decoder_train_steps=decoder_train_steps,
+        decoder_new_data_threshold=decoder_new_data_threshold,
+        decoder_epoch_coefficient=decoder_epoch_coefficient,
+        decoder_meanflow_min_improvement=decoder_meanflow_min_improvement,
+        decoder_cycle_error_tolerance=decoder_cycle_error_tolerance,
+        decoder_validation_fraction=decoder_validation_fraction,
+        decoder_validation_batches=decoder_validation_batches,
         encoder_demo_ratio=encoder_demo_ratio,
         encoder_replay_ratio=encoder_replay_ratio,
         minimum_replay_size=minimum_replay_size,
