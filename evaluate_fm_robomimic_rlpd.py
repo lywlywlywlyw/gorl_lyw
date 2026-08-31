@@ -345,6 +345,7 @@ def load_policy(config: EvaluationConfig) -> LoadedPolicy:
     from flow_policy import networks
     from flow_policy.decoder_1step_fm_residualMLP import Decoder1StepFMState
     from flow_policy.decoder_fm import DecoderFMState
+    from flow_policy.config_utils import fill_unspecified_config_values
 
     (
         checkpoint_path,
@@ -393,6 +394,15 @@ def load_policy(config: EvaluationConfig) -> LoadedPolicy:
     decoder_state_cls = (
         Decoder1StepFMState if decoder_type == "meanflow" else DecoderFMState
     )
+    if decoder_type == "meanflow":
+        from envs.robomimic.online_config.decoder_configs.meanflow_config import (
+            MeanFlowConfig,
+        )
+
+        decoder_config = fill_unspecified_config_values(
+            decoder_config,
+            warm_up_epoch=MeanFlowConfig().meanflow_warm_up_epoch,
+        )
     decoder = decoder_state_cls.init(
         jax.random.key(config.seed + 1), obs_dim, action_dim, decoder_config
     )

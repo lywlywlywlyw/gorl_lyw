@@ -17,6 +17,7 @@ import optax
 from jax import Array
 from jax import numpy as jnp
 
+from .config_utils import require_config_values
 
 
 class SinusoidalPosEmb(nn.Module):
@@ -134,38 +135,38 @@ class ConditionalResidualMLP(nn.Module):
 
 @jdc.pytree_dataclass
 class Decoder1StepFMConfig:
-    timestep_embed_dim: jdc.Static[int] = 128
-    hidden_dim: jdc.Static[int] = 512
-    num_res_blocks: jdc.Static[int] = 4
-    mlp_expansion: jdc.Static[int] = 2
-    condition_type: jdc.Static[str] = "film"
+    timestep_embed_dim: jdc.Static[int | None] = None
+    hidden_dim: jdc.Static[int | None] = None
+    num_res_blocks: jdc.Static[int | None] = None
+    mlp_expansion: jdc.Static[int | None] = None
+    condition_type: jdc.Static[str | None] = None
 
-    policy_output_scale: float = 1.0
-    learning_rate: float = 1e-4
-    optimizer_beta1: float = 0.95
-    optimizer_beta2: float = 0.999
-    optimizer_eps: float = 1e-8
-    optimizer_weight_decay: float = 1e-6
-    batch_size: jdc.Static[int] = 128
+    policy_output_scale: float | None = None
+    learning_rate: float | None = None
+    optimizer_beta1: float | None = None
+    optimizer_beta2: float | None = None
+    optimizer_eps: float | None = None
+    optimizer_weight_decay: float | None = None
+    batch_size: jdc.Static[int | None] = None
 
-    normalize_observations: jdc.Static[bool] = True
-    normalization_mode: jdc.Static[str] = "gaussian"
-    flow_ratio: float = 0.5
-    time_dist: jdc.Static[str] = "lognorm"
-    lognorm_mu: float = -0.4
-    lognorm_sigma: float = 1.0
-    adaptive_loss_gamma: float = 0.5
-    adaptive_loss_c: float = 1e-3
-    guidance_scale: float = 2.0
-    use_dispersive: jdc.Static[bool] = False
-    dispersive_loss_weight: float = 0.5
-    bifm_loss_weight: float = 0.05
-    warm_up_epoch = 0
-    dispersive_tau: float = 1.0
-    dispersive_chunk_size: jdc.Static[int] = 512
-    use_lbifm: jdc.Static[bool] = False
-    feather_std: float = 0.0
-    latent_kl_weight: float = 1.0
+    normalize_observations: jdc.Static[bool | None] = None
+    normalization_mode: jdc.Static[str | None] = None
+    flow_ratio: float | None = None
+    time_dist: jdc.Static[str | None] = None
+    lognorm_mu: float | None = None
+    lognorm_sigma: float | None = None
+    adaptive_loss_gamma: float | None = None
+    adaptive_loss_c: float | None = None
+    guidance_scale: float | None = None
+    use_dispersive: jdc.Static[bool | None] = None
+    dispersive_loss_weight: float | None = None
+    bifm_loss_weight: float | None = None
+    warm_up_epoch: jdc.Static[int | None] = None
+    dispersive_tau: float | None = None
+    dispersive_chunk_size: jdc.Static[int | None] = None
+    use_lbifm: jdc.Static[bool | None] = None
+    feather_std: float | None = None
+    latent_kl_weight: float | None = None
 
 
 @jdc.pytree_dataclass
@@ -235,6 +236,7 @@ class Decoder1StepFMState:
         action_dim: int,
         config: Decoder1StepFMConfig,
     ) -> "Decoder1StepFMState":
+        require_config_values(config)
         if config.condition_type != "film":
             raise ValueError("ConditionalResidualMLP supports FiLM conditioning.")
         if config.timestep_embed_dim < 4 or config.timestep_embed_dim % 2:

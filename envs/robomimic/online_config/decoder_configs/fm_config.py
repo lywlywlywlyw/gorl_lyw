@@ -25,11 +25,9 @@ class FlowMatchingConfig:
     fm_sde_sigma: float = 0.0
     fm_feather_std: float = 0.0
 
-    fm_reward_percentile: float = 0.0  
-    fm_min_episode_reward: float | None = None  
-    fm_hybrid_sampling: bool = False  
+    fm_reward_percentile: float = 0.0
+    fm_min_episode_reward: float | None = None
     fm_validation_split: float = 0.1
-    fm_n_samples_per_action: int = 8
 
     def to_dict(self):
         return asdict(self)

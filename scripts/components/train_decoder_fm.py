@@ -17,9 +17,11 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from flow_policy.decoder_fm import DecoderFMConfig, DecoderFMState
 from flow_policy.decoder_1step_fm_residualMLP import Decoder1StepFMConfig, Decoder1StepFMState
+from flow_policy.config_utils import fill_unspecified_config_values
 from flow_policy import networks
 from envs.robomimic.online_config.training_config import TrainingConfig
 from envs.robomimic.online_config.env_config import EnvConfig
+from envs.robomimic.online_config.decoder_configs.meanflow_config import MeanFlowConfig
 try:
     from .metrics_ipc import append_metrics
     from .online_pipeline_ipc import atomic_pickle_dump, load_transition_data
@@ -58,11 +60,17 @@ def evaluate_decoder_update_need(
     observations = jnp.asarray(replay["observations"][indices])
     actions = jnp.asarray(replay["actions"][indices])
     state_cls = Decoder1StepFMState if decoder_type == "meanflow" else DecoderFMState
+    decoder_config = decoder_checkpoint["config"]
+    if decoder_type == "meanflow":
+        decoder_config = fill_unspecified_config_values(
+            decoder_config,
+            warm_up_epoch=MeanFlowConfig().meanflow_warm_up_epoch,
+        )
     decoder = state_cls.init(
         jax.random.PRNGKey(seed + 1),
         int(decoder_checkpoint["obs_dim"]),
         int(decoder_checkpoint["action_dim"]),
-        decoder_checkpoint["config"],
+        decoder_config,
     )
     with jdc.copy_and_mutate(decoder) as decoder:
         decoder.params = decoder_checkpoint["params"]
@@ -179,6 +187,11 @@ def train_async_stage(
         raise ValueError("Replay action dimension does not match decoder.")
 
     decoder_config = previous["config"]
+    if decoder_type == "meanflow":
+        decoder_config = fill_unspecified_config_values(
+            decoder_config,
+            warm_up_epoch=config["meanflow_warm_up_epoch"],
+        )
     state_cls = Decoder1StepFMState if decoder_type == "meanflow" else DecoderFMState
     expected_config = Decoder1StepFMConfig if decoder_type == "meanflow" else DecoderFMConfig
     if not isinstance(decoder_config, expected_config):
@@ -573,22 +586,19 @@ def train_fm(
     obs_dim = states.shape[1]
     action_dim = actions.shape[1]
 
-    # Build hidden dims from parameters
-    hidden_dims = tuple([config['fm_hidden_size']] * config['fm_num_layers'])
-
     if resume_checkpoint is None:
         decoder_config = DecoderFMConfig(
-            flow_steps=10,
-            timestep_embed_dim=8,  # FPO uses 8
-            hidden_dims=hidden_dims,  # Configurable network size
-            policy_output_scale=1.0,  # Changed to 1.0 for supervised learning
+            flow_steps=config['fm_flow_steps'],
+            timestep_embed_dim=config['fm_timestep_embed_dim'],
+            hidden_dims=config['fm_hidden_dims'],
+            policy_output_scale=config['fm_policy_output_scale'],
             learning_rate=config['fm_learning_rate'],
             batch_size=config['fm_batch_size'],
             num_epochs=config['fm_num_epochs'],
-            n_samples_per_action=config['fm_n_samples_per_action'],  # FPO's actual default
-            normalize_observations=True,
-            sde_sigma=0.0,
-            feather_std=0.0,
+            n_samples_per_action=config['fm_n_samples_per_action'],
+            normalize_observations=config['fm_normalize_observations'],
+            sde_sigma=config['fm_sde_sigma'],
+            feather_std=config['fm_feather_std'],
         )
     else:
         if int(resume_checkpoint["obs_dim"]) != obs_dim:

@@ -30,7 +30,7 @@ class RLPDConfig:
     # the decoder's standard-normal latent support.  The legacy ``kl`` names
     # are retained for checkpoint and CLI compatibility; this is no longer a
     # KL-to-N(0, I) matching loss.
-    rlpd_latent_kl_weight: float = 1.0
+    rlpd_latent_kl_weight: float = 0.0
     # Allowed mean squared support overflow. Zero enforces containment.
     rlpd_latent_kl_threshold: float = 0.0
     rlpd_latent_kl_dual_learning_rate: float = 1e-3

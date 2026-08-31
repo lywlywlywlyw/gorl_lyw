@@ -11,6 +11,7 @@ from typing import NamedTuple
 
 from flow_policy.networks import MlpWeights
 from . import math_utils, networks
+from .config_utils import require_config_values
 
 
 class FlowSchedule(NamedTuple):
@@ -24,25 +25,25 @@ class DecoderFMConfig:
     """Configuration for Flow Matching - matching FPO."""
 
     # Flow parameters
-    flow_steps: jdc.Static[int] = 10
-    timestep_embed_dim: jdc.Static[int] = 8
+    flow_steps: jdc.Static[int | None] = None
+    timestep_embed_dim: jdc.Static[int | None] = None
 
     # Network architecture - increased for supervised learning
-    hidden_dims: jdc.Static[tuple[int, ...]] = (64, 64, 64, 64)
-    policy_output_scale: float = 1.0  # Changed from 0.25 for supervised learning
+    hidden_dims: jdc.Static[tuple[int, ...] | None] = None
+    policy_output_scale: float | None = None
 
     # Training parameters
-    learning_rate: float = 3e-4
-    batch_size: jdc.Static[int] = 8192
-    num_epochs: jdc.Static[int] = 50
-    n_samples_per_action: jdc.Static[int] = 8  # FPO default
+    learning_rate: float | None = None
+    batch_size: jdc.Static[int | None] = None
+    num_epochs: jdc.Static[int | None] = None
+    n_samples_per_action: jdc.Static[int | None] = None
 
     # Data parameters
-    normalize_observations: jdc.Static[bool] = True
+    normalize_observations: jdc.Static[bool | None] = None
 
     # SDE parameters from FPO (usually 0)
-    sde_sigma: float = 0.0
-    feather_std: float = 0.0
+    sde_sigma: float | None = None
+    feather_std: float | None = None
 
 
 @jdc.pytree_dataclass
@@ -65,6 +66,8 @@ class DecoderFMState:
         config: DecoderFMConfig
     ) -> DecoderFMState:
         """Initialize FM state - matching FPO."""
+
+        require_config_values(config)
 
         prng0, prng1 = jax.random.split(prng)
 

@@ -12,38 +12,39 @@ import optax
 from jax import Array
 
 from . import math_utils, networks
+from .config_utils import require_config_values
 
 
 @jdc.pytree_dataclass
 class EncoderConfig:
-    learning_rate: float
-    critic_learning_rate: float
-    temperature_learning_rate: float
-    discounting: float
-    episode_length: jdc.Static[int]
-    normalize_observations: jdc.Static[bool]
-    num_envs: jdc.Static[int]
-    z_dim: jdc.Static[int]
-    hidden_size: jdc.Static[int] = 256
-    hidden_layers: jdc.Static[int] = 2
-    critic_ensemble_size: jdc.Static[int] = 10
-    critic_subsample_size: jdc.Static[int] = 2
-    target_update_rate: float = 0.005
-    initial_temperature: float = 1.0
+    learning_rate: float | None = None
+    critic_learning_rate: float | None = None
+    temperature_learning_rate: float | None = None
+    discounting: float | None = None
+    episode_length: jdc.Static[int | None] = None
+    normalize_observations: jdc.Static[bool | None] = None
+    num_envs: jdc.Static[int | None] = None
+    z_dim: jdc.Static[int | None] = None
+    hidden_size: jdc.Static[int | None] = None
+    hidden_layers: jdc.Static[int | None] = None
+    critic_ensemble_size: jdc.Static[int | None] = None
+    critic_subsample_size: jdc.Static[int | None] = None
+    target_update_rate: float | None = None
+    initial_temperature: float | None = None
     target_entropy: float | None = None
-    backup_entropy: jdc.Static[bool] = False
-    reward_scaling: float = 1.0
-    reward_bias: float = 0.0
-    max_grad_norm: float = 10.0
-    latent_kl_weight: float = 0.1
-    latent_kl_threshold: float = 0.0
-    latent_kl_dual_learning_rate: float = 1e-3
-    latent_prior_support_radius: float = 3.0
-    latent_policy_support_stddevs: float = 3.0
-    actor_mean_bound: float = 3.0
-    learn_temperature: jdc.Static[bool] = False
-    policy_update_period: jdc.Static[int] = 20
-    apply_tanh_in_rollout: jdc.Static[bool] = True
+    backup_entropy: jdc.Static[bool | None] = None
+    reward_scaling: float | None = None
+    reward_bias: float | None = None
+    max_grad_norm: float | None = None
+    latent_kl_weight: float | None = None
+    latent_kl_threshold: float | None = None
+    latent_kl_dual_learning_rate: float | None = None
+    latent_prior_support_radius: float | None = None
+    latent_policy_support_stddevs: float | None = None
+    actor_mean_bound: float | None = None
+    learn_temperature: jdc.Static[bool | None] = None
+    policy_update_period: jdc.Static[int | None] = None
+    apply_tanh_in_rollout: jdc.Static[bool | None] = None
 
 
 class RLPDActionInfo(NamedTuple):
@@ -119,6 +120,10 @@ class EncoderState:
 
     @staticmethod
     def init(prng: Array, env: Any, config: EncoderConfig) -> "EncoderState":
+        require_config_values(
+            config,
+            allow_none=("target_entropy", "critic_subsample_size"),
+        )
         if config.initial_temperature <= 0.0:
             raise ValueError("initial_temperature must be positive")
         if config.latent_kl_weight < 0.0:

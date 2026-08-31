@@ -956,26 +956,53 @@ def main(config: ConfigView) -> None:
         if config.decoder_type == "meanflow":
             decoder_config = Decoder1StepFMConfig(
                 timestep_embed_dim=config.meanflow_timestep_embed_dim,
-                hidden_dim=config.meanflow_hidden_dim, num_res_blocks=config.meanflow_num_res_blocks,
+                hidden_dim=config.meanflow_hidden_dim,
+                num_res_blocks=config.meanflow_num_res_blocks,
                 mlp_expansion=config.meanflow_mlp_expansion,
-                policy_output_scale=config.meanflow_policy_output_scale, learning_rate=config.decoder_learning_rate,
+                condition_type=config.meanflow_condition_type,
+                policy_output_scale=config.meanflow_policy_output_scale,
+                learning_rate=config.decoder_learning_rate,
+                optimizer_beta1=config.meanflow_optimizer_beta1,
+                optimizer_beta2=config.meanflow_optimizer_beta2,
+                optimizer_eps=config.meanflow_optimizer_eps,
+                optimizer_weight_decay=config.meanflow_optimizer_weight_decay,
                 batch_size=config.decoder_batch_size,
                 normalize_observations=config.meanflow_normalize_observations,
-                normalization_mode="gaussian",
+                normalization_mode=config.meanflow_normalization_mode,
                 flow_ratio=config.meanflow_flow_ratio,
-                guidance_scale=config.meanflow_guidance_scale, use_dispersive=config.use_dispersive, dispersive_loss_weight=config.meanflow_dispersive_loss_weight,
-                latent_kl_weight=config.rlpd_latent_kl_weight,
+                time_dist=config.meanflow_time_dist,
+                lognorm_mu=config.meanflow_lognorm_mu,
+                lognorm_sigma=config.meanflow_lognorm_sigma,
+                adaptive_loss_gamma=config.meanflow_adaptive_loss_gamma,
+                adaptive_loss_c=config.meanflow_adaptive_loss_c,
+                guidance_scale=config.meanflow_guidance_scale,
+                use_dispersive=config.use_dispersive,
+                dispersive_loss_weight=config.meanflow_dispersive_loss_weight,
+                bifm_loss_weight=config.meanflow_bifm_loss_weight,
+                warm_up_epoch=config.meanflow_warm_up_epoch,
+                dispersive_tau=config.meanflow_dispersive_tau,
+                dispersive_chunk_size=config.meanflow_dispersive_chunk_size,
+                use_lbifm=config.meanflow_use_lbifm,
+                feather_std=config.meanflow_feather_std,
+                latent_kl_weight=config.meanflow_latent_kl_weight,
             )
             decoder = Decoder1StepFMState.init(decoder_key, obs_dim, action_dim, decoder_config)
             with jdc.copy_and_mutate(decoder) as decoder:
                 decoder.obs_stats = decoder.obs_stats.update(jnp.asarray(buffer.observations))
         else:
-            decoder_config = DecoderFMConfig(flow_steps=config.flow_steps, timestep_embed_dim=config.timestep_embed_dim,
+            decoder_config = DecoderFMConfig(
+                flow_steps=config.flow_steps,
+                timestep_embed_dim=config.timestep_embed_dim,
                 hidden_dims=(config.decoder_hidden_size,) * config.decoder_num_layers,
-                policy_output_scale=config.fm_policy_output_scale, learning_rate=config.decoder_learning_rate,
-                batch_size=config.decoder_batch_size, num_epochs=config.decoder_max_epochs,
-                n_samples_per_action=config.n_fm_samples_per_action, normalize_observations=config.fm_normalize_observations,
-                sde_sigma=config.fm_sde_sigma, feather_std=config.fm_feather_std)
+                policy_output_scale=config.fm_policy_output_scale,
+                learning_rate=config.decoder_learning_rate,
+                batch_size=config.decoder_batch_size,
+                num_epochs=config.decoder_max_epochs,
+                n_samples_per_action=config.n_fm_samples_per_action,
+                normalize_observations=config.fm_normalize_observations,
+                sde_sigma=config.fm_sde_sigma,
+                feather_std=config.fm_feather_std,
+            )
             decoder = DecoderFMState.init(decoder_key, obs_dim, action_dim, decoder_config)
             with jdc.copy_and_mutate(decoder) as decoder:
                 decoder.obs_stats = decoder.obs_stats.update(jnp.asarray(buffer.observations))
