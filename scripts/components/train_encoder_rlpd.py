@@ -165,23 +165,21 @@ def _load_encoder_demo_buffer(path: str | None, obs_dim: int, action_dim: int):
     return arrays
 
 
-def _inverse_decoder_batch(
+def _make_inverse_decoder_batch(
     decoder: DecoderFMState | Decoder1StepFMState,
-    observations: np.ndarray,
-    actions: np.ndarray,
-) -> np.ndarray:
-    """Call the frozen decoder's own environment-action inversion method."""
+) -> Any:
+    """Compile the fixed stage decoder's inverse exactly once."""
     if isinstance(decoder, Decoder1StepFMState):
-        latent = decoder.inverse_fm_batch(
-            jnp.asarray(observations), jnp.asarray(actions)
+        return jax.jit(
+            lambda observations, actions: decoder.inverse_fm_batch(
+                observations, actions
+            )
         )
-    else:
-        latent = decoder.inverse_fm_batch(
-            jnp.asarray(observations),
-            jnp.asarray(actions),
-            decoder.config.flow_steps,
+    return jax.jit(
+        lambda observations, actions: decoder.inverse_fm_batch(
+            observations, actions, decoder.config.flow_steps
         )
-    return np.asarray(jax.device_get(latent), dtype=np.float32)
+    )
 
 
 def _sample_mixed_batch(
@@ -190,7 +188,7 @@ def _sample_mixed_batch(
     demo_ratio: float,
     batch_size: int,
     rng: np.random.Generator,
-    decoder: DecoderFMState,
+    inverse_decoder_batch: Any,
 ) -> encoder_rlpd.RLPDTransitionBatch:
     demo_count = 0 if demo is None else int(round(batch_size * demo_ratio))
     demo_count = min(batch_size, max(0, demo_count))
@@ -207,17 +205,14 @@ def _sample_mixed_batch(
             "masks",
         )
     }
+    environment_actions: list[np.ndarray] = []
     if online_count:
         sampled = online.sample(rng, online_count)
         pieces["observations"].append(sampled["observations"])
         # Always reconstruct z from the real (s, a) pair with Decoder_{n-1}.
         # Even a freshly collected latent was produced before this optimizer
         # update and must not bypass the fixed decoder coordinate transform.
-        pieces["actions"].append(
-            _inverse_decoder_batch(
-                decoder, sampled["observations"], sampled["actions"]
-            )
-        )
+        environment_actions.append(sampled["actions"])
         for key in ("rewards", "next_observations", "masks"):
             pieces[key].append(sampled[key])
     if demo_count:
@@ -226,15 +221,19 @@ def _sample_mixed_batch(
         indices = rng.integers(0, len(demo["rewards"]), size=demo_count)
         demo_obs = demo["observations"][indices]
         pieces["observations"].append(demo_obs)
-        pieces["actions"].append(
-            _inverse_decoder_batch(decoder, demo_obs, demo["env_actions"][indices])
-        )
+        environment_actions.append(demo["env_actions"][indices])
         for key in ("rewards", "next_observations", "masks"):
             pieces[key].append(demo[key][indices])
+    observations = jnp.asarray(np.concatenate(pieces["observations"], axis=0))
     batch = {
         key: jnp.asarray(np.concatenate(value, axis=0))
         for key, value in pieces.items()
+        if key != "actions"
     }
+    batch["observations"] = observations
+    batch["actions"] = inverse_decoder_batch(
+        observations, jnp.asarray(np.concatenate(environment_actions, axis=0))
+    )
     return encoder_rlpd.RLPDTransitionBatch(**batch)
 
 
@@ -253,7 +252,7 @@ def _sample_async_mixed_batch(
     demo_ratio: float,
     batch_size: int,
     rng: np.random.Generator,
-    decoder: DecoderFMState,
+    inverse_decoder_batch: Any,
 ) -> encoder_rlpd.RLPDTransitionBatch:
     """Build one RLPD batch in the fixed stage decoder's latent coordinates."""
     demo_count = int(round(batch_size * demo_ratio))
@@ -265,6 +264,7 @@ def _sample_async_mixed_batch(
         raise ValueError("replay_buffer is empty but encoder_replay_ratio is non-zero.")
 
     pieces = {key: [] for key in ("observations", "actions", "rewards", "next_observations", "masks")}
+    environment_actions: list[np.ndarray] = []
     for source, count in ((demo, demo_count), (replay, replay_count)):
         if count == 0:
             continue
@@ -272,14 +272,20 @@ def _sample_async_mixed_batch(
         pieces["observations"].append(sampled["observations"])
         # Deliberately reconstruct every latent, including fresh replay data.
         # Thus no latent from a collector or an older stage is treated as GT.
-        pieces["actions"].append(
-            _inverse_decoder_batch(decoder, sampled["observations"], sampled["actions"])
-        )
+        environment_actions.append(sampled["actions"])
         for key in ("rewards", "next_observations", "masks"):
             pieces[key].append(sampled[key])
-    return encoder_rlpd.RLPDTransitionBatch(
-        **{key: jnp.asarray(np.concatenate(values, axis=0)) for key, values in pieces.items()}
+    observations = jnp.asarray(np.concatenate(pieces["observations"], axis=0))
+    batch = {
+        key: jnp.asarray(np.concatenate(values, axis=0))
+        for key, values in pieces.items()
+        if key != "actions"
+    }
+    batch["observations"] = observations
+    batch["actions"] = inverse_decoder_batch(
+        observations, jnp.asarray(np.concatenate(environment_actions, axis=0))
     )
+    return encoder_rlpd.RLPDTransitionBatch(**batch)
 
 
 def _checkpoint(
@@ -372,6 +378,7 @@ def train_async_stage(
         latent_kl_dual_learning_rate=config["rlpd_latent_kl_dual_learning_rate"],
         latent_prior_support_radius=config["rlpd_latent_prior_support_radius"],
         latent_policy_support_stddevs=config["rlpd_latent_policy_support_stddevs"],
+        actor_mean_bound=config["rlpd_actor_mean_bound"],
         policy_update_period=config["rlpd_policy_update_period"],
         apply_tanh_in_rollout=config["rlpd_apply_tanh_in_rollout"],
     )
@@ -434,6 +441,7 @@ def train_async_stage(
     decoder_state = state_cls.init(jax.random.PRNGKey(config["seed"] + 1000 + version), decoder_checkpoint["obs_dim"], decoder_checkpoint["action_dim"], decoder_checkpoint["config"])
     with jdc.copy_and_mutate(decoder_state) as decoder_state:
         decoder_state.params, decoder_state.obs_stats = decoder_checkpoint["params"], decoder_checkpoint["obs_stats"]
+    inverse_decoder_batch = _make_inverse_decoder_batch(decoder_state)
 
     demo = load_transition_data(demo_buffer_path)
     replay = load_transition_data(replay_snapshot_path)
@@ -452,7 +460,12 @@ def train_async_stage(
     started = time.time()
     for update in tqdm(range(updates), desc=f"Encoder {version}"):
         batch = _sample_async_mixed_batch(
-            replay, demo, demo_ratio, config["rlpd_batch_size"], rng, decoder_state
+            replay,
+            demo,
+            demo_ratio,
+            config["rlpd_batch_size"],
+            rng,
+            inverse_decoder_batch,
         )
         if update == 0:
             # Record the checkpoint critic before any online state mutation,
@@ -613,6 +626,7 @@ def main(
         latent_kl_dual_learning_rate=config["rlpd_latent_kl_dual_learning_rate"],
         latent_prior_support_radius=config["rlpd_latent_prior_support_radius"],
         latent_policy_support_stddevs=config["rlpd_latent_policy_support_stddevs"],
+        actor_mean_bound=config["rlpd_actor_mean_bound"],
         policy_update_period=config["rlpd_policy_update_period"],
         apply_tanh_in_rollout=config["rlpd_apply_tanh_in_rollout"],
     )
@@ -693,6 +707,7 @@ def main(
     decoder_state = state_cls.init(jax.random.PRNGKey(config["seed"] + 1000), decoder_checkpoint["obs_dim"], decoder_checkpoint["action_dim"], decoder_checkpoint["config"])
     with jdc.copy_and_mutate(decoder_state) as state:
         state.params, state.obs_stats = decoder_checkpoint["params"], decoder_checkpoint["obs_stats"]
+    inverse_decoder_batch = _make_inverse_decoder_batch(decoder_state)
     agent = EncoderFMAgent(ppo_z_state=encoder_state, fm_state=decoder_state)
     rollout_state = BatchedRolloutStateEncoderFM.init(
         env, jax.random.key(config["seed"] + 1), config["num_envs"]
@@ -742,7 +757,7 @@ def main(
                     config["rlpd_offline_ratio"] if demo is not None else 0.0,
                     config["rlpd_batch_size"],
                     np_rng,
-                    agent.fm_state,
+                    inverse_decoder_batch,
                 )
                 encoder_state, critic_metrics = agent.ppo_z_state.update_critic(batch)
                 update_count += 1

@@ -35,7 +35,8 @@ class TrainingConfig:
     wandb_video_width: int = 256
     wandb_video_height: int = 256
     wandb_video_frame_skip: int = 2
-    q_gap_rollouts_per_state: int = 5
+    q_gap_num_states: int = 48
+    q_gap_rollouts_per_state: int = 2
 
     def to_dict(self):
         if self.encoder_type == "ppo":

@@ -171,6 +171,39 @@ class RobomimicEnv(BaseEnv):
             if horizon is not None:
                 robosuite_env.done = int(timestep) >= int(horizon) and not ignore_done
 
+    def reset_to_dataset_state(
+        self,
+        states: np.ndarray,
+        episode_step: int,
+        model: str | None = None,
+        ep_meta: str | None = None,
+    ) -> State:
+        """Restore a Robomimic HDF5 transition state and return its observation."""
+        payload: dict[str, object] = {"states": np.asarray(states)}
+        if model is not None:
+            payload["model"] = model
+        if ep_meta is not None:
+            payload["ep_meta"] = ep_meta
+        # Reset controller goals and episode bookkeeping before replacing the
+        # simulator coordinates. State-only reset_to does not do this itself.
+        self.env.reset()
+        obs_dict = self.env.reset_to(payload)
+        robosuite_env = getattr(self.env, "env", self.env)
+        if hasattr(robosuite_env, "timestep"):
+            robosuite_env.timestep = int(episode_step)
+        if hasattr(robosuite_env, "cur_time"):
+            control_timestep = getattr(robosuite_env, "control_timestep", None)
+            if control_timestep is not None:
+                robosuite_env.cur_time = int(episode_step) * float(control_timestep)
+        if hasattr(robosuite_env, "done"):
+            robosuite_env.done = False
+        return State(
+            obs=self.flatten_obs_dict(obs_dict),
+            reward=jnp.asarray(0.0),
+            done=jnp.asarray(False),
+            info={"success": self.is_success()},
+        )
+
     def is_success(self) -> bool:
         """Return the wrapped Robomimic task-level success signal."""
         success = self.env.is_success()

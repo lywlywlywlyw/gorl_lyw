@@ -38,6 +38,8 @@ class RLPDConfig:
     # require the actor's [mu - 3 sigma, mu + 3 sigma] interval to fit inside.
     rlpd_latent_prior_support_radius: float = 3.0
     rlpd_latent_policy_support_stddevs: float = 3.0
+    # Architectural bound applied inside the Gaussian actor forward pass.
+    rlpd_actor_mean_bound: float = 3.0
     rlpd_normalize_observations: bool = True
     rlpd_apply_tanh_in_rollout: bool = False
     rlpd_rollout_steps_per_iteration: int = 8

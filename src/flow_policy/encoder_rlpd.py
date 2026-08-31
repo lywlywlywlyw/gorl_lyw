@@ -40,6 +40,7 @@ class EncoderConfig:
     latent_kl_dual_learning_rate: float = 1e-3
     latent_prior_support_radius: float = 3.0
     latent_policy_support_stddevs: float = 3.0
+    actor_mean_bound: float = 3.0
     learn_temperature: jdc.Static[bool] = False
     policy_update_period: jdc.Static[int] = 20
     apply_tanh_in_rollout: jdc.Static[bool] = True
@@ -130,6 +131,8 @@ class EncoderState:
             raise ValueError("latent_prior_support_radius must be positive")
         if config.latent_policy_support_stddevs <= 0.0:
             raise ValueError("latent_policy_support_stddevs must be positive")
+        if config.actor_mean_bound <= 0.0:
+            raise ValueError("actor_mean_bound must be positive")
         obs_dim = int(env.observation_size)
         actor_key, critic_key, prng = jax.random.split(prng, 3)
         actor_dims = (obs_dim,) + (config.hidden_size,) * config.hidden_layers + (
@@ -177,7 +180,9 @@ class EncoderState:
 
     def _distribution(self, obs: Array, params: networks.MlpWeights | None = None):
         return networks.gaussian_policy_fwd(
-            self.actor_params if params is None else params, self._normalize_obs(obs)
+            self.actor_params if params is None else params,
+            self._normalize_obs(obs),
+            mean_bound=self.config.actor_mean_bound,
         )
 
     @staticmethod
@@ -357,17 +362,13 @@ class EncoderState:
             q = jnp.mean(qs, axis=0)
             mean = distribution.loc
             std = distribution.scale
-            # Keep KL only as a diagnostic. The optimization constraint below
-            # is deliberately one-sided: the actor may occupy any subset of
-            # the decoder's N(0, I) support and need not match its mean or
-            # variance.
+            # Analytic KL[N(mu, sigma^2) || N(0, I)]. The frozen FM decoder
+            # was trained from a standard-normal latent prior, so regularize
+            # the actor toward that prior in the actor objective.
             prior_kl = 0.5 * jnp.sum(
                 jnp.square(mean) + jnp.square(std) - 1.0 - 2.0 * jnp.log(std),
                 axis=-1,
             )
-            # Squared distance is zero exactly when the actor interval is
-            # contained in the prior interval. It does not pull an already
-            # contained actor toward mean=0 or std=1.
             (
                 support_overflow,
                 support_violation,
@@ -381,9 +382,10 @@ class EncoderState:
                 self.config.latent_policy_support_stddevs,
                 self.config.latent_kl_threshold,
             )
-            loss = jnp.mean(temperature * log_probs - q) + (
-                jax.lax.stop_gradient(self.latent_kl_multiplier)
-                * support_violation
+            loss = jnp.mean(
+                temperature * log_probs
+                - q
+                + self.config.latent_kl_weight * prior_kl
             )
             return loss, (
                 jnp.mean(-log_probs),

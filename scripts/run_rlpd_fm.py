@@ -120,7 +120,10 @@ def _encoder_worker(settings: dict) -> None:
 
 def _decoder_worker(settings: dict) -> None:
     _configure_worker_gpu("decoder", settings["decoder_gpu_id"])
-    from scripts.components.train_decoder_fm import train_async_stage
+    from scripts.components.train_decoder_fm import (
+        evaluate_decoder_update_need,
+        train_async_stage,
+    )
 
     manager = VersionManager(settings["versions_dir"])
     replay = ChunkReplayBuffer(settings["replay_dir"], settings["replay_capacity"])
@@ -133,7 +136,7 @@ def _decoder_worker(settings: dict) -> None:
             required_size = max(
                 settings["minimum_replay_size"],
                 last_attempt_replay_size
-                + settings["decoder_new_data_threshold"] + 1,
+                + settings["decoder_new_data_threshold"],
             )
             _wait_for_replay(replay, required_size, stop, settings["poll_seconds"])
             replay_size = replay.size()
@@ -146,6 +149,30 @@ def _decoder_worker(settings: dict) -> None:
                 f"decoder_{version}_replay_{replay_size}.pkl"
             )
             _write_replay_snapshot(replay, snapshot)
+            gate = evaluate_decoder_update_need(
+                encoder_checkpoint_path=str(encoder),
+                decoder_checkpoint_path=str(previous_decoder),
+                replay_snapshot_path=str(snapshot),
+                new_sample_count=new_samples,
+                sample_count=settings["decoder_gate_sample_count"],
+                action_roundtrip_p95_threshold=settings["decoder_action_roundtrip_p95_threshold"],
+                latent_cycle_p95_threshold=settings["decoder_latent_cycle_p95_threshold"],
+                inverse_outlier_fraction_threshold=settings["decoder_inverse_outlier_fraction_threshold"],
+                latent_support_radius=settings["decoder_inverse_latent_radius"],
+                decoder_type=settings["decoder_type"],
+                seed=settings["seed"] + version * 1000 + replay_size,
+            )
+            last_attempt_replay_size = replay_size
+            if settings["metrics_file"]:
+                from scripts.components.metrics_ipc import append_metrics
+                append_metrics(settings["metrics_file"], {
+                    "pipeline/version": version,
+                    **{f"decoder/gate_{key}": value for key, value in gate.items()},
+                })
+            if not gate["update_required"]:
+                snapshot.unlink(missing_ok=True)
+                print(f"[decoder] update gate stayed closed: {gate}", flush=True)
+                continue
             with previous_decoder.open("rb") as file:
                 decoder_checkpoint = pickle.load(file)
             decoder_batch_size = int(decoder_checkpoint["config"].batch_size)
@@ -175,7 +202,6 @@ def _decoder_worker(settings: dict) -> None:
                 meanflow_min_improvement=settings["decoder_meanflow_min_improvement"],
                 cycle_error_tolerance=settings["decoder_cycle_error_tolerance"],
             )
-            last_attempt_replay_size = replay_size
             if not acceptance["accepted"]:
                 temporary_output.unlink(missing_ok=True)
                 snapshot.unlink(missing_ok=True)
@@ -230,6 +256,7 @@ def _evaluator_worker(settings: dict) -> None:
         decoder_type=settings["decoder_type"],
         evaluation_dir=settings["evaluation_dir"],
         replay_buffer_dir=settings["replay_dir"],
+        q_gap_states_path=settings["q_gap_states_path"],
     )
 
 
@@ -272,12 +299,17 @@ def run_async_pipeline(
     # Maximum decoder optimizer steps per accepted candidate. The actual count
     # is ceil(c * N_new / B_D), capped by this value.
     decoder_train_steps: int = 500,
-    decoder_new_data_threshold: int = 32_768,
+    decoder_new_data_threshold: int = 8_192,
     decoder_epoch_coefficient: float = 1.0,
     decoder_meanflow_min_improvement: float = 1e-4,
     decoder_cycle_error_tolerance: float = 1e-6,
     decoder_validation_fraction: float = 0.1,
     decoder_validation_batches: int = 4,
+    decoder_gate_sample_count: int = 4096,
+    decoder_action_roundtrip_p95_threshold: float = 1e-2,
+    decoder_latent_cycle_p95_threshold: float = 5e-2,
+    decoder_inverse_outlier_fraction_threshold: float = 5e-2,
+    decoder_inverse_latent_radius: float = 3.0,
     encoder_demo_ratio: float = 0.5,
     encoder_replay_ratio: float = 0.5,
     minimum_replay_size: int = 49152,
@@ -303,10 +335,24 @@ def run_async_pipeline(
         raise ValueError("minimum_replay_size must be positive")
     if decoder_train_steps < 1 or decoder_new_data_threshold < 1:
         raise ValueError("Decoder step cap and new-data threshold must be positive")
+    if config["q_gap_num_states"] < 6 or config["q_gap_rollouts_per_state"] < 1:
+        raise ValueError("Q-gap requires at least six states and one rollout per state.")
+    if config["eval_num_envs"] < 1:
+        raise ValueError("eval_num_envs must be positive.")
     if not 0.5 <= decoder_epoch_coefficient <= 2.0:
         raise ValueError("decoder_epoch_coefficient must be in [0.5, 2.0]")
     if decoder_meanflow_min_improvement < 0.0 or decoder_cycle_error_tolerance < 0.0:
         raise ValueError("Decoder acceptance tolerances must be non-negative")
+    if decoder_gate_sample_count < 1:
+        raise ValueError("decoder_gate_sample_count must be positive.")
+    if min(
+        decoder_action_roundtrip_p95_threshold,
+        decoder_latent_cycle_p95_threshold,
+        decoder_inverse_outlier_fraction_threshold,
+    ) < 0.0 or decoder_inverse_latent_radius <= 0.0:
+        raise ValueError("Decoder gate thresholds must be non-negative and radius positive.")
+    if decoder_inverse_outlier_fraction_threshold > 1.0:
+        raise ValueError("Decoder inverse outlier fraction threshold cannot exceed one.")
     if not 0.0 < decoder_validation_fraction < 1.0:
         raise ValueError("decoder_validation_fraction must be between 0 and 1")
     if decoder_validation_batches < 1:
@@ -360,6 +406,14 @@ def run_async_pipeline(
         directory.mkdir(parents=True, exist_ok=True)
     evaluation_dir = root / "evaluations"
     evaluation_dir.mkdir(parents=True, exist_ok=True)
+    from scripts.components.q_gap_dataset import build_fixed_q_gap_states
+
+    q_gap_states_path = build_fixed_q_gap_states(
+        config["dataset_path"],
+        root / "q_gap_fixed_states.pkl",
+        config["q_gap_num_states"],
+        config["seed"],
+    )
     stop = root / "STOP"
     stop.unlink(missing_ok=True)
     manager = VersionManager(versions)
@@ -370,6 +424,8 @@ def run_async_pipeline(
         "stop_file": str(stop), "demo_buffer_path": str(canonical_demo),
         "metrics_file": str(root / "async_metrics.jsonl"),
         "evaluation_dir": str(evaluation_dir),
+        "q_gap_states_path": str(q_gap_states_path),
+        "seed": config["seed"],
         "start_version": 1, "max_version": num_versions,
         "encoder_train_env_steps": encoder_train_env_steps,
         "decoder_train_steps": decoder_train_steps,
@@ -379,6 +435,11 @@ def run_async_pipeline(
         "decoder_cycle_error_tolerance": decoder_cycle_error_tolerance,
         "decoder_validation_fraction": decoder_validation_fraction,
         "decoder_validation_batches": decoder_validation_batches,
+        "decoder_gate_sample_count": decoder_gate_sample_count,
+        "decoder_action_roundtrip_p95_threshold": decoder_action_roundtrip_p95_threshold,
+        "decoder_latent_cycle_p95_threshold": decoder_latent_cycle_p95_threshold,
+        "decoder_inverse_outlier_fraction_threshold": decoder_inverse_outlier_fraction_threshold,
+        "decoder_inverse_latent_radius": decoder_inverse_latent_radius,
         "encoder_demo_ratio": encoder_demo_ratio,
         "encoder_replay_ratio": encoder_replay_ratio,
         "minimum_replay_size": minimum_replay_size,
@@ -633,12 +694,17 @@ def main(
     num_versions: int = 50,
     encoder_train_env_steps: int = 50,
     decoder_train_steps: int = 250,
-    decoder_new_data_threshold: int = 32_768,
+    decoder_new_data_threshold: int = 8_192,
     decoder_epoch_coefficient: float = 1.0,
     decoder_meanflow_min_improvement: float = 1e-4,
     decoder_cycle_error_tolerance: float = 1e-6,
     decoder_validation_fraction: float = 0.1,
     decoder_validation_batches: int = 4,
+    decoder_gate_sample_count: int = 4096,
+    decoder_action_roundtrip_p95_threshold: float = 1e-2,
+    decoder_latent_cycle_p95_threshold: float = 5e-2,
+    decoder_inverse_outlier_fraction_threshold: float = 5e-2,
+    decoder_inverse_latent_radius: float = 3.0,
     encoder_demo_ratio: float = 0.5,
     encoder_replay_ratio: float = 0.5,
     minimum_replay_size: int = 8192,#49152,
@@ -665,6 +731,11 @@ def main(
         decoder_cycle_error_tolerance=decoder_cycle_error_tolerance,
         decoder_validation_fraction=decoder_validation_fraction,
         decoder_validation_batches=decoder_validation_batches,
+        decoder_gate_sample_count=decoder_gate_sample_count,
+        decoder_action_roundtrip_p95_threshold=decoder_action_roundtrip_p95_threshold,
+        decoder_latent_cycle_p95_threshold=decoder_latent_cycle_p95_threshold,
+        decoder_inverse_outlier_fraction_threshold=decoder_inverse_outlier_fraction_threshold,
+        decoder_inverse_latent_radius=decoder_inverse_latent_radius,
         encoder_demo_ratio=encoder_demo_ratio,
         encoder_replay_ratio=encoder_replay_ratio,
         minimum_replay_size=minimum_replay_size,

@@ -53,6 +53,15 @@ def _environment_worker(connection: Any, env_type: type, dataset_path: str) -> N
                         bool(state.info.get("success", False)),
                         env_state,
                     )
+                elif command == "reset_to_dataset":
+                    state = env.reset_to_dataset_state(**payload)
+                    result = (
+                        np.asarray(state.obs),
+                        0.0,
+                        False,
+                        bool(state.info.get("success", False)),
+                        None,
+                    )
                 elif command == "close":
                     break
                 else:
@@ -222,6 +231,50 @@ class BatchedRolloutStateEncoderFM:
         for index, key in zip(indices, keys):
             self.connections[index].send(("reset", np.asarray(jax.random.key_data(key))))
         return {index: self._receive(self.connections[index]) for index in indices}
+
+    def reset_all(self, keys: list[Array]) -> None:
+        if len(keys) != self.num_envs:
+            raise ValueError("reset_all requires one key per environment.")
+        for connection, key in zip(self.connections, keys):
+            connection.send(("reset", np.asarray(jax.random.key_data(key))))
+        responses = [self._receive(connection) for connection in self.connections]
+        self.env_states = [self._state(response) for response in responses]
+        self.steps[:] = 0
+        self.terminated[:] = False
+
+    def restore_dataset_states(self, records: list[dict[str, Any]]) -> None:
+        if len(records) != self.num_envs:
+            raise ValueError("restore_dataset_states requires one record per environment.")
+        for connection, record in zip(self.connections, records):
+            connection.send((
+                "reset_to_dataset",
+                {
+                    "states": record["states"],
+                    "episode_step": int(record["episode_step"]),
+                    "model": record.get("model"),
+                    "ep_meta": record.get("ep_meta"),
+                },
+            ))
+        responses = [self._receive(connection) for connection in self.connections]
+        self.env_states = [self._state(response) for response in responses]
+        self.steps = np.asarray(
+            [int(record["episode_step"]) for record in records], dtype=np.int32
+        )
+        self.terminated[:] = False
+
+    def step_active(
+        self, actions: np.ndarray, active: np.ndarray
+    ) -> list[Any | None]:
+        responses: list[Any | None] = [None] * self.num_envs
+        for index, (connection, action, enabled) in enumerate(
+            zip(self.connections, actions, active)
+        ):
+            if enabled:
+                connection.send(("step", action))
+        for index, (connection, enabled) in enumerate(zip(self.connections, active)):
+            if enabled:
+                responses[index] = self._receive(connection)
+        return responses
 
     @staticmethod
     def _receive(connection: Any) -> tuple[np.ndarray, float, bool, bool, Any]:

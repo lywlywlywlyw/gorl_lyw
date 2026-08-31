@@ -8,7 +8,7 @@ class EnvConfig:
     action_repeat: int = 1
     episode_length: int = 150#1000
     num_envs: int = 96#50#16
-    eval_num_envs: int = 10#50#32,
+    eval_num_envs: int = 48
     dense_reward: bool = True
 
     def to_dict(self):

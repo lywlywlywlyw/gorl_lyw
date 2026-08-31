@@ -6,7 +6,7 @@ import time
 import json
 import warnings
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import jax
 import jax_dataclasses as jdc
@@ -84,7 +84,7 @@ def _load_policy_pair(
     )
 
 
-def _record_policy_evaluation(
+def _record_policy_evaluation_serial(
     agent: EncoderFMAgent,
     config: dict,
     version: int,
@@ -175,6 +175,62 @@ def _record_policy_evaluation(
     }
     if output_path is not None:
         metrics["_video_path"] = str(output_path.resolve())
+    return metrics
+
+
+def _record_policy_evaluation(
+    agent: EncoderFMAgent,
+    config: dict,
+    version: int,
+    output_path: Path | None,
+    apply_tanh_in_rollout: bool,
+    rollout_state: BatchedRolloutStateEncoderFM,
+) -> dict[str, float | int | str]:
+    """Evaluate all episodes concurrently in the persistent evaluation pool."""
+    num_envs = int(config["eval_num_envs"])
+    reset_keys = list(
+        jax.random.split(jax.random.key(int(config["seed"]) + version), num_envs)
+    )
+    rollout_state.reset_all(reset_keys)
+    rollout_state.prng = jax.random.key(int(config["seed"]) + version * 10000)
+    rollout_state, transitions = rollout_state.rollout(
+        agent,
+        episode_length=int(config["episode_length"]),
+        iterations_per_env=int(config["episode_length"]),
+        auto_reset=False,
+        deterministic=True,
+        apply_tanh_in_rollout=apply_tanh_in_rollout,
+    )
+    rewards = onp.asarray(jax.device_get(transitions.reward))
+    successes = onp.any(rewards >= SUCCESS_REWARD_BONUS, axis=0)
+    returns = rewards.sum(axis=0) - SUCCESS_REWARD_BONUS * successes
+    lengths = onp.full(num_envs, int(config["episode_length"]), dtype=onp.int32)
+    for env_index in onp.flatnonzero(successes):
+        lengths[env_index] = int(
+            onp.argmax(rewards[:, env_index] >= SUCCESS_REWARD_BONUS) + 1
+        )
+    metrics: dict[str, float | int | str] = {
+        "pipeline/version": version,
+        "eval/return_mean": float(onp.mean(returns)),
+        "eval/return_std": float(onp.std(returns)),
+        "eval/return_min": float(onp.min(returns)),
+        "eval/return_max": float(onp.max(returns)),
+        "eval/episode_length_mean": float(onp.mean(lengths)),
+        "eval/success_rate": float(onp.mean(successes)),
+        "eval/num_envs": num_envs,
+    }
+    if output_path is not None:
+        video_config = dict(config)
+        video_config["eval_num_envs"] = 1
+        video_metrics = _record_policy_evaluation_serial(
+            agent,
+            video_config,
+            version,
+            output_path,
+            apply_tanh_in_rollout,
+        )
+        if "_video_path" in video_metrics:
+            metrics["_video_path"] = video_metrics["_video_path"]
     return metrics
 
 
@@ -347,6 +403,117 @@ def _record_q_gap_evaluation(
     }
 
 
+def _record_fixed_q_gap_evaluation(
+    agent: EncoderFMAgent,
+    config: dict,
+    version: int,
+    records: list[dict[str, Any]],
+    rollout_state: BatchedRolloutStateEncoderFM,
+) -> dict[str, float | int]:
+    """Evaluate Q calibration on one fixed stratified restored-state bank."""
+    if len(records) != int(config["q_gap_num_states"]):
+        raise ValueError("Fixed Q-gap state bank does not match q_gap_num_states.")
+    rollouts_per_state = int(config["q_gap_rollouts_per_state"])
+    episode_length = int(config["episode_length"])
+    gamma = float(config["rlpd_discounting"])
+    pool_size = rollout_state.num_envs
+    estimated_values: list[float] = []
+    true_values: list[float] = []
+    evaluation_decoder = agent.fm_state
+
+    for offset in range(0, len(records), pool_size):
+        chunk = records[offset : offset + pool_size]
+        valid_count = len(chunk)
+        padded = chunk + [chunk[-1]] * (pool_size - valid_count)
+        rollout_state.restore_dataset_states(padded)
+        observations = jnp.stack([state.obs for state in rollout_state.env_states])
+        latent, _ = agent.sample_z(
+            observations,
+            jax.random.key(int(config["seed"]) + offset),
+            deterministic=True,
+        )
+        q_values = agent.ppo_z_state._critic_values(
+            agent.ppo_z_state.critic_params, observations, latent
+        )
+        estimated_values.extend(
+            onp.asarray(jnp.min(q_values, axis=0))[:valid_count].tolist()
+        )
+        remaining = onp.asarray(
+            [max(0, episode_length - int(record["episode_step"])) for record in padded],
+            dtype=onp.int32,
+        )
+        returns = onp.zeros((rollouts_per_state, pool_size), dtype=onp.float64)
+
+        for rollout_index in range(rollouts_per_state):
+            rollout_state.restore_dataset_states(padded)
+            active = onp.arange(pool_size) < valid_count
+            active &= remaining > 0
+            discounts = onp.ones(pool_size, dtype=onp.float64)
+            rollout_key = jax.random.key(
+                int(config["seed"]) + offset * 1000 + rollout_index
+            )
+            for step in range(int(onp.max(remaining, initial=0))):
+                observations_step = jnp.stack(
+                    [state.obs for state in rollout_state.env_states]
+                )
+                if step == 0:
+                    rollout_latent = latent
+                else:
+                    rollout_latent, _ = agent.sample_z(
+                        observations_step,
+                        jax.random.fold_in(rollout_key, step),
+                        deterministic=False,
+                    )
+                actions = evaluation_decoder.sample_action_from_z(
+                    observations_step,
+                    rollout_latent,
+                    jax.random.PRNGKey(0),
+                    deterministic=True,
+                )
+                responses = rollout_state.step_active(
+                    onp.asarray(jax.device_get(actions)), active
+                )
+                for env_index, response in enumerate(responses):
+                    if response is None:
+                        continue
+                    next_state = rollout_state._state(response)
+                    rollout_state.env_states[env_index] = next_state
+                    reward = float(onp.asarray(next_state.reward))
+                    success = bool(next_state.info.get("success", False))
+                    if success:
+                        reward += SUCCESS_REWARD_BONUS
+                    returns[rollout_index, env_index] += discounts[env_index] * reward
+                    discounts[env_index] *= gamma
+                    if (
+                        bool(onp.asarray(next_state.done))
+                        or success
+                        or step + 1 >= remaining[env_index]
+                    ):
+                        active[env_index] = False
+                if not onp.any(active):
+                    break
+        true_values.extend(onp.mean(returns[:, :valid_count], axis=0).tolist())
+
+    estimated_array = onp.asarray(estimated_values)
+    true_array = onp.asarray(true_values)
+    gaps = estimated_array - true_array
+    standard_error = float(onp.std(gaps, ddof=1) / onp.sqrt(len(gaps)))
+    return {
+        "pipeline/version": version,
+        "estimated_value": float(onp.mean(estimated_array)),
+        "true_value": float(onp.mean(true_array)),
+        "q_gap": float(onp.mean(gaps)),
+        "q_gap/mae": float(onp.mean(onp.abs(gaps))),
+        "q_gap/rmse": float(onp.sqrt(onp.mean(onp.square(gaps)))),
+        "q_gap/standard_error": standard_error,
+        "q_gap/ci95_low": float(onp.mean(gaps) - 1.96 * standard_error),
+        "q_gap/ci95_high": float(onp.mean(gaps) + 1.96 * standard_error),
+        "q_gap/num_samples": len(records),
+        "q_gap/rollouts_per_state": rollouts_per_state,
+        "q_gap/eval_num_envs": pool_size,
+    }
+
+
 def run_async_collector(
     pipeline_root: str,
     replay_buffer_dir: str,
@@ -441,6 +608,7 @@ def run_async_evaluator(
     metrics_file: str | None = None,
     evaluation_dir: str | None = None,
     replay_buffer_dir: str | None = None,
+    q_gap_states_path: str | None = None,
     decoder_type: str = "flow_matching",
 ) -> None:
     """Evaluate every Policy_n exactly once and strictly in version order."""
@@ -453,6 +621,15 @@ def run_async_evaluator(
     stop = Path(stop_file)
     env = RobomimicEnv(
         dataset_path=config["dataset_path"], reward_shaping=config["dense_reward"]
+    )
+    if q_gap_states_path is None:
+        raise ValueError("q_gap_states_path is required for fixed Q-gap evaluation.")
+    with Path(q_gap_states_path).expanduser().open("rb") as file:
+        q_gap_records = pickle.load(file)
+    evaluation_pool = BatchedRolloutStateEncoderFM.init(
+        env,
+        jax.random.key(int(config["seed"]) + 5000),
+        int(config["eval_num_envs"]),
     )
     video_interval = max(1, int(config["wandb_video_interval_evals"]))
     try:
@@ -476,30 +653,16 @@ def run_async_evaluator(
                     else None
                 ),
                 apply_tanh,
+                evaluation_pool,
             )
-            if replay_buffer_dir is not None:
-                # The evaluator starts concurrently with the collector.  In
-                # particular, Policy_0 is the offline checkpoint and its q-gap
-                # must wait for the first restored simulator states instead of
-                # being permanently skipped because replay is still empty.
-                q_gap_deadline = time.monotonic() + 300.0
-                while not stop.exists():
-                    q_gap = _record_q_gap_evaluation(
-                        agent, config, version, replay_buffer_dir, warn=False
-                    )
-                    if q_gap:
-                        metrics.update(q_gap)
-                        break
-                    if time.monotonic() >= q_gap_deadline:
-                        metrics.update(_record_q_gap_evaluation(
-                            agent, config, version, replay_buffer_dir, warn=True
-                        ))
-                        break
-                    time.sleep(poll_seconds)
+            metrics.update(_record_fixed_q_gap_evaluation(
+                agent, config, version, q_gap_records, evaluation_pool
+            ))
             if metrics_file:
                 append_metrics(metrics_file, metrics)
             print(f"Evaluation completed for Policy_{version}.", flush=True)
     finally:
+        evaluation_pool.close()
         env.close()
 
 
