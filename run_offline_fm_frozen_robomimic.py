@@ -305,6 +305,8 @@ def make_rlpd_encoder_config(
         latent_kl_weight=config.rlpd_latent_kl_weight,
         latent_kl_threshold=config.rlpd_latent_kl_threshold,
         latent_kl_dual_learning_rate=config.rlpd_latent_kl_dual_learning_rate,
+        latent_prior_support_radius=config.rlpd_latent_prior_support_radius,
+        latent_policy_support_stddevs=config.rlpd_latent_policy_support_stddevs,
         policy_update_period=config.rlpd_policy_update_period,
         apply_tanh_in_rollout=config.rlpd_apply_tanh_in_rollout,
     )

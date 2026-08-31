@@ -370,6 +370,8 @@ def train_async_stage(
         latent_kl_weight=config["rlpd_latent_kl_weight"],
         latent_kl_threshold=config["rlpd_latent_kl_threshold"],
         latent_kl_dual_learning_rate=config["rlpd_latent_kl_dual_learning_rate"],
+        latent_prior_support_radius=config["rlpd_latent_prior_support_radius"],
+        latent_policy_support_stddevs=config["rlpd_latent_policy_support_stddevs"],
         policy_update_period=config["rlpd_policy_update_period"],
         apply_tanh_in_rollout=config["rlpd_apply_tanh_in_rollout"],
     )
@@ -445,6 +447,8 @@ def train_async_stage(
     updates = max(1, int(train_env_steps * config["rlpd_updates_per_env_step"]))
     rng = np.random.default_rng(config["seed"] + version)
     metrics: dict[str, Any] = {}
+    latest_actor_metrics: dict[str, Any] = {}
+    latest_actor_step: int | None = None
     started = time.time()
     for update in tqdm(range(updates), desc=f"Encoder {version}"):
         batch = _sample_async_mixed_batch(
@@ -471,8 +475,18 @@ def train_async_stage(
         metrics = dict(critic_metrics)
         if (update + 1) % config["rlpd_policy_update_period"] == 0:
             encoder_state, actor_metrics = encoder_state.update_actor_and_temperature(batch)
+            latest_actor_metrics = dict(actor_metrics)
+            latest_actor_step = online_encoder_updates + update + 1
             metrics.update(actor_metrics)
         if metrics_file and ((update + 1) % 100 == 0 or update + 1 == updates):
+            # The final stage update need not be an actor update (for example,
+            # 50 updates with a policy period of 4). Preserve the most recent
+            # actor diagnostics instead of silently emitting critic-only data.
+            metrics.update(latest_actor_metrics)
+            if latest_actor_step is not None:
+                current_step = online_encoder_updates + update + 1
+                metrics["actor_metrics_step"] = latest_actor_step
+                metrics["actor_metrics_age"] = current_step - latest_actor_step
             append_metrics(metrics_file, {
                 "pipeline/version": version,
                 # W&B custom step metrics must be monotonic across immutable
@@ -597,6 +611,8 @@ def main(
         latent_kl_weight=config["rlpd_latent_kl_weight"],
         latent_kl_threshold=config["rlpd_latent_kl_threshold"],
         latent_kl_dual_learning_rate=config["rlpd_latent_kl_dual_learning_rate"],
+        latent_prior_support_radius=config["rlpd_latent_prior_support_radius"],
+        latent_policy_support_stddevs=config["rlpd_latent_policy_support_stddevs"],
         policy_update_period=config["rlpd_policy_update_period"],
         apply_tanh_in_rollout=config["rlpd_apply_tanh_in_rollout"],
     )

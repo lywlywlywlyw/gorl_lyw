@@ -448,14 +448,33 @@ def run_async_pipeline(
         context.Process(name="decoder-trainer", target=_decoder_worker, args=(settings,)),
     ]
     processes = [collector_process, evaluator_process, *trainer_processes]
+    training_processes = [collector_process, *trainer_processes]
     for process in processes:
         process.start()
     pipeline_error: BaseException | None = None
+    evaluator_failure_reported = False
+    metrics_forwarding_enabled = wandb_run is not None
     try:
         while any(process.is_alive() for process in processes):
-            failed = next((p for p in processes if p.exitcode not in (None, 0)), None)
+            # Evaluation is a best-effort observer. Its metrics are never read
+            # by a trainer, and an evaluator failure must not stop collection
+            # or either optimizer process.
+            failed = next(
+                (p for p in training_processes if p.exitcode not in (None, 0)),
+                None,
+            )
             if failed is not None:
                 raise RuntimeError(f"{failed.name} exited with code {failed.exitcode}")
+            if (
+                evaluator_process.exitcode not in (None, 0)
+                and not evaluator_failure_reported
+            ):
+                evaluator_failure_reported = True
+                print(
+                    "WARNING: policy-evaluator exited with code "
+                    f"{evaluator_process.exitcode}; training will continue.",
+                    flush=True,
+                )
             # Collection is intentionally endless. Even after both trainers
             # finish, keep the pipeline alive until every policy is evaluated.
             if (
@@ -463,8 +482,20 @@ def run_async_pipeline(
                 and not evaluator_process.is_alive()
             ):
                 break
-            if wandb_run is not None:
-                metrics_offset = _forward_metrics(metrics_file, wandb_run, metrics_offset)
+            if metrics_forwarding_enabled:
+                try:
+                    metrics_offset = _forward_metrics(
+                        metrics_file, wandb_run, metrics_offset
+                    )
+                except Exception as error:
+                    # W&B/video/JSONL forwarding is observability only. Never
+                    # turn a monitoring outage into a training stop condition.
+                    metrics_forwarding_enabled = False
+                    print(
+                        "WARNING: metrics forwarding failed and was disabled; "
+                        f"training will continue: {error}",
+                        flush=True,
+                    )
             time.sleep(1.0)
     except KeyboardInterrupt:
         print("Stopping asynchronous pipeline...")
@@ -478,11 +509,17 @@ def run_async_pipeline(
                 process.terminate()
         for process in processes:
             process.join()
-        if wandb_run is not None:
-            _forward_metrics(metrics_file, wandb_run, metrics_offset)
+        if metrics_forwarding_enabled:
+            try:
+                _forward_metrics(metrics_file, wandb_run, metrics_offset)
+            except Exception as error:
+                print(
+                    f"WARNING: final metrics forwarding failed: {error}",
+                    flush=True,
+                )
     failures = {
         process.name: process.exitcode
-        for process in [evaluator_process, *trainer_processes]
+        for process in training_processes
         if process.exitcode not in (0, None)
     }
     if pipeline_error is not None or failures:

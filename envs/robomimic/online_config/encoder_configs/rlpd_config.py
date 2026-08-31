@@ -26,12 +26,18 @@ class RLPDConfig:
     rlpd_reward_scaling: float = 1.0
     rlpd_reward_bias: float = 0.0
     rlpd_max_grad_norm: float = 10.0
-    # Initial Lagrange multiplier for the per-latent-dimension KL constraint.
+    # Initial Lagrange multiplier for keeping the actor distribution inside
+    # the decoder's standard-normal latent support.  The legacy ``kl`` names
+    # are retained for checkpoint and CLI compatibility; this is no longer a
+    # KL-to-N(0, I) matching loss.
     rlpd_latent_kl_weight: float = 1.0
-    # A dead zone of 0.1 nat per latent dimension lets the actor depart from
-    # N(0, I) while keeping it inside the decoder's well-supported region.
-    rlpd_latent_kl_threshold: float = 0.1
+    # Allowed mean squared support overflow. Zero enforces containment.
+    rlpd_latent_kl_threshold: float = 0.0
     rlpd_latent_kl_dual_learning_rate: float = 1e-3
+    # Interpret N(0, I)'s practical support as [-3, 3] per dimension and
+    # require the actor's [mu - 3 sigma, mu + 3 sigma] interval to fit inside.
+    rlpd_latent_prior_support_radius: float = 3.0
+    rlpd_latent_policy_support_stddevs: float = 3.0
     rlpd_normalize_observations: bool = True
     rlpd_apply_tanh_in_rollout: bool = False
     rlpd_rollout_steps_per_iteration: int = 8
