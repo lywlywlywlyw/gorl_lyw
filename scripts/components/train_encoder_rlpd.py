@@ -335,6 +335,10 @@ def train_async_stage(
     metrics_file: str | None = None,
     inherit_optimizer_state: bool = True,
     decoder_type: str = "flow_matching",
+    temperature_learning_rate: float | None = None,
+    learn_temperature: bool | None = None,
+    initial_temperature: float | None = None,
+    target_entropy: float | None = None,
 ) -> None:
     """Train one immutable Encoder_n stage without collecting environment data.
 
@@ -349,6 +353,14 @@ def train_async_stage(
 
     config = TrainingConfig().to_dict() | EnvConfig().to_dict()
     config["decoder_type"] = decoder_type
+    if temperature_learning_rate is not None:
+        config["rlpd_temperature_learning_rate"] = temperature_learning_rate
+    if learn_temperature is not None:
+        config["rlpd_learn_temperature"] = learn_temperature
+    if initial_temperature is not None:
+        config["rlpd_initial_temperature"] = initial_temperature
+    if target_entropy is not None:
+        config["rlpd_target_entropy"] = target_entropy
     env = RobomimicEnv(
         dataset_path=config["dataset_path"], reward_shaping=config["dense_reward"]
     )

@@ -12,8 +12,9 @@ class RLPDConfig:
     rlpd_policy_update_period: int = 4
     rlpd_actor_learning_rate: float = 1e-4
     rlpd_critic_learning_rate: float = 3e-4
+    # SAC-style automatic entropy-temperature tuning.
     rlpd_temperature_learning_rate: float = 1e-4
-    rlpd_learn_temperature: bool = False
+    rlpd_learn_temperature: bool = True
     rlpd_discounting: float = 0.99
     rlpd_target_update_rate: float = 0.005
     rlpd_initial_temperature: float = 0.02

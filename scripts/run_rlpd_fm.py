@@ -101,6 +101,10 @@ def _encoder_worker(settings: dict) -> None:
             metrics_file=settings["metrics_file"],
             inherit_optimizer_state=version > 1,
             decoder_type=settings["decoder_type"],
+            temperature_learning_rate=settings["temperature_learning_rate"],
+            learn_temperature=settings["learn_temperature"],
+            initial_temperature=settings["initial_temperature"],
+            target_entropy=settings["target_entropy"],
         )
         manager.publish_component("encoder", version, temporary_output, {
             "version": version,
@@ -245,6 +249,10 @@ def run_async_pipeline(
     evaluator_gpu_id: int = 0,
     decoder_gpu_id: int = 0,
     parent_gpu_id: int = 0,
+    temperature_learning_rate: float = 1e-4,
+    learn_temperature: bool = True,
+    initial_temperature: float = 0.02,
+    target_entropy: float | None = None,
 ) -> None:
     """Run collection, evaluation, and both trainers as independent processes."""
     config = TrainingConfig().to_dict() | EnvConfig().to_dict()
@@ -345,6 +353,10 @@ def run_async_pipeline(
         "decoder_gpu_id": decoder_gpu_id,
         "parent_gpu_id": parent_gpu_id,
         "decoder_type": decoder_type,
+        "temperature_learning_rate": temperature_learning_rate,
+        "learn_temperature": learn_temperature,
+        "initial_temperature": initial_temperature,
+        "target_entropy": target_entropy,
     }
     atomic_pickle_dump(settings, root / "pipeline_settings.pkl")
     print(
@@ -586,7 +598,7 @@ def main(
     demo_buffer_path: str,
     run_dir: str | None = None,
     encoder_train_env_steps: int = 50,
-    decoder_train_steps: int = 250,
+    decoder_train_steps: int = 100,
     encoder_demo_ratio: float = 0.5,
     encoder_replay_ratio: float = 0.5,
     minimum_replay_size: int = 8192,#49152,
@@ -598,6 +610,10 @@ def main(
     decoder_gpu_id: int = 2,
     parent_gpu_id: int = 3,
     evaluator_gpu_id: int = 3,
+    temperature_learning_rate: float = 1e-4,
+    learn_temperature: bool = True,
+    initial_temperature: float = 0.02,
+    target_entropy: float | None = None,
 ) -> None:
     """Run the asynchronous RLPD encoder + FM decoder training pipeline."""
     run_async_pipeline(
@@ -617,6 +633,10 @@ def main(
         decoder_gpu_id=decoder_gpu_id,
         parent_gpu_id=parent_gpu_id,
         evaluator_gpu_id=evaluator_gpu_id,
+        temperature_learning_rate=temperature_learning_rate,
+        learn_temperature=learn_temperature,
+        initial_temperature=initial_temperature,
+        target_entropy=target_entropy,
     )
 
 
