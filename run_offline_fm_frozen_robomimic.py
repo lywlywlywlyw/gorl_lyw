@@ -345,7 +345,8 @@ def forward_fm_batch(
 
 def build_latent_targets(
     decoder: Any,
-    buffer: ReplayBuffer,
+    observations: Array,
+    actions: Array,
     batch_size: int,
     inverse_steps: int | None,
 ) -> np.ndarray:
@@ -359,26 +360,84 @@ def build_latent_targets(
         )
     chunks = []
     for start in trange(
-        0, len(buffer), batch_size, desc="Invert actions", leave=False
+        0, observations.shape[0], batch_size, desc="Invert actions", leave=False
     ):
-        end = min(start + batch_size, len(buffer))
+        end = min(start + batch_size, observations.shape[0])
         chunks.append(
             np.asarray(
                 invert(
-                    jnp.asarray(buffer.observations[start:end]),
-                    jnp.asarray(buffer.actions[start:end]),
+                    observations[start:end], actions[start:end],
                 )
             )
         )
     return np.concatenate(chunks)
 
 
+def make_decoder_eval_functions(decoder: Any, inverse_steps: int | None):
+    """Create decoder evaluation kernels once; parameters remain dynamic."""
+    if isinstance(decoder, Decoder1StepFMState):
+        @jax.jit
+        def inverse(state, obs, actions):
+            return state.inverse_fm_batch(obs, actions)
+
+        @jax.jit
+        def validation(state, obs, actions, key):
+            key, eps_key, time_key = jax.random.split(key, 3)
+            eps = jax.random.normal(eps_key, actions.shape)
+            times, starts = state.sample_t_r(time_key, actions.shape[0])
+            loss = state.compute_meanflow_loss(
+                state.steps, state._normalize_obs(obs), actions,
+                eps, times, starts
+            )[0]
+            return loss, key
+    else:
+        if inverse_steps is None:
+            raise ValueError("Flow Matching inversion requires inverse_steps.")
+
+        @jax.jit
+        def inverse(state, obs, actions):
+            return state.inverse_fm_batch(obs, actions, inverse_steps)
+
+        @jax.jit
+        def validation(state, obs, actions, key):
+            key, eps_key, time_key = jax.random.split(key, 3)
+            obs_norm = (obs - state.obs_stats.mean) / (state.obs_stats.std + 1e-8)
+            eps = jax.random.normal(
+                eps_key,
+                (actions.shape[0], state.config.n_samples_per_action, actions.shape[-1]),
+            )
+            times = jax.random.uniform(
+                time_key, (actions.shape[0], state.config.n_samples_per_action, 1)
+            )
+            return jnp.mean(state.compute_cfm_loss(obs_norm, actions, eps, times)), key
+
+    @jax.jit
+    def metrics(state, obs, actions):
+        latents = inverse(state, obs, actions)
+        reconstructed = forward_fm_batch(state, obs, latents)
+        latent_std = jnp.std(latents, axis=0)
+        values = jnp.asarray([
+            jnp.mean(jnp.square(reconstructed - actions)),
+            jnp.mean(jnp.abs(reconstructed - actions)),
+            jnp.mean(jnp.abs(jnp.mean(latents, axis=0))),
+            jnp.mean(latent_std),
+            jnp.mean(jnp.abs(latent_std - 1.0)),
+            jnp.mean(jnp.linalg.norm(latents, axis=-1)),
+            jnp.max(jnp.abs(latents)),
+        ])
+        return values, latents
+
+    return inverse, validation, metrics
+
+
 def decoder_validation_loss(
     decoder: Any,
-    buffer: ReplayBuffer,
+    observations: Array,
+    actions: Array,
     indices: np.ndarray,
     max_batches: int,
     key: Array,
+    validation_fn,
 ) -> tuple[float, Array]:
     losses = []
     for batch_number, start in enumerate(
@@ -387,55 +446,28 @@ def decoder_validation_loss(
         if batch_number >= max_batches:
             break
         batch = indices[start : start + decoder.config.batch_size]
-        obs = jnp.asarray(buffer.observations[batch])
-        actions = jnp.asarray(buffer.actions[batch])
-        key, eps_key, time_key = jax.random.split(key, 3)
-        if isinstance(decoder, Decoder1StepFMState):
-            eps = jax.random.normal(eps_key, actions.shape)
-            times, starts = decoder.sample_t_r(time_key, len(batch))
-            losses.append(float(decoder.compute_meanflow_loss(decoder.steps, decoder._normalize_obs(obs), actions, eps, times, starts)[0]))
-        else:
-            obs_norm = (obs - decoder.obs_stats.mean) / (decoder.obs_stats.std + 1e-8)
-            eps = jax.random.normal(eps_key, (len(batch), decoder.config.n_samples_per_action, actions.shape[-1]))
-            times = jax.random.uniform(time_key, (len(batch), decoder.config.n_samples_per_action, 1))
-            losses.append(float(jnp.mean(decoder.compute_cfm_loss(obs_norm, actions, eps, times))))
-    return float(np.mean(losses)), key
+        obs = observations[jnp.asarray(batch)]
+        batch_actions = actions[jnp.asarray(batch)]
+        loss, key = validation_fn(decoder, obs, batch_actions, key)
+        losses.append(loss)
+    return float(jax.device_get(jnp.mean(jnp.stack(losses)))), key
 
 
 def decoder_metrics(
     decoder: Any,
-    buffer: ReplayBuffer,
+    observations: Array,
+    actions: Array,
     indices: np.ndarray,
-    inverse_steps: int | None,
+    metrics_fn,
 ) -> tuple[dict[str, float], np.ndarray]:
-    obs = jnp.asarray(buffer.observations[indices])
-    actions = jnp.asarray(buffer.actions[indices])
-    if isinstance(decoder, Decoder1StepFMState):
-        latents = jax.jit(decoder.inverse_fm_batch)(obs, actions)
-    else:
-        if inverse_steps is None:
-            raise ValueError("Flow Matching inversion requires inverse_steps.")
-        latents = jax.jit(
-            lambda o, a: decoder.inverse_fm_batch(o, a, inverse_steps)
-        )(obs, actions)
-    reconstructed = jax.jit(
-        lambda o, z: forward_fm_batch(decoder, o, z)
-    )(obs, latents)
-    latent_std = jnp.std(latents, axis=0)
-    metrics = {
-        "decoder/cycle_action_mse": float(
-            jnp.mean(jnp.square(reconstructed - actions))
-        ),
-        "decoder/cycle_action_mae": float(
-            jnp.mean(jnp.abs(reconstructed - actions))
-        ),
-        "latent/mean_abs": float(jnp.mean(jnp.abs(jnp.mean(latents, axis=0)))),
-        "latent/std_mean": float(jnp.mean(latent_std)),
-        "latent/std_error": float(jnp.mean(jnp.abs(latent_std - 1.0))),
-        "latent/norm_mean": float(jnp.mean(jnp.linalg.norm(latents, axis=-1))),
-        "latent/max_abs": float(jnp.max(jnp.abs(latents))),
-    }
-    return metrics, np.asarray(latents)
+    obs = observations[jnp.asarray(indices)]
+    batch_actions = actions[jnp.asarray(indices)]
+    values, latents = metrics_fn(decoder, obs, batch_actions)
+    values, latents = jax.device_get((values, latents))
+    names = ("decoder/cycle_action_mse", "decoder/cycle_action_mae",
+             "latent/mean_abs", "latent/std_mean", "latent/std_error",
+             "latent/norm_mean", "latent/max_abs")
+    return dict(zip(names, np.asarray(values).tolist())), np.asarray(latents)
 
 
 def expectile_loss(diff: Array, expectile: float) -> Array:
@@ -569,6 +601,37 @@ def make_iql_update(
 
     return update
 
+@jax.jit
+def _iql_validation_kernel(
+    expectile, discount, actor_nll_weight,
+    actor_params, q1_params, q2_params, value_params,
+    target_q1_params, target_q2_params, obs, next_obs, latents,
+    rewards, masks,
+):
+    target_q = jnp.minimum(
+        networks.q_mlp_fwd(target_q1_params, obs, latents),
+        networks.q_mlp_fwd(target_q2_params, obs, latents),
+    )
+    distribution = networks.gaussian_policy_fwd(actor_params, obs)
+    actor_nll = -jnp.mean(jnp.sum(distribution.log_prob(latents), axis=-1))
+    value = networks.value_mlp_fwd(value_params, obs)
+    value_loss = jnp.mean(expectile_loss(target_q - value, expectile))
+    next_value = networks.value_mlp_fwd(value_params, next_obs)
+    bellman_target = rewards + discount * masks * next_value
+    q1 = networks.q_mlp_fwd(q1_params, obs, latents)
+    q2 = networks.q_mlp_fwd(q2_params, obs, latents)
+    td_loss = jnp.mean(jnp.square(q1 - bellman_target) + jnp.square(q2 - bellman_target))
+    q_scale = jnp.maximum(jnp.mean(jnp.abs(bellman_target)), 1.0)
+    value_scale = jnp.maximum(jnp.mean(jnp.abs(target_q)), 1.0)
+    relative_td_rmse = jnp.sqrt(td_loss / 2.0) / q_scale
+    relative_value_rmse = jnp.sqrt(value_loss) / value_scale
+    actor_nll_per_dim = actor_nll / latents.shape[-1]
+    validation_score = relative_td_rmse + relative_value_rmse + actor_nll_weight * actor_nll_per_dim
+    return jnp.asarray((td_loss, value_loss, td_loss + value_loss, q_scale,
+                        value_scale, relative_td_rmse, relative_value_rmse,
+                        actor_nll, actor_nll_per_dim, validation_score))
+
+
 def iql_validation_losses(
     config: ConfigView,
     actor_params: PyTree,
@@ -577,57 +640,29 @@ def iql_validation_losses(
     value_params: PyTree,
     target_q1_params: PyTree,
     target_q2_params: PyTree,
-    normalized_observations: np.ndarray,
-    normalized_next_observations: np.ndarray,
-    buffer: ReplayBuffer,
-    latent_targets: np.ndarray,
+    normalized_observations: Array,
+    normalized_next_observations: Array,
+    rewards: Array,
+    masks: Array,
+    latent_targets: Array,
     indices: np.ndarray,
 ) -> dict[str, float]:
     """Compute deterministic held-out Bellman TD and expectile value losses."""
-    obs = jnp.asarray(normalized_observations[indices])
-    next_obs = jnp.asarray(normalized_next_observations[indices])
-    latents = jnp.asarray(latent_targets[indices])
-    rewards = jnp.asarray(buffer.rewards[indices])
-    masks = jnp.asarray(buffer.masks[indices])
-    target_q = jnp.minimum(
-        networks.q_mlp_fwd(target_q1_params, obs, latents),
-        networks.q_mlp_fwd(target_q2_params, obs, latents),
-    )
-    distribution = networks.gaussian_policy_fwd(
-        actor_params, obs
-    )
-    actor_nll = -jnp.mean(jnp.sum(distribution.log_prob(latents), axis=-1))
-    value = networks.value_mlp_fwd(value_params, obs)
-    value_loss = jnp.mean(expectile_loss(target_q - value, config.expectile))
-    next_value = networks.value_mlp_fwd(value_params, next_obs)
-    bellman_target = rewards + config.discount * masks * next_value
-    q1 = networks.q_mlp_fwd(q1_params, obs, latents)
-    q2 = networks.q_mlp_fwd(q2_params, obs, latents)
-    td_loss = jnp.mean(
-        jnp.square(q1 - bellman_target) + jnp.square(q2 - bellman_target)
-    )
-    q_scale = jnp.maximum(jnp.mean(jnp.abs(bellman_target)), 1.0)
-    value_scale = jnp.maximum(jnp.mean(jnp.abs(target_q)), 1.0)
-    relative_td_rmse = jnp.sqrt(td_loss / 2.0) / q_scale
-    relative_value_rmse = jnp.sqrt(value_loss) / value_scale
-    actor_nll_per_dim = actor_nll / latents.shape[-1]
-    validation_score = (
-        relative_td_rmse
-        + relative_value_rmse
-        + config.early_stopping_actor_nll_weight * actor_nll_per_dim
-    )
-    return {
-        "validation_td_loss": float(td_loss),
-        "validation_value_loss": float(value_loss),
-        "validation_loss": float(td_loss + value_loss),
-        "validation_q_scale": float(q_scale),
-        "validation_value_scale": float(value_scale),
-        "validation_relative_td_rmse": float(relative_td_rmse),
-        "validation_relative_value_rmse": float(relative_value_rmse),
-        "validation_actor_nll": float(actor_nll),
-        "validation_actor_nll_per_dim": float(actor_nll_per_dim),
-        "validation_score": float(validation_score),
-    }
+    values = jax.device_get(_iql_validation_kernel(
+        config.expectile, config.discount, config.early_stopping_actor_nll_weight,
+        actor_params, q1_params, q2_params, value_params,
+        target_q1_params, target_q2_params,
+        normalized_observations[jnp.asarray(indices)],
+        normalized_next_observations[jnp.asarray(indices)],
+        latent_targets[jnp.asarray(indices)], rewards[jnp.asarray(indices)],
+        masks[jnp.asarray(indices)],
+    ))
+    names = ("validation_td_loss", "validation_value_loss", "validation_loss",
+             "validation_q_scale", "validation_value_scale",
+             "validation_relative_td_rmse", "validation_relative_value_rmse",
+             "validation_actor_nll", "validation_actor_nll_per_dim",
+             "validation_score")
+    return dict(zip(names, np.asarray(values).tolist()))
 
 
 def compatible_opt_state(
@@ -646,28 +681,14 @@ def compatible_opt_state(
     return candidate
 
 
-def policy_metrics(
-    actor_params: PyTree,
-    q1_params: PyTree,
-    q2_params: PyTree,
-    value_params: PyTree,
-    decoder: Any,
-    buffer: ReplayBuffer,
-    normalized_observations: np.ndarray,
-    indices: np.ndarray,
-    latent_targets: np.ndarray,
-) -> dict[str, float]:
-    obs_norm = jnp.asarray(normalized_observations[indices])
-    obs_raw = jnp.asarray(buffer.observations[indices])
-    data_actions = jnp.asarray(buffer.actions[indices])
-    targets = jnp.asarray(latent_targets[indices])
-    distribution = networks.gaussian_policy_fwd(
-        actor_params, obs_norm
-    )
+@jax.jit
+def _policy_metrics_kernel(
+    actor_params, q1_params, q2_params, value_params, decoder,
+    obs_norm, obs_raw, data_actions, targets,
+):
+    distribution = networks.gaussian_policy_fwd(actor_params, obs_norm)
     policy_z = distribution.loc
-    policy_actions = jax.jit(
-        lambda o, z: forward_fm_batch(decoder, o, z)
-    )(obs_raw, policy_z)
+    policy_actions = forward_fm_batch(decoder, obs_raw, policy_z)
     q_policy = jnp.minimum(
         networks.q_mlp_fwd(q1_params, obs_norm, policy_z),
         networks.q_mlp_fwd(q2_params, obs_norm, policy_z),
@@ -677,22 +698,37 @@ def policy_metrics(
         networks.q_mlp_fwd(q2_params, obs_norm, targets),
     )
     value = networks.value_mlp_fwd(value_params, obs_norm)
-    return {
-        "comparison/policy_q": float(jnp.mean(q_policy)),
-        "comparison/data_q": float(jnp.mean(q_data)),
-        "comparison/policy_q_minus_data_q": float(jnp.mean(q_policy - q_data)),
-        "comparison/policy_q_minus_v": float(jnp.mean(q_policy - value)),
-        "comparison/policy_action_data_mse": float(
-            jnp.mean(jnp.square(policy_actions - data_actions))
-        ),
-        "encoder/latent_nll": float(
-            -jnp.mean(jnp.sum(distribution.log_prob(targets), axis=-1))
-        ),
-        "encoder/mean_target_mse": float(
-            jnp.mean(jnp.square(policy_z - targets))
-        ),
-        "encoder/scale_mean": float(jnp.mean(distribution.scale)),
-    }
+    return jnp.asarray((
+        jnp.mean(q_policy), jnp.mean(q_data), jnp.mean(q_policy - q_data),
+        jnp.mean(q_policy - value), jnp.mean(jnp.square(policy_actions - data_actions)),
+        -jnp.mean(jnp.sum(distribution.log_prob(targets), axis=-1)),
+        jnp.mean(jnp.square(policy_z - targets)), jnp.mean(distribution.scale),
+    ))
+
+
+def policy_metrics(
+    actor_params: PyTree,
+    q1_params: PyTree,
+    q2_params: PyTree,
+    value_params: PyTree,
+    decoder: Any,
+    normalized_observations: Array,
+    observations: Array,
+    data_actions: Array,
+    indices: np.ndarray,
+    latent_targets: Array,
+) -> dict[str, float]:
+    values = jax.device_get(_policy_metrics_kernel(
+        actor_params, q1_params, q2_params, value_params, decoder,
+        normalized_observations[jnp.asarray(indices)],
+        observations[jnp.asarray(indices)],
+        data_actions[jnp.asarray(indices)],
+        latent_targets[jnp.asarray(indices)],
+    ))
+    names = ("comparison/policy_q", "comparison/data_q", "comparison/policy_q_minus_data_q",
+             "comparison/policy_q_minus_v", "comparison/policy_action_data_mse",
+             "encoder/latent_nll", "encoder/mean_target_mse", "encoder/scale_mean")
+    return dict(zip(names, np.asarray(values).tolist()))
 
 
 def append_metrics(path: Path, record: dict[str, Any]) -> None:
@@ -1028,6 +1064,15 @@ def main(config: ConfigView) -> None:
         normalized_next_observations = (
             buffer.next_observations - obs_mean
         ) / (obs_std + 1e-8)
+        # Keep the small offline dataset resident on the accelerator.  Batch
+        # sampling below then avoids a NumPy copy and host-to-device transfer
+        # on every update.
+        device_observations = jax.device_put(buffer.observations)
+        device_actions = jax.device_put(buffer.actions)
+        device_rewards = jax.device_put(buffer.rewards)
+        device_masks = jax.device_put(buffer.masks)
+        device_normalized_observations = jax.device_put(normalized_observations)
+        device_normalized_next_observations = jax.device_put(normalized_next_observations)
 
         if (
             config.q_hidden_size != rlpd_config.hidden_size
@@ -1066,6 +1111,8 @@ def main(config: ConfigView) -> None:
             normalized_next_observations = (
                 buffer.next_observations - obs_mean
             ) / (obs_std + 1e-8)
+            device_normalized_observations = jax.device_put(normalized_observations)
+            device_normalized_next_observations = jax.device_put(normalized_next_observations)
             start_iql_step = checkpoint_iql_step(resume_checkpoint, resume_path)
             print(
                 f"Resuming encoder training from IQL step {start_iql_step}: "
@@ -1078,6 +1125,10 @@ def main(config: ConfigView) -> None:
             validation_indices,
             min(config.comparison_samples, len(validation_indices)),
             replace=False,
+        )
+        _decoder_inverse, decoder_validation, decoder_metric_kernel = make_decoder_eval_functions(
+            decoder,
+            config.latent_inverse_steps if config.decoder_type == "flow_matching" else None,
         )
         print(
             f"Loaded {len(buffer):,} transitions for {environment_id}. "
@@ -1125,31 +1176,32 @@ def main(config: ConfigView) -> None:
                 batch = permutation[start : start + config.decoder_batch_size]
                 if isinstance(decoder, Decoder1StepFMState):
                     decoder, metrics = decoder.train_step(
-                        epoch, jnp.asarray(buffer.observations[batch]), jnp.asarray(buffer.actions[batch])
+                        epoch, device_observations[jnp.asarray(batch)], device_actions[jnp.asarray(batch)]
                     )
                 else:
                     decoder, metrics = decoder.train_step(
-                        jnp.asarray(buffer.observations[batch]),
+                        device_observations[jnp.asarray(batch)],
                         # Train directly on dataset (s, a). Dataset actions are
                         # already the targets; never apply atanh/arctanh here.
-                        jnp.asarray(buffer.actions[batch]),
+                        device_actions[jnp.asarray(batch)],
                     )
-                losses.append(float(metrics["loss"]))
+                losses.append(metrics["loss"])
                 global_step += 1
             validation_loss, key = decoder_validation_loss(
                 decoder,
-                buffer,
+                device_observations,
+                device_actions,
                 validation_indices,
                 config.decoder_eval_batches,
                 key,
+                decoder_validation,
             )
             comparison, current_latents = decoder_metrics(
                 decoder,
-                buffer,
+                device_observations,
+                device_actions,
                 comparison_indices,
-                config.latent_inverse_steps
-                if config.decoder_type == "flow_matching"
-                else None,
+                decoder_metric_kernel,
             )
             comparison["latent/drift_mse"] = (
                 0.0
@@ -1162,7 +1214,7 @@ def main(config: ConfigView) -> None:
                 "phase": "decoder",
                 "global_step": global_step,
                 "decoder/epoch": epoch + 1,
-                "decoder/train_cfm_loss": float(np.mean(losses)),
+                "decoder/train_cfm_loss": float(jax.device_get(jnp.mean(jnp.stack(losses)))),
                 "decoder/validation_cfm_loss": validation_loss,
                 **comparison,
             }
@@ -1236,19 +1288,20 @@ def main(config: ConfigView) -> None:
             print("Frozen decoder restored from checkpoint.")
         latent_targets = build_latent_targets(
             decoder,
-            buffer,
+            device_observations,
+            device_actions,
             config.decoder_batch_size,
             config.latent_inverse_steps
             if config.decoder_type == "flow_matching"
             else None,
         )
+        device_latent_targets = jax.device_put(latent_targets)
         frozen_metrics, _ = decoder_metrics(
             decoder,
-            buffer,
+            device_observations,
+            device_actions,
             comparison_indices,
-            config.latent_inverse_steps
-            if config.decoder_type == "flow_matching"
-            else None,
+            decoder_metric_kernel,
         )
         frozen_record = {
             "method": "frozen_decoder",
@@ -1303,7 +1356,8 @@ def main(config: ConfigView) -> None:
         iql_update = make_iql_update(
             config, actor_optimizer, critic_optimizer, value_optimizer
         )
-        accumulators: dict[str, list[float]] = {}
+        accumulators: dict[str, Array] = {}
+        accumulator_count = 0
         policy_indices = rng.choice(
             len(buffer),
             min(config.comparison_samples, len(buffer)),
@@ -1349,15 +1403,16 @@ def main(config: ConfigView) -> None:
                 value_opt_state,
                 target_q1_params,
                 target_q2_params,
-                jnp.asarray(normalized_observations[indices]),
-                jnp.asarray(buffer.actions[indices]),
-                jnp.asarray(buffer.rewards[indices]),
-                jnp.asarray(normalized_next_observations[indices]),
-                jnp.asarray(buffer.masks[indices]),
-                jnp.asarray(latent_targets[indices]),
+                device_normalized_observations[jnp.asarray(indices)],
+                device_actions[jnp.asarray(indices)],
+                device_rewards[jnp.asarray(indices)],
+                device_normalized_next_observations[jnp.asarray(indices)],
+                device_masks[jnp.asarray(indices)],
+                device_latent_targets[jnp.asarray(indices)],
             )
             for name, value in metrics.items():
-                accumulators.setdefault(name, []).append(float(value))
+                accumulators[name] = accumulators.get(name, jnp.asarray(0.0)) + value
+            accumulator_count += 1
             completed_iql_steps = step + 1
             should_validate = (
                 completed_iql_steps % config.validation_interval == 0
@@ -1373,10 +1428,11 @@ def main(config: ConfigView) -> None:
                     value_params,
                     target_q1_params,
                     target_q2_params,
-                    normalized_observations,
-                    normalized_next_observations,
-                    buffer,
-                    latent_targets,
+                    device_normalized_observations,
+                    device_normalized_next_observations,
+                    device_rewards,
+                    device_masks,
+                    device_latent_targets,
                     validation_eval_indices,
                 )
                 if completed_iql_steps >= config.early_stopping_min_steps:
@@ -1418,7 +1474,7 @@ def main(config: ConfigView) -> None:
                         for name, value in latest_validation_metrics.items()
                     },
                     **{
-                        f"iql/{name}": float(np.mean(values))
+                        f"iql/{name}": float(jax.device_get(values / accumulator_count))
                         for name, values in accumulators.items()
                     },
                     **policy_metrics(
@@ -1427,10 +1483,11 @@ def main(config: ConfigView) -> None:
                         q2_params,
                         value_params,
                         decoder,
-                        buffer,
-                        normalized_observations,
+                        device_normalized_observations,
+                        device_observations,
+                        device_actions,
                         policy_indices,
-                        latent_targets,
+                        device_latent_targets,
                     ),
                 }
                 append_metrics(metrics_path, record)
@@ -1444,6 +1501,7 @@ def main(config: ConfigView) -> None:
                 )
                 print(f"  step {step + 1}: {record}")
                 accumulators.clear()
+                accumulator_count = 0
 
             if completed_iql_steps % config.checkpoint_interval == 0:
                 periodic_decoder_path = (

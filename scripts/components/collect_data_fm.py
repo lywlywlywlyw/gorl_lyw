@@ -610,7 +610,6 @@ def run_async_collector(
 def run_async_evaluator(
     pipeline_root: str,
     stop_file: str,
-    max_version: int,
     poll_seconds: float = 2.0,
     metrics_file: str | None = None,
     evaluation_dir: str | None = None,
@@ -619,9 +618,6 @@ def run_async_evaluator(
     decoder_type: str = "flow_matching",
 ) -> None:
     """Evaluate every Policy_n exactly once and strictly in version order."""
-    if max_version < 0:
-        raise ValueError("max_version must be non-negative")
-
     config = TrainingConfig().to_dict() | EnvConfig().to_dict()
     config["decoder_type"] = decoder_type
     manager = VersionManager(pipeline_root)
@@ -642,7 +638,8 @@ def run_async_evaluator(
     try:
         # Waiting for an explicit version, rather than latest_policy(), ensures
         # that a quickly advancing trainer cannot skip evaluations.
-        for version in range(max_version + 1):
+        version = 0
+        while not stop.exists():
             encoder_path, decoder_path = manager.wait_policy(
                 version, poll_seconds, stop
             )
@@ -668,6 +665,7 @@ def run_async_evaluator(
             if metrics_file:
                 append_metrics(metrics_file, metrics)
             print(f"Evaluation completed for Policy_{version}.", flush=True)
+            version += 1
     finally:
         evaluation_pool.close()
         env.close()

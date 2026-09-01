@@ -407,6 +407,7 @@ class DecoderFMState:
         assert loss.shape == (*batch_dims, samples_dim)
         return loss
 
+    @jax.jit
     def train_step(
         self,
         batch_obs: Array,

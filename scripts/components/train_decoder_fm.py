@@ -18,112 +18,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from flow_policy.decoder_fm import DecoderFMConfig, DecoderFMState
 from flow_policy.decoder_1step_fm_residualMLP import Decoder1StepFMConfig, Decoder1StepFMState
 from flow_policy.config_utils import fill_unspecified_config_values
-from flow_policy import networks
 from envs.robomimic.online_config.training_config import TrainingConfig
 from envs.robomimic.online_config.env_config import EnvConfig
-from envs.robomimic.online_config.decoder_configs.meanflow_config import MeanFlowConfig
 try:
     from .metrics_ipc import append_metrics
     from .online_pipeline_ipc import atomic_pickle_dump, load_transition_data
 except ImportError:  # Direct execution: python scripts/components/train_decoder_fm.py
     from metrics_ipc import append_metrics
     from online_pipeline_ipc import atomic_pickle_dump, load_transition_data
-
-
-def evaluate_decoder_update_need(
-    encoder_checkpoint_path: str,
-    decoder_checkpoint_path: str,
-    replay_snapshot_path: str,
-    new_sample_count: int,
-    sample_count: int,
-    action_roundtrip_p95_threshold: float,
-    latent_cycle_p95_threshold: float,
-    inverse_outlier_fraction_threshold: float,
-    latent_support_radius: float,
-    decoder_type: str,
-    seed: int,
-) -> dict[str, float | int | bool]:
-    """Measure whether the current decoder still serves new data and policy latents."""
-    with Path(encoder_checkpoint_path).expanduser().open("rb") as file:
-        encoder = pickle.load(file)
-    with Path(decoder_checkpoint_path).expanduser().open("rb") as file:
-        decoder_checkpoint = pickle.load(file)
-    replay = load_transition_data(replay_snapshot_path)
-    available = min(max(1, int(new_sample_count)), len(replay["observations"]))
-    recent_start = len(replay["observations"]) - available
-    rng = np.random.default_rng(seed)
-    indices = rng.integers(
-        recent_start,
-        len(replay["observations"]),
-        size=min(int(sample_count), available),
-    )
-    observations = jnp.asarray(replay["observations"][indices])
-    actions = jnp.asarray(replay["actions"][indices])
-    state_cls = Decoder1StepFMState if decoder_type == "meanflow" else DecoderFMState
-    decoder_config = decoder_checkpoint["config"]
-    if decoder_type == "meanflow":
-        decoder_config = fill_unspecified_config_values(
-            decoder_config,
-            warm_up_epoch=MeanFlowConfig().meanflow_warm_up_epoch,
-        )
-    decoder = state_cls.init(
-        jax.random.PRNGKey(seed + 1),
-        int(decoder_checkpoint["obs_dim"]),
-        int(decoder_checkpoint["action_dim"]),
-        decoder_config,
-    )
-    with jdc.copy_and_mutate(decoder) as decoder:
-        decoder.params = decoder_checkpoint["params"]
-        decoder.obs_stats = decoder_checkpoint["obs_stats"]
-    inverse = jax.jit(decoder.inverse_fm_batch)
-    decode = jax.jit(
-        lambda obs, z: decoder.sample_action_from_z(
-            obs, z, jax.random.PRNGKey(0), deterministic=True
-        )
-    )
-    inverse_latents = inverse(observations, actions)
-    reconstructed_actions = decode(observations, inverse_latents)
-    action_errors = jnp.mean(jnp.square(reconstructed_actions - actions), axis=-1)
-
-    encoder_config = encoder.get("config", encoder.get("rlpd_encoder_config"))
-    actor_obs = observations
-    if bool(getattr(encoder_config, "normalize_observations", True)):
-        stats = encoder["rlpd_z_obs_stats"]
-        actor_obs = (actor_obs - stats.mean) / (stats.std + 1e-8)
-    actor_distribution = networks.gaussian_policy_fwd(
-        encoder["rlpd_z_actor_params"],
-        actor_obs,
-    )
-    policy_latents = actor_distribution.sample(jax.random.PRNGKey(seed + 2))
-    policy_actions = decode(observations, policy_latents)
-    roundtrip_policy_latents = inverse(observations, policy_actions)
-    latent_errors = jnp.mean(
-        jnp.square(roundtrip_policy_latents - policy_latents), axis=-1
-    )
-    outliers = jnp.any(jnp.abs(inverse_latents) > latent_support_radius, axis=-1)
-    action_p95 = float(np.asarray(jnp.percentile(action_errors, 95.0)))
-    latent_p95 = float(np.asarray(jnp.percentile(latent_errors, 95.0)))
-    outlier_fraction = float(np.asarray(jnp.mean(outliers)))
-    action_triggered = action_p95 > action_roundtrip_p95_threshold
-    latent_triggered = latent_p95 > latent_cycle_p95_threshold
-    outlier_triggered = outlier_fraction > inverse_outlier_fraction_threshold
-    return {
-        "update_required": bool(
-            action_triggered or latent_triggered or outlier_triggered
-        ),
-        "sample_count": len(indices),
-        "new_sample_count": int(new_sample_count),
-        "action_roundtrip_p95": action_p95,
-        "action_roundtrip_p95_threshold": action_roundtrip_p95_threshold,
-        "action_roundtrip_triggered": action_triggered,
-        "latent_cycle_p95": latent_p95,
-        "latent_cycle_p95_threshold": latent_cycle_p95_threshold,
-        "latent_cycle_triggered": latent_triggered,
-        "inverse_outlier_fraction": outlier_fraction,
-        "inverse_outlier_fraction_threshold": inverse_outlier_fraction_threshold,
-        "inverse_outlier_triggered": outlier_triggered,
-        "latent_support_radius": latent_support_radius,
-    }
 
 
 def train_async_stage(
@@ -136,28 +38,16 @@ def train_async_stage(
     metrics_file: str | None = None,
     inherit_optimizer_state: bool = True,
     decoder_type: str = "flow_matching",
-    validation_fraction: float = 0.1,
-    validation_batches: int = 4,
-    meanflow_min_improvement: float = 1e-4,
-    cycle_error_tolerance: float = 1e-6,
-) -> dict[str, float | int | bool]:
+) -> None:
     """Train one Decoder_n from an immutable replay snapshot.
 
     This is the existing FM objective (``DecoderFMState.train_step``) without
-    success/reward filtering. The latest published encoder is loaded only for
-    provenance and validation; decoder optimization does not wait for a new
-    encoder version. The current FM
-    implementation constructs its own noise latent, so no alternate latent
-    target is introduced here.
+    success/reward filtering. The encoder checkpoint is loaded for provenance
+    and compatibility validation. The current FM implementation constructs its
+    own noise latent, so no alternate latent target is introduced here.
     """
     if train_steps <= 0:
         raise ValueError("train_steps must be positive.")
-    if not 0.0 < validation_fraction < 1.0:
-        raise ValueError("validation_fraction must be between 0 and 1.")
-    if validation_batches <= 0:
-        raise ValueError("validation_batches must be positive.")
-    if meanflow_min_improvement < 0.0 or cycle_error_tolerance < 0.0:
-        raise ValueError("Decoder acceptance tolerances must be non-negative.")
     config = TrainingConfig().to_dict() | EnvConfig().to_dict()
     if decoder_type not in ("flow_matching", "meanflow"):
         raise ValueError("decoder_type must be 'flow_matching' or 'meanflow'.")
@@ -197,16 +87,6 @@ def train_async_stage(
         raise ValueError(f"Checkpoint config is not compatible with {decoder_type}.")
     if inherit_optimizer_state and "decoder_opt_state" not in previous:
         raise ValueError("Online decoder continuation requires optimizer state.")
-    previous_state = state_cls.init(
-        jax.random.PRNGKey(config["seed"] + 1900 + version),
-        int(previous["obs_dim"]), int(previous["action_dim"]), decoder_config,
-    )
-    with jdc.copy_and_mutate(previous_state) as previous_state:
-        previous_state.params = previous["params"]
-        previous_state.obs_stats = previous["obs_stats"]
-        if "decoder_steps" in previous:
-            previous_state.steps = previous["decoder_steps"]
-
     fm_state = state_cls.init(jax.random.PRNGKey(config["seed"] + 2000 + version), int(previous["obs_dim"]), int(previous["action_dim"]), decoder_config)
     with jdc.copy_and_mutate(fm_state) as fm_state:
         fm_state.params = previous["params"]
@@ -221,13 +101,7 @@ def train_async_stage(
 
     rng = np.random.default_rng(config["seed"] + version)
     permutation = rng.permutation(len(states))
-    validation_size = min(
-        len(states) - 1, max(1, int(round(len(states) * validation_fraction)))
-    )
-    validation_indices = permutation[:validation_size]
-    training_indices = permutation[validation_size:]
-    validation_states = states[validation_indices]
-    validation_actions = actions[validation_indices]
+    training_indices = permutation
     batch_size = int(decoder_config.batch_size)
     started = time.time()
     metrics: dict[str, Any] = {}
@@ -250,23 +124,6 @@ def train_async_stage(
                 **{f"decoder/{key}": float(np.asarray(value)) for key, value in metrics.items()},
             })
 
-    baseline_metrics = _evaluate_decoder_candidate(
-        previous_state, validation_states, validation_actions, decoder_type,
-        validation_batches, config["seed"] + version * 100,
-    )
-    candidate_metrics = _evaluate_decoder_candidate(
-        fm_state, validation_states, validation_actions, decoder_type,
-        validation_batches, config["seed"] + version * 100,
-    )
-    meanflow_improvement = (
-        baseline_metrics["meanflow_loss"] - candidate_metrics["meanflow_loss"]
-    )
-    loss_accepted = meanflow_improvement > meanflow_min_improvement
-    cycle_accepted = candidate_metrics["cycle_error"] <= (
-        baseline_metrics["cycle_error"] + cycle_error_tolerance
-    )
-    accepted = bool(loss_accepted and cycle_accepted)
-
     checkpoint = {
         "params": fm_state.params,
         "obs_stats": fm_state.obs_stats,
@@ -284,100 +141,11 @@ def train_async_stage(
         "train_steps": train_steps,
         "inherited_optimizer_state": inherit_optimizer_state,
         "final_loss": float(np.asarray(metrics.get("loss", np.nan))),
-        "accepted": accepted,
-        "validation_meanflow_loss": candidate_metrics["meanflow_loss"],
-        "baseline_validation_meanflow_loss": baseline_metrics["meanflow_loss"],
-        "meanflow_improvement": meanflow_improvement,
-        "meanflow_min_improvement": meanflow_min_improvement,
-        "validation_cycle_error": candidate_metrics["cycle_error"],
-        "baseline_validation_cycle_error": baseline_metrics["cycle_error"],
-        "cycle_error_tolerance": cycle_error_tolerance,
-        "validation_size": validation_size,
         "wall_time_seconds": time.time() - started,
     }
     atomic_pickle_dump(checkpoint, output_checkpoint_path)
-    acceptance_metrics: dict[str, float | int | bool] = {
-        "accepted": accepted,
-        "train_steps": train_steps,
-        "validation_size": validation_size,
-        "baseline_meanflow_loss": baseline_metrics["meanflow_loss"],
-        "candidate_meanflow_loss": candidate_metrics["meanflow_loss"],
-        "meanflow_improvement": meanflow_improvement,
-        "baseline_cycle_error": baseline_metrics["cycle_error"],
-        "candidate_cycle_error": candidate_metrics["cycle_error"],
-    }
-    if metrics_file:
-        append_metrics(metrics_file, {
-            "pipeline/version": version,
-            **{
-                f"decoder/acceptance_{key}": value
-                for key, value in acceptance_metrics.items()
-            },
-        })
-    return acceptance_metrics
+    return None
 
-
-def _evaluate_decoder_candidate(
-    state: DecoderFMState | Decoder1StepFMState,
-    states: np.ndarray,
-    actions: np.ndarray,
-    decoder_type: str,
-    evaluation_batches: int,
-    seed: int,
-) -> dict[str, float]:
-    """Compare candidates with identical held-out samples and random draws."""
-    rng = np.random.default_rng(seed)
-    batch_size = min(int(state.config.batch_size), len(states))
-    losses: list[float] = []
-    cycle_errors: list[float] = []
-    for batch_index in range(evaluation_batches):
-        indices = rng.integers(0, len(states), size=batch_size)
-        batch_obs = jnp.asarray(states[indices])
-        batch_actions = jnp.asarray(actions[indices])
-        key = jax.random.PRNGKey(seed + batch_index)
-        if decoder_type == "meanflow":
-            eps_key, time_key, decode_key = jax.random.split(key, 3)
-            eps = jax.random.normal(eps_key, batch_actions.shape)
-            t, r = state.sample_t_r(time_key, batch_size)
-            _, meanflow_loss, _ = state.compute_meanflow_loss(
-                state.steps,
-                state._normalize_obs(batch_obs),
-                batch_actions,
-                eps,
-                t,
-                r,
-            )
-            loss = meanflow_loss
-        else:
-            eps_key, time_key, decode_key = jax.random.split(key, 3)
-            eps = jax.random.normal(
-                eps_key,
-                (batch_size, state.config.n_samples_per_action, actions.shape[-1]),
-            )
-            t = jax.random.uniform(
-                time_key,
-                (batch_size, state.config.n_samples_per_action, 1),
-            )
-            obs_norm = (
-                (batch_obs - state.obs_stats.mean) / (state.obs_stats.std + 1e-8)
-                if state.config.normalize_observations else batch_obs
-            )
-            loss = jnp.mean(
-                state.compute_cfm_loss(obs_norm, batch_actions, eps, t)
-            )
-        latents = state.inverse_fm_batch(batch_obs, batch_actions)
-        reconstructed = state.sample_action_from_z(
-            batch_obs, latents, decode_key, deterministic=True
-        )
-        # Mean over both batch and action dimensions makes this metric
-        # independent of the action-space dimensionality.
-        cycle_error = jnp.mean(jnp.square(reconstructed - batch_actions))
-        losses.append(float(np.asarray(loss)))
-        cycle_errors.append(float(np.asarray(cycle_error)))
-    return {
-        "meanflow_loss": float(np.mean(losses)),
-        "cycle_error": float(np.mean(cycle_errors)),
-    }
 
 def train_fm(
     data_path: str = "data/ppo_training_data_WalkerWalk_20250928_212057.pkl",
