@@ -43,3 +43,19 @@ def test_support_overflow_penalizes_mean_and_scale() -> None:
     assert float(upper) > 3.0
     assert float(mean_grad[0, 0]) > 0.0
     assert float(std_grad[0, 0]) > 0.0
+
+
+def test_support_overflow_matches_absolute_mean_formula() -> None:
+    mean = jnp.asarray([[0.0, -2.0]])
+    std = jnp.asarray([[2.0, 0.5]])
+
+    overflow, violation, fraction, _, _ = _latent_support_constraint(
+        mean, std, prior_radius=3.0, policy_stddevs=3.0, tolerance=0.0
+    )
+    expected = jnp.mean(
+        jnp.square(jax.nn.relu(jnp.abs(mean) + 3.0 * std - 3.0))
+    )
+
+    assert jnp.allclose(overflow, expected)
+    assert jnp.allclose(violation, expected)
+    assert float(fraction) == 0.0

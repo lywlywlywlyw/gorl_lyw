@@ -84,15 +84,12 @@ def _latent_support_constraint(
     actor_half_width = policy_stddevs * std
     actor_lower = mean - actor_half_width
     actor_upper = mean + actor_half_width
-    lower_overflow = jax.nn.relu(-prior_radius - actor_lower)
-    upper_overflow = jax.nn.relu(actor_upper - prior_radius)
-    overflow = jnp.mean(
-        jnp.square(lower_overflow) + jnp.square(upper_overflow)
+    overflow_amount = jax.nn.relu(
+        jnp.abs(mean) + actor_half_width - prior_radius
     )
+    overflow = jnp.mean(jnp.square(overflow_amount))
     violation = jax.nn.relu(overflow - tolerance)
-    contained_fraction = jnp.mean(
-        (lower_overflow == 0.0) & (upper_overflow == 0.0)
-    )
+    contained_fraction = jnp.mean(overflow_amount == 0.0)
     return (
         overflow,
         violation,
@@ -367,9 +364,9 @@ class EncoderState:
             q = jnp.mean(qs, axis=0)
             mean = distribution.loc
             std = distribution.scale
-            # Analytic KL[N(mu, sigma^2) || N(0, I)]. The frozen FM decoder
-            # was trained from a standard-normal latent prior, so regularize
-            # the actor toward that prior in the actor objective.
+            # Diagnostic only: this KL is logged but deliberately excluded
+            # from the actor objective so the policy is not distribution-
+            # matched to N(0, I).
             prior_kl = 0.5 * jnp.sum(
                 jnp.square(mean) + jnp.square(std) - 1.0 - 2.0 * jnp.log(std),
                 axis=-1,
@@ -387,15 +384,16 @@ class EncoderState:
                 self.config.latent_policy_support_stddevs,
                 self.config.latent_kl_threshold,
             )
-            loss = jnp.mean(
-                temperature * log_probs
-                - q
-                + self.config.latent_kl_weight * prior_kl
+            support_multiplier = jax.lax.stop_gradient(
+                self.latent_kl_multiplier
             )
+            support_penalty = support_multiplier * support_violation
+            loss = jnp.mean(temperature * log_probs - q) + support_penalty
             return loss, (
                 jnp.mean(-log_probs),
                 jnp.mean(q),
                 jnp.mean(prior_kl),
+                support_penalty,
                 jnp.mean(mean),
                 jnp.mean(jnp.abs(mean)),
                 jnp.mean(std),
@@ -418,6 +416,7 @@ class EncoderState:
             entropy,
             actor_q,
             latent_prior_kl,
+            latent_support_penalty,
             latent_mean,
             latent_mean_abs,
             latent_std,
@@ -499,6 +498,7 @@ class EncoderState:
             "temperature_loss": temperature_loss,
             "actor_grad_norm": _global_norm(actor_grads),
             "latent_prior_kl": latent_prior_kl,
+            "latent_support_penalty": latent_support_penalty,
             "latent_support_overflow": latent_support_overflow,
             "latent_support_violation": latent_support_violation,
             "latent_support_fraction": latent_support_fraction,
