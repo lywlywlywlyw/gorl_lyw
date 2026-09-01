@@ -61,7 +61,6 @@ def flow_mlp_fwd(weights: MlpWeights, *inputs_to_concat: Array) -> Array:
 def gaussian_policy_fwd(
     weights: MlpWeights,
     x: Array,
-    mean_bound: float | None = None,
 ) -> NormalDistribution:
     """Apply hidden layers, then output projection."""
     # Final layer is split into mean and scale.
@@ -76,8 +75,6 @@ def gaussian_policy_fwd(
     x = jnp.einsum("...i,ij->...j", x, linear) + bias
 
     mean, scale = jnp.split(x, 2, axis=-1)
-    if mean_bound is not None:
-        mean = mean_bound * jnp.tanh(mean / mean_bound)
     scale = nn.softplus(scale) + 1e-3
     # Clip scale to prevent numerical overflow in log(scale)
     # Tightened upper bound to reduce early-step KL explosions

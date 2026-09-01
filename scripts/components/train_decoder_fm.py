@@ -93,7 +93,6 @@ def evaluate_decoder_update_need(
     actor_distribution = networks.gaussian_policy_fwd(
         encoder["rlpd_z_actor_params"],
         actor_obs,
-        mean_bound=getattr(encoder_config, "actor_mean_bound", None),
     )
     policy_latents = actor_distribution.sample(jax.random.PRNGKey(seed + 2))
     policy_actions = decode(observations, policy_latents)

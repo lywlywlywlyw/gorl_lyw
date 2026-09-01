@@ -29,3 +29,4 @@ nohup*.out
 output*.log
 ref/
 evaluation_videos/
+latent_papers/

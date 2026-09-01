@@ -2,6 +2,17 @@ import jax
 import jax.numpy as jnp
 
 from flow_policy.encoder_rlpd import _latent_support_constraint
+from flow_policy import networks
+
+
+def test_gaussian_actor_mean_is_the_raw_network_output() -> None:
+    weights = networks.MlpWeights(
+        ((jnp.asarray([[2.0, 0.0]]), jnp.asarray([5.0, 0.0])),)
+    )
+
+    distribution = networks.gaussian_policy_fwd(weights, jnp.asarray([[1.0]]))
+
+    assert jnp.allclose(distribution.loc, jnp.asarray([[7.0]]))
 
 
 def test_nonstandard_actor_distribution_can_be_contained() -> None:

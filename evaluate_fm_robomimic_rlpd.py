@@ -70,7 +70,6 @@ class LoadedPolicy:
     actor_params: Any
     actor_obs_stats: Any
     normalize_actor_observations: bool
-    actor_mean_bound: float | None
     apply_tanh: bool
     encoder_algorithm: str
     decoder_type: str
@@ -421,7 +420,6 @@ def load_policy(config: EvaluationConfig) -> LoadedPolicy:
     normalize_actor_observations = bool(
         getattr(encoder_config, "normalize_observations", True)
     )
-    actor_mean_bound = getattr(encoder_config, "actor_mean_bound", None)
     # Current RLPD rollouts pass the frozen decoder output directly to the
     # environment. ``apply_tanh_in_rollout`` remains in training configs for
     # compatibility but rollout_encoder.py intentionally does not use it.
@@ -453,7 +451,7 @@ def load_policy(config: EvaluationConfig) -> LoadedPolicy:
             actor_obs_stats.std + 1e-8
         )
     distribution = networks.gaussian_policy_fwd(
-        actor_params, dummy_obs, mean_bound=actor_mean_bound
+        actor_params, dummy_obs
     )
     if distribution.loc.shape[-1] != action_dim:
         raise ValueError(
@@ -470,7 +468,6 @@ def load_policy(config: EvaluationConfig) -> LoadedPolicy:
         actor_params=actor_params,
         actor_obs_stats=actor_obs_stats,
         normalize_actor_observations=normalize_actor_observations,
-        actor_mean_bound=actor_mean_bound,
         apply_tanh=apply_tanh,
         encoder_algorithm=_encoder_algorithm(encoder_checkpoint),
         decoder_type=decoder_type,
@@ -495,7 +492,6 @@ def _policy_action(
     distribution = networks.gaussian_policy_fwd(
         policy.actor_params,
         actor_observation,
-        mean_bound=policy.actor_mean_bound,
     )
     latent = distribution.loc if deterministic else distribution.sample(key)
     action = policy.decoder.sample_action_from_z(

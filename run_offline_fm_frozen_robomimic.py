@@ -307,7 +307,6 @@ def make_rlpd_encoder_config(
         latent_kl_dual_learning_rate=config.rlpd_latent_kl_dual_learning_rate,
         latent_prior_support_radius=config.rlpd_latent_prior_support_radius,
         latent_policy_support_stddevs=config.rlpd_latent_policy_support_stddevs,
-        actor_mean_bound=config.rlpd_actor_mean_bound,
         policy_update_period=config.rlpd_policy_update_period,
         apply_tanh_in_rollout=config.rlpd_apply_tanh_in_rollout,
     )
@@ -505,9 +504,7 @@ def make_iql_update(
         )
 
         def actor_loss_fn(params):
-            distribution = networks.gaussian_policy_fwd(
-                params, obs, mean_bound=config.rlpd_actor_mean_bound
-            )
+            distribution = networks.gaussian_policy_fwd(params, obs)
             log_prob = jnp.sum(distribution.log_prob(latent_actions), axis=-1)
             return -jnp.mean(advantage_weight * log_prob)
 
@@ -597,7 +594,7 @@ def iql_validation_losses(
         networks.q_mlp_fwd(target_q2_params, obs, latents),
     )
     distribution = networks.gaussian_policy_fwd(
-        actor_params, obs, mean_bound=config.rlpd_actor_mean_bound
+        actor_params, obs
     )
     actor_nll = -jnp.mean(jnp.sum(distribution.log_prob(latents), axis=-1))
     value = networks.value_mlp_fwd(value_params, obs)
@@ -659,14 +656,13 @@ def policy_metrics(
     normalized_observations: np.ndarray,
     indices: np.ndarray,
     latent_targets: np.ndarray,
-    actor_mean_bound: float,
 ) -> dict[str, float]:
     obs_norm = jnp.asarray(normalized_observations[indices])
     obs_raw = jnp.asarray(buffer.observations[indices])
     data_actions = jnp.asarray(buffer.actions[indices])
     targets = jnp.asarray(latent_targets[indices])
     distribution = networks.gaussian_policy_fwd(
-        actor_params, obs_norm, mean_bound=actor_mean_bound
+        actor_params, obs_norm
     )
     policy_z = distribution.loc
     policy_actions = jax.jit(
@@ -1435,7 +1431,6 @@ def main(config: ConfigView) -> None:
                         normalized_observations,
                         policy_indices,
                         latent_targets,
-                        rlpd_config.actor_mean_bound,
                     ),
                 }
                 append_metrics(metrics_path, record)

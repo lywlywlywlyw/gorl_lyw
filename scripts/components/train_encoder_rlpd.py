@@ -379,7 +379,6 @@ def train_async_stage(
         latent_kl_dual_learning_rate=config["rlpd_latent_kl_dual_learning_rate"],
         latent_prior_support_radius=config["rlpd_latent_prior_support_radius"],
         latent_policy_support_stddevs=config["rlpd_latent_policy_support_stddevs"],
-        actor_mean_bound=config["rlpd_actor_mean_bound"],
         policy_update_period=config["rlpd_policy_update_period"],
         apply_tanh_in_rollout=config["rlpd_apply_tanh_in_rollout"],
     )
@@ -633,7 +632,6 @@ def main(
         latent_kl_dual_learning_rate=config["rlpd_latent_kl_dual_learning_rate"],
         latent_prior_support_radius=config["rlpd_latent_prior_support_radius"],
         latent_policy_support_stddevs=config["rlpd_latent_policy_support_stddevs"],
-        actor_mean_bound=config["rlpd_actor_mean_bound"],
         policy_update_period=config["rlpd_policy_update_period"],
         apply_tanh_in_rollout=config["rlpd_apply_tanh_in_rollout"],
     )
