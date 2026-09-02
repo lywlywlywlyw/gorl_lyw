@@ -5,6 +5,9 @@ The method is the same two-stage procedure as ``run_offline_fm_frozen.py``:
 1. Train a conditional flow-matching decoder to convergence and freeze it.
 2. Invert dataset actions through the frozen decoder and train the latent
    encoder with IQL advantage-weighted behavior cloning.
+3. After IQL early stopping, finetune the live actor/critics with an
+   online-RLPD-compatible latent score-matching bridge.  A frozen copy of the
+   early-stopped actor supplies the teacher score; the live actor is not frozen.
 
 This file is deliberately self-contained with respect to the old offline
 scripts. It trains only the frozen FM decoder and IQL latent encoder needed to
@@ -262,6 +265,12 @@ def validate_config(config: ConfigView) -> None:
     if config.early_stopping_actor_nll_weight < 0.0:
         raise ValueError(
             "early_stopping_actor_nll_weight must be non-negative."
+        )
+    if config.encoder_alignment_steps < 0:
+        raise ValueError("encoder_alignment_steps must be non-negative.")
+    if config.encoder_score_matching_weight < 0.0:
+        raise ValueError(
+            "encoder_score_matching_weight must be non-negative."
         )
     if config.wandb_mode not in {"online", "offline", "disabled"}:
         raise ValueError("wandb_mode must be online, offline, or disabled.")
@@ -601,6 +610,178 @@ def make_iql_update(
 
     return update
 
+
+def make_iql_alignment_update(
+    config: ConfigView,
+    actor_optimizer: optax.GradientTransformation,
+    critic_optimizer: optax.GradientTransformation,
+    value_optimizer: optax.GradientTransformation,
+    score_matching_weight: float,
+):
+    """Continue IQL while matching the online RLPD actor geometry.
+
+    The teacher actor is passed as a separate, frozen parameter tree.  The
+    trainable actor continues with the IQL AWR loss only.  The online
+    latent-prior KL is represented once in the critic score target.  The
+    critic receives an additional loss on the latent gradient of the
+    ensemble-mean Q.  Because online RLPD uses
+    ``alpha * log pi + KL(pi || N(0,I)) - Q``, its stationary condition is
+    ``grad Q = (alpha + 1) grad log pi + z``.
+    """
+    online_temperature = float(config.rlpd_initial_temperature)
+    online_kl_weight = 1.0
+
+    @jax.jit
+    def update(
+        actor_params,
+        actor_opt_state,
+        q1_params,
+        q2_params,
+        critic_opt_state,
+        value_params,
+        value_opt_state,
+        target_q1_params,
+        target_q2_params,
+        teacher_actor_params,
+        obs,
+        actions,
+        rewards,
+        next_obs,
+        masks,
+        latent_actions,
+    ):
+        target_q = jnp.minimum(
+            networks.q_mlp_fwd(target_q1_params, obs, latent_actions),
+            networks.q_mlp_fwd(target_q2_params, obs, latent_actions),
+        )
+
+        def value_loss_fn(params):
+            value = networks.value_mlp_fwd(params, obs)
+            loss = jnp.mean(expectile_loss(target_q - value, config.expectile))
+            return loss, (value, target_q - value)
+
+        (value_loss, (value, advantage)), value_grads = jax.value_and_grad(
+            value_loss_fn, has_aux=True
+        )(value_params)
+        value_updates, value_opt_state = value_optimizer.update(
+            value_grads, value_opt_state, value_params
+        )
+        value_params = optax.apply_updates(value_params, value_updates)
+
+        new_value = networks.value_mlp_fwd(value_params, obs)
+        actor_advantage = jax.lax.stop_gradient(target_q - new_value)
+        advantage_weight = jnp.minimum(
+            jnp.exp(actor_advantage * config.temperature),
+            config.max_adv_weight,
+        )
+
+        def actor_loss_fn(params):
+            distribution = networks.gaussian_policy_fwd(params, obs)
+            log_prob = jnp.sum(distribution.log_prob(latent_actions), axis=-1)
+            # Keep the IQL actor objective. The online KL is already encoded
+            # once in score_target below; applying it here would double-count
+            # the prior and unnecessarily move the live actor.
+            return -jnp.mean(advantage_weight * log_prob)
+
+        actor_loss, actor_grads = jax.value_and_grad(actor_loss_fn)(actor_params)
+        actor_updates, actor_opt_state = actor_optimizer.update(
+            actor_grads, actor_opt_state, actor_params
+        )
+        actor_params = optax.apply_updates(actor_params, actor_updates)
+
+        next_value = jax.lax.stop_gradient(
+            networks.value_mlp_fwd(value_params, next_obs)
+        )
+        bellman_target = rewards + config.discount * masks * next_value
+
+        teacher_distribution = networks.gaussian_policy_fwd(
+            teacher_actor_params, obs
+        )
+        teacher_score = -(
+            latent_actions - teacher_distribution.loc
+        ) / jnp.square(teacher_distribution.scale)
+        score_target = jax.lax.stop_gradient(
+            (online_temperature + online_kl_weight) * teacher_score
+            + latent_actions
+        )
+
+        def q_mean_single(params, observation, latent):
+            q1, q2 = params
+            return 0.5 * (
+                networks.q_mlp_fwd(q1, observation, latent)
+                + networks.q_mlp_fwd(q2, observation, latent)
+            )
+
+        q_grad = jax.vmap(
+            jax.grad(q_mean_single, argnums=2), in_axes=(None, 0, 0)
+        )((q1_params, q2_params), obs, latent_actions)
+
+        def critic_loss_fn(params):
+            q1, q2 = params
+            q1_value = networks.q_mlp_fwd(q1, obs, latent_actions)
+            q2_value = networks.q_mlp_fwd(q2, obs, latent_actions)
+            bellman_loss = jnp.mean(
+                jnp.square(q1_value - bellman_target)
+                + jnp.square(q2_value - bellman_target)
+            )
+            # Recompute the gradient with the current critic parameters so the
+            # score term contributes gradients to both Q networks.
+            current_q_grad = jax.vmap(
+                jax.grad(q_mean_single, argnums=2), in_axes=(None, 0, 0)
+            )(params, obs, latent_actions)
+            score_loss = jnp.mean(jnp.square(current_q_grad - score_target))
+            return bellman_loss + score_matching_weight * score_loss, (
+                q1_value,
+                q2_value,
+                bellman_loss,
+                score_loss,
+            )
+
+        (critic_loss, (q1_value, q2_value, bellman_loss, score_loss)), critic_grads = (
+            jax.value_and_grad(critic_loss_fn, has_aux=True)(
+                (q1_params, q2_params)
+            )
+        )
+        critic_updates, critic_opt_state = critic_optimizer.update(
+            critic_grads, critic_opt_state, (q1_params, q2_params)
+        )
+        q1_params, q2_params = optax.apply_updates(
+            (q1_params, q2_params), critic_updates
+        )
+        target_q1_params = polyak_update(
+            q1_params, target_q1_params, config.target_update_rate
+        )
+        target_q2_params = polyak_update(
+            q2_params, target_q2_params, config.target_update_rate
+        )
+        return (
+            actor_params,
+            actor_opt_state,
+            q1_params,
+            q2_params,
+            critic_opt_state,
+            value_params,
+            value_opt_state,
+            target_q1_params,
+            target_q2_params,
+            {
+                "value_loss": value_loss,
+                "actor_loss": actor_loss,
+                "critic_loss": critic_loss,
+                "bellman_loss": bellman_loss,
+                "score_matching_loss": score_loss,
+                "value": jnp.mean(value),
+                "q1": jnp.mean(q1_value),
+                "q2": jnp.mean(q2_value),
+                "advantage": jnp.mean(advantage),
+                "adv_weight": jnp.mean(advantage_weight),
+                "teacher_score_norm": jnp.mean(jnp.linalg.norm(teacher_score, axis=-1)),
+                "q_gradient_norm": jnp.mean(jnp.linalg.norm(q_grad, axis=-1)),
+            },
+        )
+
+    return update
+
 @jax.jit
 def _iql_validation_kernel(
     expectile, discount, actor_nll_weight,
@@ -866,6 +1047,7 @@ def save_offline_checkpoint(
     target_q2_params: PyTree,
     rng: np.random.Generator,
     key: Array,
+    bridge_metadata: dict[str, Any] | None = None,
 ) -> None:
     obs_dim = int(decoder.obs_stats.mean.shape[-1])
     action_dim = int(decoder.action_dim if hasattr(decoder, "action_dim") else decoder.params[-1][0].shape[-1])
@@ -930,6 +1112,8 @@ def save_offline_checkpoint(
         "numpy_rng_state": rng.bit_generator.state,
         "jax_key": key,
     }
+    if bridge_metadata:
+        checkpoint.update(bridge_metadata)
     with open(path, "wb") as file:
         pickle.dump(checkpoint, file)
 
@@ -1558,6 +1742,97 @@ def main(config: ConfigView) -> None:
         print(
             f"Restored best encoder from IQL step {best_iql_step}."
         )
+
+        # Bridge finetune: keep an immutable copy of the early-stopped IQL
+        # actor as the score teacher, while the live actor, critics, and value
+        # network continue training from the restored IQL state.  The teacher
+        # is never updated by either the actor or critic optimizer.
+        teacher_actor_params = jax.tree.map(
+            lambda value: jax.lax.stop_gradient(value), actor_params
+        )
+        alignment_steps = int(config.encoder_alignment_steps)
+        if alignment_steps < 0:
+            raise ValueError("encoder_alignment_steps must be non-negative.")
+        if config.encoder_score_matching_weight < 0.0:
+            raise ValueError("encoder_score_matching_weight must be non-negative.")
+        alignment_update = make_iql_alignment_update(
+            config,
+            actor_optimizer,
+            critic_optimizer,
+            value_optimizer,
+            config.encoder_score_matching_weight,
+        )
+        alignment_accumulators: dict[str, Array] = {}
+        alignment_total = 0
+        alignment_count = 0
+        for alignment_step in trange(
+            alignment_steps, desc="IQL-to-RLPD bridge"
+        ):
+            indices = rng.choice(train_indices, size=config.batch_size, replace=True)
+            (
+                actor_params,
+                actor_opt_state,
+                q1_params,
+                q2_params,
+                critic_opt_state,
+                value_params,
+                value_opt_state,
+                target_q1_params,
+                target_q2_params,
+                alignment_metrics,
+            ) = alignment_update(
+                actor_params,
+                actor_opt_state,
+                q1_params,
+                q2_params,
+                critic_opt_state,
+                value_params,
+                value_opt_state,
+                target_q1_params,
+                target_q2_params,
+                teacher_actor_params,
+                device_normalized_observations[jnp.asarray(indices)],
+                device_actions[jnp.asarray(indices)],
+                device_rewards[jnp.asarray(indices)],
+                device_normalized_next_observations[jnp.asarray(indices)],
+                device_masks[jnp.asarray(indices)],
+                device_latent_targets[jnp.asarray(indices)],
+            )
+            for name, value in alignment_metrics.items():
+                alignment_accumulators[name] = (
+                    alignment_accumulators.get(name, jnp.asarray(0.0)) + value
+                )
+            alignment_total += 1
+            alignment_count += 1
+            if (
+                alignment_count % config.log_interval == 0
+                or alignment_total == alignment_steps
+            ):
+                bridge_record = {
+                    "method": "frozen_decoder",
+                    "phase": "encoder_alignment",
+                    "global_step": global_step + alignment_total,
+                    "encoder/alignment_step": alignment_total,
+                    **{
+                        f"alignment/{name}": float(
+                            jax.device_get(value / alignment_count)
+                        )
+                        for name, value in alignment_accumulators.items()
+                    },
+                }
+                append_metrics(metrics_path, bridge_record)
+                logger.log(
+                    {
+                        key: value
+                        for key, value in bridge_record.items()
+                        if isinstance(value, (int, float))
+                    },
+                    global_step + alignment_total,
+                )
+                print(f"  bridge step {alignment_total}: {bridge_record}")
+                alignment_accumulators.clear()
+                alignment_count = 0
+
         decoder_path = output_dir / "checkpoint_final.pkl"
         final_iql_step = best_iql_step
         save_offline_checkpoint(
@@ -1579,6 +1854,12 @@ def main(config: ConfigView) -> None:
             target_q2_params,
             rng,
             key,
+            bridge_metadata={
+                "encoder_alignment_steps": alignment_steps,
+                "encoder_score_matching_weight": config.encoder_score_matching_weight,
+                "encoder_alignment_kl_weight": 1.0,
+                "alignment_teacher_frozen": True,
+            },
         )
         print(f"Saved final offline RLPD checkpoint: {decoder_path}")
     finally:
