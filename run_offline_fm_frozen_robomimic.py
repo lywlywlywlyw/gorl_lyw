@@ -629,7 +629,8 @@ def make_iql_alignment_update(
     ``grad Q = (alpha + 1) grad log pi + z``.
     """
     online_temperature = float(config.rlpd_initial_temperature)
-    online_kl_weight = 1.0
+    # Match the coefficient of KL(pi || N(0, I)) in the online actor loss.
+    online_kl_weight = float(config.rlpd_latent_kl_weight)
 
     @jax.jit
     def update(
@@ -702,7 +703,7 @@ def make_iql_alignment_update(
         ) / jnp.square(teacher_distribution.scale)
         score_target = jax.lax.stop_gradient(
             (online_temperature + online_kl_weight) * teacher_score
-            + latent_actions
+            + online_kl_weight * latent_actions
         )
 
         def q_mean_single(params, observation, latent):
@@ -777,6 +778,38 @@ def make_iql_alignment_update(
                 "adv_weight": jnp.mean(advantage_weight),
                 "teacher_score_norm": jnp.mean(jnp.linalg.norm(teacher_score, axis=-1)),
                 "q_gradient_norm": jnp.mean(jnp.linalg.norm(q_grad, axis=-1)),
+                "score_target_norm": jnp.mean(jnp.linalg.norm(score_target, axis=-1)),
+                "score_target_q_grad_mse": jnp.mean(jnp.square(q_grad - score_target)),
+                "score_target_q_grad_relative_mse": jnp.mean(jnp.square(q_grad - score_target)) / (jnp.mean(jnp.square(score_target)) + 1e-8),
+                "score_target_q_grad_cosine": jnp.mean(
+                    jnp.sum(q_grad * score_target, axis=-1)
+                    / (jnp.linalg.norm(q_grad, axis=-1) * jnp.linalg.norm(score_target, axis=-1) + 1e-8)
+                ),
+                "score_target_q_grad_norm_ratio": jnp.mean(
+                    jnp.linalg.norm(q_grad, axis=-1) / (jnp.linalg.norm(score_target, axis=-1) + 1e-8)
+                ),
+                "teacher_latent_score_norm": jnp.mean(jnp.linalg.norm(teacher_score, axis=-1)),
+                "latent_prior_score_norm": jnp.mean(jnp.linalg.norm(latent_actions, axis=-1)),
+                "q12_gap": jnp.mean(jnp.abs(q1_value - q2_value)),
+                "advantage_std": jnp.std(advantage),
+                "adv_weight_std": jnp.std(advantage_weight),
+                "adv_weight_max": jnp.max(advantage_weight),
+                "actor_grad_norm": optax.global_norm(actor_grads),
+                "critic_grad_norm": optax.global_norm(critic_grads),
+                "value_grad_norm": optax.global_norm(value_grads),
+                "actor_update_norm": optax.global_norm(actor_updates),
+                "critic_update_norm": optax.global_norm(critic_updates),
+                "value_update_norm": optax.global_norm(value_updates),
+                "bellman_target_mean": jnp.mean(bellman_target),
+                "bellman_target_std": jnp.std(bellman_target),
+                "td_error_abs_mean": jnp.mean(0.5 * (jnp.abs(q1_value - bellman_target) + jnp.abs(q2_value - bellman_target))),
+                "td_error_abs_p95": jnp.percentile(0.5 * (jnp.abs(q1_value - bellman_target) + jnp.abs(q2_value - bellman_target)), 95.0),
+                "score_loss_fraction": score_matching_weight * score_loss / (bellman_loss + score_matching_weight * score_loss + 1e-8),
+                "actor_grad_clipped": jnp.asarray(optax.global_norm(actor_grads) > config.max_grad_norm),
+                "critic_grad_clipped": jnp.asarray(optax.global_norm(critic_grads) > config.max_grad_norm),
+                "value_grad_clipped": jnp.asarray(optax.global_norm(value_grads) > config.max_grad_norm),
+                "advantage_p95": jnp.percentile(advantage, 95.0),
+                "adv_weight_p95": jnp.percentile(advantage_weight, 95.0),
             },
         )
 
@@ -910,6 +943,101 @@ def policy_metrics(
              "comparison/policy_q_minus_v", "comparison/policy_action_data_mse",
              "encoder/latent_nll", "encoder/mean_target_mse", "encoder/scale_mean")
     return dict(zip(names, np.asarray(values).tolist()))
+
+
+@jax.jit
+def _alignment_diagnostics_kernel(actor_params, teacher_params, q1_params, q2_params,
+                                  value_params, obs, raw_obs, data_actions,
+                                  latent_targets, decoder):
+    live = networks.gaussian_policy_fwd(actor_params, obs)
+    teacher = networks.gaussian_policy_fwd(teacher_params, obs)
+    live_z = live.loc
+    teacher_z = teacher.loc
+    decoded_live = forward_fm_batch(decoder, raw_obs, live_z)
+    decoded_teacher = forward_fm_batch(decoder, raw_obs, teacher_z)
+    kl_live_teacher = jnp.sum(
+        jnp.log(teacher.scale / live.scale)
+        + (jnp.square(live.scale) + jnp.square(live.loc - teacher.loc))
+        / (2.0 * jnp.square(teacher.scale)) - 0.5, axis=-1
+    )
+    kl_teacher_live = jnp.sum(
+        jnp.log(live.scale / teacher.scale)
+        + (jnp.square(teacher.scale) + jnp.square(teacher.loc - live.loc))
+        / (2.0 * jnp.square(live.scale)) - 0.5, axis=-1
+    )
+    q1 = networks.q_mlp_fwd(q1_params, obs, live_z)
+    q2 = networks.q_mlp_fwd(q2_params, obs, live_z)
+    value = networks.value_mlp_fwd(value_params, obs)
+    return jnp.asarray((
+        jnp.mean(kl_live_teacher), jnp.percentile(kl_live_teacher, 95.0), jnp.max(kl_live_teacher),
+        jnp.mean(kl_teacher_live), jnp.mean(jnp.square(live_z - teacher_z)),
+        jnp.mean(jnp.abs(live_z - teacher_z)), jnp.mean(live.scale / teacher.scale),
+        jnp.mean(jnp.square(decoded_live - decoded_teacher)),
+        jnp.mean(jnp.abs(decoded_live - decoded_teacher)), jnp.max(jnp.abs(decoded_live - decoded_teacher)),
+        jnp.mean(jnp.square(decoded_live - data_actions)), jnp.mean(jnp.abs(decoded_live - data_actions)),
+        jnp.mean(q1), jnp.mean(q2), jnp.mean(jnp.abs(q1 - q2)),
+        jnp.mean(q1 - value), jnp.mean(live.scale),
+        jnp.mean(jnp.square(live_z - latent_targets)),
+    ))
+
+
+def alignment_diagnostics(actor_params, teacher_params, q1_params, q2_params,
+                          value_params, decoder, normalized_observations,
+                          observations, data_actions, indices, latent_targets):
+    values = jax.device_get(_alignment_diagnostics_kernel(
+        actor_params, teacher_params, q1_params, q2_params, value_params,
+        normalized_observations[jnp.asarray(indices)], observations[jnp.asarray(indices)],
+        data_actions[jnp.asarray(indices)], latent_targets[jnp.asarray(indices)], decoder,
+    ))
+    names = ("actor/kl_live_teacher_mean", "actor/kl_live_teacher_p95", "actor/kl_live_teacher_max",
+             "actor/kl_teacher_live_mean", "actor/latent_teacher_mse", "actor/latent_teacher_mae",
+             "actor/scale_ratio_live_teacher", "actor/decoded_teacher_mse", "actor/decoded_teacher_mae",
+             "actor/decoded_teacher_max", "comparison/policy_action_data_mse",
+             "comparison/policy_action_data_mae", "comparison/policy_q", "comparison/policy_q2",
+             "comparison/q1_q2_gap", "comparison/policy_q_minus_v", "encoder/scale_mean",
+             "encoder/mean_target_mse")
+    result = dict(zip(names, np.asarray(values).tolist()))
+    actor_norm = optax.global_norm(actor_params)
+    actor_delta = optax.global_norm(jax.tree.map(lambda x, y: x - y, actor_params, teacher_params))
+    result["actor/parameter_distance_relative"] = float(
+        np.asarray(actor_delta / (actor_norm + 1e-8))
+    )
+    return result
+
+
+def evaluate_policy_environment(environment, actor_params, decoder, obs_stats,
+                                config, eval_step: int, stochastic: bool = False) -> dict[str, float]:
+    """Deterministic fixed-seed evaluation used only at finetune checkpoints."""
+    returns, lengths, successes, success_times = [], [], [], []
+    mean, std = obs_stats.mean, obs_stats.std
+    for episode in range(int(config.eval_num_envs)):
+        # Keep the episode seeds identical at every checkpoint so changes are
+        # attributable to the policy rather than evaluation sampling noise.
+        state = environment.reset(jax.random.key(int(config.seed) + episode))
+        episode_return, success, length, success_step = 0.0, False, 0, None
+        for step in range(int(config.episode_length)):
+            obs_norm = (state.obs - mean) / (std + 1e-8)
+            dist = networks.gaussian_policy_fwd(actor_params, obs_norm[None])
+            latent = dist.sample(seed=jax.random.key(int(config.seed) + episode * 1000 + step)) if stochastic else dist.loc
+            action = forward_fm_batch(decoder, state.obs[None], latent)[0]
+            if config.rlpd_apply_tanh_in_rollout:
+                action = jnp.tanh(action)
+            state = environment.step(state, action)
+            episode_return += float(np.asarray(state.reward)); length = step + 1
+            success = success or bool(np.asarray(state.info.get("success", False)))
+            if success and success_step is None:
+                success_step = step + 1
+            if bool(np.asarray(state.done)):
+                break
+        returns.append(episode_return); lengths.append(length); successes.append(float(success))
+        success_times.append(success_step if success_step is not None else int(config.episode_length))
+    success_rate = float(np.mean(successes))
+    prefix = "eval/stochastic_" if stochastic else "eval/"
+    return {prefix + "success_rate": success_rate, prefix + "return_mean": float(np.mean(returns)),
+            prefix + "return_std": float(np.std(returns)), prefix + "episode_length_mean": float(np.mean(lengths)),
+            prefix + "time_to_success_mean": float(np.mean(success_times)),
+            prefix + "num_episodes": float(len(returns)),
+            prefix + "success_rate_se": float(np.sqrt(max(success_rate * (1.0 - success_rate), 0.0) / max(len(returns), 1)))}
 
 
 def append_metrics(path: Path, record: dict[str, Any]) -> None:
@@ -1132,6 +1260,7 @@ def main(config: ConfigView) -> None:
 
     logger = WandbLogger(config)
     rng = np.random.default_rng(config.seed)
+    env = None
     try:
         resume_checkpoint, resume_path = load_checkpoint(config.checkpoint_path)
         env, environment_id = make_dataset_environment(config)
@@ -1765,6 +1894,30 @@ def main(config: ConfigView) -> None:
         alignment_accumulators: dict[str, Array] = {}
         alignment_total = 0
         alignment_count = 0
+        # Record the exact pre-bridge baseline on the same held-out states and
+        # with the same fixed evaluation seeds used below.
+        alignment_base_step = global_step + completed_iql_steps
+        baseline_record = {
+            "method": "frozen_decoder", "phase": "encoder_alignment",
+            "global_step": alignment_base_step, "encoder/alignment_step": 0,
+            "alignment/baseline": 1.0,
+            **{f"alignment/{name}": value for name, value in iql_validation_losses(
+                config, actor_params, q1_params, q2_params, value_params,
+                target_q1_params, target_q2_params, device_normalized_observations,
+                device_normalized_next_observations, device_rewards, device_masks,
+                device_latent_targets, validation_eval_indices).items()},
+            **alignment_diagnostics(actor_params, teacher_actor_params, q1_params, q2_params,
+                                    value_params, decoder, device_normalized_observations,
+                                    device_observations, device_actions, validation_eval_indices,
+                                    device_latent_targets),
+            **evaluate_policy_environment(env, actor_params, decoder, encoder_obs_stats,
+                                          config, 0),
+            **evaluate_policy_environment(env, actor_params, decoder, encoder_obs_stats,
+                                          config, 0, stochastic=True),
+        }
+        append_metrics(metrics_path, baseline_record)
+        logger.log({k: v for k, v in baseline_record.items() if isinstance(v, (int, float))},
+                   alignment_base_step)
         for alignment_step in trange(
             alignment_steps, desc="IQL-to-RLPD bridge"
         ):
@@ -1811,7 +1964,7 @@ def main(config: ConfigView) -> None:
                 bridge_record = {
                     "method": "frozen_decoder",
                     "phase": "encoder_alignment",
-                    "global_step": global_step + alignment_total,
+                    "global_step": alignment_base_step + alignment_total,
                     "encoder/alignment_step": alignment_total,
                     **{
                         f"alignment/{name}": float(
@@ -1819,6 +1972,19 @@ def main(config: ConfigView) -> None:
                         )
                         for name, value in alignment_accumulators.items()
                     },
+                    **{f"alignment/{name}": value for name, value in iql_validation_losses(
+                        config, actor_params, q1_params, q2_params, value_params,
+                        target_q1_params, target_q2_params, device_normalized_observations,
+                        device_normalized_next_observations, device_rewards, device_masks,
+                        device_latent_targets, validation_eval_indices).items()},
+                    **alignment_diagnostics(actor_params, teacher_actor_params, q1_params, q2_params,
+                                            value_params, decoder, device_normalized_observations,
+                                            device_observations, device_actions, validation_eval_indices,
+                                            device_latent_targets),
+                    **evaluate_policy_environment(env, actor_params, decoder, encoder_obs_stats,
+                                                  config, alignment_total),
+                    **evaluate_policy_environment(env, actor_params, decoder, encoder_obs_stats,
+                                                  config, alignment_total, stochastic=True),
                 }
                 append_metrics(metrics_path, bridge_record)
                 logger.log(
@@ -1827,7 +1993,7 @@ def main(config: ConfigView) -> None:
                         for key, value in bridge_record.items()
                         if isinstance(value, (int, float))
                     },
-                    global_step + alignment_total,
+                    alignment_base_step + alignment_total,
                 )
                 print(f"  bridge step {alignment_total}: {bridge_record}")
                 alignment_accumulators.clear()
@@ -1863,6 +2029,8 @@ def main(config: ConfigView) -> None:
         )
         print(f"Saved final offline RLPD checkpoint: {decoder_path}")
     finally:
+        if env is not None:
+            env.close()
         logger.finish()
 
 
