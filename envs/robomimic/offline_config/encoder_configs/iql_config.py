@@ -14,6 +14,9 @@ class IQLConfig:
     max_adv_weight: float = 100.0
     target_update_rate: float = 0.005
     actor_learning_rate: float = 3e-4
+    # Offline-only KL regularization toward the decoder's N(0, I) latent
+    # prior. This is intentionally independent of rlpd_latent_kl_weight.
+    encoder_iql_prior_kl_weight: float = 0.0
     critic_learning_rate: float = 1e-4
     value_learning_rate: float = 1e-4
     max_grad_norm: float = 0.5

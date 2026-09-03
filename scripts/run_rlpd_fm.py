@@ -597,7 +597,7 @@ def main(
     offline_checkpoint_path: str,
     demo_buffer_path: str,
     run_dir: str | None = None,
-    encoder_train_env_steps: int = 50,
+    encoder_train_env_steps: int = 250,
     decoder_train_steps: int = 100,
     encoder_demo_ratio: float = 0.5,
     encoder_replay_ratio: float = 0.5,
