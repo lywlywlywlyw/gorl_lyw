@@ -34,9 +34,8 @@ class IQLConfig:
     early_stopping_min_delta: float = 1e-4
     # Small policy-quality tie-breaker in the normalized validation score.
     early_stopping_actor_nll_weight: float = 0.01
-    # Optional post-IQL bridge finetune for compatibility with online RLPD.
-    # The bridge uses a frozen copy of the IQL actor as a score teacher while
-    # the live actor and critics continue from the early-stopped checkpoint.
+    # Optional post-IQL alignment for compatibility with online RLPD. The
+    # bridge freezes actor/value and distills the early-stopped critics.
     encoder_alignment_steps: int = 10_000
     encoder_score_matching_weight: float = 0.1
 
