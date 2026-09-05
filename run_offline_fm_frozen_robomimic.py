@@ -277,8 +277,6 @@ def validate_config(config: ConfigView) -> None:
         raise ValueError(
             "encoder_score_matching_weight must be non-negative."
         )
-    if config.batch_size % 2:
-        raise ValueError("batch_size must be even for alignment sampling.")
     if config.wandb_mode not in {"online", "offline", "disabled"}:
         raise ValueError("wandb_mode must be online, offline, or disabled.")
 
@@ -319,10 +317,6 @@ def make_rlpd_encoder_config(
         reward_bias=config.rlpd_reward_bias,
         max_grad_norm=config.rlpd_max_grad_norm,
         latent_kl_weight=config.rlpd_latent_kl_weight,
-        latent_kl_threshold=config.rlpd_latent_kl_threshold,
-        latent_kl_dual_learning_rate=config.rlpd_latent_kl_dual_learning_rate,
-        latent_prior_support_radius=config.rlpd_latent_prior_support_radius,
-        latent_policy_support_stddevs=config.rlpd_latent_policy_support_stddevs,
         policy_update_period=config.rlpd_policy_update_period,
         apply_tanh_in_rollout=config.rlpd_apply_tanh_in_rollout,
     )
@@ -652,15 +646,12 @@ def make_iql_alignment_update(
         critic_opt_state,
         teacher_actor_params,
         obs,
-        latent_targets,
         actor_sample_key,
     ):
-        half = obs.shape[0] // 2
         actor_distribution = networks.gaussian_policy_fwd(
-            teacher_actor_params, obs[half:]
+            teacher_actor_params, obs
         )
-        actor_latents = actor_distribution.sample(seed=actor_sample_key)
-        latent_actions = jnp.concatenate((latent_targets[:half], actor_latents), axis=0)
+        latent_actions = actor_distribution.sample(seed=actor_sample_key)
         teacher_distribution = networks.gaussian_policy_fwd(
             teacher_actor_params, obs
         )
@@ -1061,9 +1052,6 @@ def save_offline_checkpoint(
         "rlpd_temperature_parameterization": "softplus_raw",
         "rlpd_z_log_temperature": jnp.log(
             jnp.expm1(jnp.asarray(rlpd_config.initial_temperature))
-        ),
-        "rlpd_z_latent_kl_multiplier": jnp.asarray(
-            rlpd_config.latent_kl_weight
         ),
         "rlpd_z_obs_stats": encoder_obs_stats,
         # Offline-only training state/metadata.
@@ -1588,27 +1576,28 @@ def main(config: ConfigView) -> None:
                     device_latent_targets,
                     validation_eval_indices,
                 )
-                if completed_iql_steps >= config.early_stopping_min_steps:
-                    validation_score = latest_validation_metrics[
-                        "validation_score"
-                    ]
-                    if validation_score < (
-                        best_validation_score - config.early_stopping_min_delta
-                    ):
-                        best_validation_score = validation_score
-                        best_iql_step = completed_iql_steps
-                        best_iql_state = (
-                            actor_params, actor_opt_state,
-                            q1_params, q2_params, critic_opt_state,
-                            value_params, value_opt_state,
-                            target_q1_params, target_q2_params,
-                        )
-                        stale_validations = 0
-                    else:
-                        stale_validations += 1
-                    should_stop = (
-                        stale_validations >= config.early_stopping_patience
+                validation_score = latest_validation_metrics["validation_score"]
+                if validation_score < (
+                    best_validation_score - config.early_stopping_min_delta
+                ):
+                    # Always retain the best validation state. The minimum
+                    # step only gates early stopping, not best-state tracking.
+                    best_validation_score = validation_score
+                    best_iql_step = completed_iql_steps
+                    best_iql_state = (
+                        actor_params, actor_opt_state,
+                        q1_params, q2_params, critic_opt_state,
+                        value_params, value_opt_state,
+                        target_q1_params, target_q2_params,
                     )
+                    stale_validations = 0
+                elif completed_iql_steps >= config.early_stopping_min_steps:
+                    stale_validations += 1
+                # End of best-state update
+                should_stop = (
+                    completed_iql_steps >= config.early_stopping_min_steps
+                    and stale_validations >= config.early_stopping_patience
+                )
             if (
                 (step + 1) % config.log_interval == 0
                 or completed_iql_steps == encoder_target_step
@@ -1746,7 +1735,6 @@ def main(config: ConfigView) -> None:
                 critic_opt_state,
                 teacher_actor_params,
                 device_normalized_observations[jnp.asarray(indices)],
-                device_latent_targets[jnp.asarray(indices)],
                 (key := jax.random.fold_in(key, alignment_step)),
             )
             for name, value in alignment_metrics.items():

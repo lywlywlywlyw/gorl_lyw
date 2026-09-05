@@ -30,13 +30,6 @@ class RLPDConfig:
     # KL regularization weight in the encoder actor objective. Keep this at 1.0
     # to match the normal offline-to-online gap&190min sr=1 experiment.
     rlpd_latent_kl_weight: float = 1.0
-    # Allowed mean squared support overflow. Zero enforces containment.
-    rlpd_latent_kl_threshold: float = 0.0
-    rlpd_latent_kl_dual_learning_rate: float = 1e-3
-    # Interpret N(0, I)'s practical support as [-3, 3] per dimension and
-    # require the actor's [mu - 3 sigma, mu + 3 sigma] interval to fit inside.
-    rlpd_latent_prior_support_radius: float = 3.0
-    rlpd_latent_policy_support_stddevs: float = 3.0
     rlpd_normalize_observations: bool = True
     rlpd_apply_tanh_in_rollout: bool = False
     rlpd_rollout_steps_per_iteration: int = 8

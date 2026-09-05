@@ -37,10 +37,6 @@ class EncoderConfig:
     reward_bias: float | None = None
     max_grad_norm: float | None = None
     latent_kl_weight: float | None = None
-    latent_kl_threshold: float | None = None
-    latent_kl_dual_learning_rate: float | None = None
-    latent_prior_support_radius: float | None = None
-    latent_policy_support_stddevs: float | None = None
     learn_temperature: jdc.Static[bool | None] = None
     policy_update_period: jdc.Static[int | None] = None
     apply_tanh_in_rollout: jdc.Static[bool | None] = None
@@ -67,37 +63,6 @@ def _global_norm(tree: Any) -> Array:
     return optax.global_norm(tree)
 
 
-def _latent_support_constraint(
-    mean: Array,
-    std: Array,
-    prior_radius: float,
-    policy_stddevs: float,
-    tolerance: float,
-) -> tuple[Array, Array, Array, Array, Array]:
-    """Measure whether an actor Gaussian's practical support fits in N(0, I).
-
-    The prior support is ``[-prior_radius, prior_radius]`` and the actor support
-    is ``[mean - policy_stddevs * std, mean + policy_stddevs * std]`` per latent
-    dimension. This is a containment constraint, not distribution matching.
-    """
-    actor_half_width = policy_stddevs * std
-    actor_lower = mean - actor_half_width
-    actor_upper = mean + actor_half_width
-    overflow_amount = jax.nn.relu(
-        jnp.abs(mean) + actor_half_width - prior_radius
-    )
-    overflow = jnp.mean(jnp.square(overflow_amount))
-    violation = jax.nn.relu(overflow - tolerance)
-    contained_fraction = jnp.mean(overflow_amount == 0.0)
-    return (
-        overflow,
-        violation,
-        contained_fraction,
-        jnp.min(actor_lower),
-        jnp.max(actor_upper),
-    )
-
-
 @jdc.pytree_dataclass
 class EncoderState:
     actor_params: networks.MlpWeights
@@ -107,7 +72,6 @@ class EncoderState:
     actor_opt_state: optax.OptState
     critic_opt_state: optax.OptState
     temperature_opt_state: optax.OptState
-    latent_kl_multiplier: Array
     obs_stats: math_utils.RunningStats
     prng: Array
     steps: Array
@@ -124,14 +88,6 @@ class EncoderState:
             raise ValueError("initial_temperature must be positive")
         if config.latent_kl_weight < 0.0:
             raise ValueError("latent_kl_weight must be non-negative")
-        if config.latent_kl_threshold < 0.0:
-            raise ValueError("latent_kl_threshold must be non-negative")
-        if config.latent_kl_dual_learning_rate < 0.0:
-            raise ValueError("latent_kl_dual_learning_rate must be non-negative")
-        if config.latent_prior_support_radius <= 0.0:
-            raise ValueError("latent_prior_support_radius must be positive")
-        if config.latent_policy_support_stddevs <= 0.0:
-            raise ValueError("latent_policy_support_stddevs must be positive")
         obs_dim = int(env.observation_size)
         actor_key, critic_key, prng = jax.random.split(prng, 3)
         actor_dims = (obs_dim,) + (config.hidden_size,) * config.hidden_layers + (
@@ -164,7 +120,6 @@ class EncoderState:
             actor_opt_state=actor_optimizer.init(actor_params),
             critic_opt_state=critic_optimizer.init(critic_params),
             temperature_opt_state=temperature_optimizer.init(log_temperature),
-            latent_kl_multiplier=jnp.asarray(config.latent_kl_weight),
             obs_stats=math_utils.RunningStats.init((obs_dim,)),
             prng=prng,
             steps=jnp.zeros((), dtype=jnp.int32),
@@ -367,21 +322,6 @@ class EncoderState:
                 jnp.square(mean) + jnp.square(std) - 1.0 - 2.0 * jnp.log(std),
                 axis=-1,
             )
-            (
-                support_overflow,
-                support_violation,
-                support_fraction,
-                support_lower_min,
-                support_upper_max,
-            ) = _latent_support_constraint(
-                mean,
-                std,
-                self.config.latent_prior_support_radius,
-                self.config.latent_policy_support_stddevs,
-                self.config.latent_kl_threshold,
-            )
-            support_multiplier = jax.lax.stop_gradient(self.latent_kl_multiplier)
-            support_penalty = support_multiplier * support_violation
             loss = jnp.mean(
                 temperature * log_probs
                 - q
@@ -391,7 +331,6 @@ class EncoderState:
                 jnp.mean(-log_probs),
                 jnp.mean(q),
                 jnp.mean(prior_kl),
-                support_penalty,
                 jnp.mean(mean),
                 jnp.mean(jnp.abs(mean)),
                 jnp.mean(std),
@@ -400,11 +339,6 @@ class EncoderState:
                 jnp.max(std),
                 jnp.mean(jnp.linalg.norm(actions, axis=-1)),
                 jnp.max(jnp.abs(actions)),
-                support_overflow,
-                support_violation,
-                support_fraction,
-                support_lower_min,
-                support_upper_max,
             )
 
         (actor_loss, actor_aux), actor_grads = jax.value_and_grad(
@@ -414,7 +348,6 @@ class EncoderState:
             entropy,
             actor_q,
             latent_prior_kl,
-            latent_support_penalty,
             latent_mean,
             latent_mean_abs,
             latent_std,
@@ -423,11 +356,6 @@ class EncoderState:
             latent_std_max,
             latent_norm,
             latent_max_abs,
-            latent_support_overflow,
-            latent_support_violation,
-            latent_support_fraction,
-            latent_support_lower_min,
-            latent_support_upper_max,
         ) = actor_aux
         actor_optimizer = optax.chain(
             optax.clip_by_global_norm(self.config.max_grad_norm),
@@ -437,17 +365,6 @@ class EncoderState:
             actor_grads, self.actor_opt_state, self.actor_params
         )
         actor_params = optax.apply_updates(self.actor_params, actor_updates)
-
-        # Projected dual ascent for support_overflow <= tolerance. This changes
-        # only lambda; an already-contained actor receives no support gradient.
-        latent_kl_multiplier = jnp.maximum(
-            0.0,
-            self.latent_kl_multiplier
-            + self.config.latent_kl_dual_learning_rate
-            * jax.lax.stop_gradient(
-                latent_support_overflow - self.config.latent_kl_threshold
-            ),
-        )
 
         # Temperature is fixed by default while the explicit decoder-prior KL
         # regularizes the actor. Keep the old update path behind a config flag
@@ -485,7 +402,6 @@ class EncoderState:
             log_temperature=log_temperature,
             actor_opt_state=actor_opt_state,
             temperature_opt_state=temperature_opt_state,
-            latent_kl_multiplier=latent_kl_multiplier,
             prng=rng,
         )
         return state, {
@@ -496,15 +412,6 @@ class EncoderState:
             "temperature_loss": temperature_loss,
             "actor_grad_norm": _global_norm(actor_grads),
             "latent_prior_kl": latent_prior_kl,
-            "latent_support_penalty": latent_support_penalty,
-            "latent_support_overflow": latent_support_overflow,
-            "latent_support_violation": latent_support_violation,
-            "latent_support_fraction": latent_support_fraction,
-            "latent_support_lower_min": latent_support_lower_min,
-            "latent_support_upper_max": latent_support_upper_max,
-            "latent_support_multiplier": latent_kl_multiplier,
-            # Legacy metric name retained for dashboards/checkpoint continuity.
-            "latent_kl_multiplier": latent_kl_multiplier,
             "latent_mean": latent_mean,
             "latent_mean_abs": latent_mean_abs,
             "latent_std": latent_std,
