@@ -1,14 +1,64 @@
 from ..base_env import BaseEnv, ObservationSize, State
+from copy import deepcopy
+
 # import utils.file_utils as FileUtils
 # import utils.obs_utils as ObsUtils
 # import utils.env_utils as EnvUtils
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.obs_utils as ObsUtils
 import robomimic.utils.env_utils as EnvUtils
+import robosuite
 import h5py
 from jax import numpy as jnp
 import jax
 import numpy as np
+
+
+def _robosuite_supports_composite_controllers() -> bool:
+    """Return whether the installed robosuite accepts v1.5 metadata."""
+    try:
+        major, minor = (int(part) for part in robosuite.__version__.split(".")[:2])
+    except (AttributeError, TypeError, ValueError):
+        # Do not rewrite metadata for an unknown/new development version.
+        return True
+    return (major, minor) >= (1, 5)
+
+
+def _compatible_env_metadata(env_meta: dict) -> dict:
+    """Translate robosuite 1.5 dataset metadata for robosuite 1.4."""
+    env_meta = deepcopy(env_meta)
+    if _robosuite_supports_composite_controllers():
+        return env_meta
+
+    env_kwargs = env_meta.setdefault("env_kwargs", {})
+    # Added to the robosuite environment constructor in v1.5.
+    env_kwargs.pop("lite_physics", None)
+
+    controller = env_kwargs.get("controller_configs")
+    if not isinstance(controller, dict) or controller.get("type") != "BASIC":
+        return env_meta
+
+    # v1.5 wraps a single-arm controller in a BASIC composite controller.
+    # v1.4 expects the underlying arm controller dictionary directly.
+    body_parts = controller.get("body_parts", {})
+    arm_controllers = [
+        config
+        for config in body_parts.values()
+        if isinstance(config, dict) and config.get("type") != "GRIP"
+    ]
+    if len(arm_controllers) != 1:
+        raise ValueError(
+            "This dataset uses a robosuite 1.5 composite controller that cannot "
+            f"be represented by installed robosuite {robosuite.__version__}. "
+            "Install robosuite >= 1.5 to use it."
+        )
+    controller = deepcopy(arm_controllers[0])
+    controller.pop("input_ref_frame", None)
+    controller.pop("gripper", None)
+    env_kwargs["controller_configs"] = controller
+    return env_meta
+
+
 class RobomimicEnv(BaseEnv):
     def __init__(
         self,
@@ -55,7 +105,9 @@ class RobomimicEnv(BaseEnv):
 
     def load_env(self):
         self.initialize_obs_modalities()
-        env_meta = FileUtils.get_env_metadata_from_dataset(self.dataset_path)
+        env_meta = _compatible_env_metadata(
+            FileUtils.get_env_metadata_from_dataset(self.dataset_path)
+        )
         # Override the dataset setting before robomimic constructs robosuite.
         # This is forwarded by create_env_from_metadata -> robosuite.make.
         env_meta.setdefault("env_kwargs", {})["reward_shaping"] = self.reward_shaping
@@ -84,15 +136,42 @@ class RobomimicEnv(BaseEnv):
             info={},
         )
 
-    def flatten_obs_dict(self, obs_dict: dict) -> jax.Array:
-        missing_keys = [key for key in self.obs_keys if key not in obs_dict]
+    def _resolve_observation_sources(self, obs_dict: dict) -> dict[str, str]:
+        """Map dataset observation keys to keys exposed by the live environment."""
+        available_keys = set(obs_dict)
+        source_keys = {}
+        missing_keys = []
+        for dataset_key in self.obs_keys:
+            if dataset_key in available_keys:
+                source_keys[dataset_key] = dataset_key
+                continue
+
+            # robosuite versions differ on whether site observables include the
+            # ``_site`` suffix. Resolve this from the keys actually returned by
+            # the current environment instead of assuming one fixed version.
+            candidates = []
+            if dataset_key.endswith("_site"):
+                candidates.append(dataset_key[:-5])
+            source_key = next(
+                (candidate for candidate in candidates if candidate in available_keys),
+                None,
+            )
+            if source_key is None:
+                missing_keys.append(dataset_key)
+            else:
+                source_keys[dataset_key] = source_key
+
         if missing_keys:
             raise KeyError(
                 "Robomimic environment observation is missing dataset keys "
                 f"{missing_keys}; available keys: {sorted(obs_dict)}"
             )
+        return source_keys
+
+    def flatten_obs_dict(self, obs_dict: dict) -> jax.Array:
+        source_keys = self._resolve_observation_sources(obs_dict)
         return jnp.concatenate(
-            [jnp.ravel(jnp.asarray(obs_dict[key])) for key in self.obs_keys],
+            [jnp.ravel(jnp.asarray(obs_dict[source_keys[key]])) for key in self.obs_keys],
             axis=0,
         )
 
