@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from typing import Any, NamedTuple
 
 import jax
@@ -180,10 +179,8 @@ class EncoderState:
         value = self.config.target_entropy
         if value is not None:
             return float(value)
-        # Total differential entropy of the decoder prior N(0, I).
-        return 0.5 * float(self.config.z_dim) * (
-            1.0 + math.log(2.0 * math.pi)
-        )
+        # SAC convention: target entropy is the negative action dimension.
+        return -float(self.config.z_dim)
 
     @jax.jit
     def update_observation_stats(self, observations: Array) -> "EncoderState":
