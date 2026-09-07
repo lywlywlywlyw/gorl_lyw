@@ -676,25 +676,20 @@ def make_iql_alignment_update(
             q2_value = networks.q_mlp_fwd(q2, obs, latent_actions)
             q01_value = networks.q_mlp_fwd(q0_params[0], obs, latent_actions)
             q02_value = networks.q_mlp_fwd(q0_params[1], obs, latent_actions)
-            preserve_loss = jnp.mean(
-                jnp.square(q1_value - jax.lax.stop_gradient(q01_value))
-                + jnp.square(q2_value - jax.lax.stop_gradient(q02_value))
-            )
             current_q_grad = jax.vmap(
                 jax.grad(q_mean_single, argnums=2), in_axes=(None, 0, 0)
             )(params, obs, latent_actions)
             score_loss = jnp.mean(jnp.square(current_q_grad - score_target))
-            return preserve_loss + score_weight * score_loss, (
+            return score_loss, (
                 q1_value,
                 q2_value,
                 q01_value,
                 q02_value,
-                preserve_loss,
                 score_loss,
             )
 
         (critic_loss, (q1_value, q2_value, q01_value, q02_value,
-                       preserve_loss, score_loss)), critic_grads = (
+                       score_loss)), critic_grads = (
             jax.value_and_grad(critic_loss_fn, has_aux=True)(
                 (q1_params, q2_params)
             )
@@ -729,7 +724,6 @@ def make_iql_alignment_update(
             q2_params,
             critic_opt_state,
             {
-                "q_preserve_loss": preserve_loss,
                 "q_abs_drift": q_abs_drift,
                 "q_relative_drift": q_relative_drift,
                 "score_matching_loss": score_loss,
