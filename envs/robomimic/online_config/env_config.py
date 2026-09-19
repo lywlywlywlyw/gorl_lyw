@@ -10,7 +10,8 @@ class EnvConfig:
     num_envs: int = 48#50#16
     eval_num_envs: int = 48
     dense_reward: bool = True
-    success_reward_bonus: float = 0.0
+    success_reward_bonus: float = 150.0
+    terminate_on_success: bool = True
 
     def to_dict(self):
         return asdict(self)

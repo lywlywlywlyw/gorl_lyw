@@ -543,7 +543,7 @@ def run_async_collector(
         dataset_path=config["dataset_path"], reward_shaping=config["dense_reward"]
     )
     rollout_state = BatchedRolloutStateEncoderFM.init(
-        env, jax.random.key(config["seed"] + 1), config["num_envs"]
+        env, jax.random.key(config["seed"] + 1), config["num_envs"], terminate_on_success=config["terminate_on_success"]
     )
     current_version = -1
     agent = None
@@ -631,6 +631,7 @@ def run_async_evaluator(
         env,
         jax.random.key(int(config["seed"]) + 5000),
         int(config["eval_num_envs"]),
+        terminate_on_success=config["terminate_on_success"],
     )
     video_interval = max(1, int(config["wandb_video_interval_evals"]))
     try:
@@ -830,6 +831,7 @@ def main(
         num_envs=config['eval_num_envs'],
         max_episode_length=config['episode_length'],
         apply_tanh_in_rollout=apply_tanh_in_rollout,
+        terminate_on_success=config["terminate_on_success"],
     )
     s_np = {k: onp.array(v) for k, v in eval_outputs.scalar_metrics.items()}
 

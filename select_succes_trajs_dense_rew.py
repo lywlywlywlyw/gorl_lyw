@@ -25,15 +25,15 @@ import numpy as np
 
 
 INPUT_PATH = Path(
-    "/root/GoRL/datasets/robomimic/mg_lift_low_dim_dense.hdf5"
+    "/root/GoRL/datasets/robomimic/mg_can_low_dim_dense.hdf5"
 )
 PROCESSED_PATH = Path(
     "/root/GoRL/datasets/robomimic/"
-    "mg_lift_low_dim_dense_done_processed_no150.hdf5"
+    "mg_can_low_dim_dense_done_processed.hdf5"
 )
 SUCCESS_OUTPUT_PATH = Path(
     "/root/GoRL/datasets/robomimic/"
-    "mg_lift_low_dim_dense_done_processed_success_no150.pkl"
+    "mg_can_low_dim_dense_done_processed_success.pkl"
 )
 
 TRANSITION_KEYS = (
@@ -173,7 +173,7 @@ def process_done_labels(input_path: Path, output_path: Path) -> dict[str, int]:
                 if is_success:
                     success[-1] = True
                     processed_rewards = np.asarray(target_demo["rewards"])
-                    processed_rewards[-1] += 0#150
+                    processed_rewards[-1] += 150
                     del target_demo["rewards"]
                     target_rewards = target_demo.create_dataset(
                         "rewards",

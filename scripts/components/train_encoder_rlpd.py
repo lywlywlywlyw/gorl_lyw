@@ -718,7 +718,7 @@ def main(
     inverse_decoder_batch = _make_inverse_decoder_batch(decoder_state)
     agent = EncoderFMAgent(ppo_z_state=encoder_state, fm_state=decoder_state)
     rollout_state = BatchedRolloutStateEncoderFM.init(
-        env, jax.random.key(config["seed"] + 1), config["num_envs"]
+        env, jax.random.key(config["seed"] + 1), config["num_envs"], terminate_on_success=config["terminate_on_success"]
     )
     replay = ReplayBuffer.load_or_create(
         replay_buffer_path,
@@ -783,6 +783,7 @@ def main(
                 num_envs=config["eval_num_envs"],
                 max_episode_length=config["episode_length"],
                 apply_tanh_in_rollout=config["rlpd_apply_tanh_in_rollout"],
+                terminate_on_success=config["terminate_on_success"],
             )
             evaluation_metrics = {
                 key: float(np.asarray(value))

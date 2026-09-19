@@ -136,6 +136,7 @@ class BatchedRolloutStateEncoderFM:
     success_reward_bonus: float = field(
         default_factory=lambda: EnvConfig().success_reward_bonus
     )
+    terminate_on_success: bool = True
     last_transition_env_states: list[Any] | None = None
 
     @classmethod
@@ -144,6 +145,7 @@ class BatchedRolloutStateEncoderFM:
         env: Any,
         prng: Array,
         num_envs: int,
+        terminate_on_success: bool = True,
     ) -> "BatchedRolloutStateEncoderFM":
         """Create and reset ``num_envs`` process-isolated CPU environments."""
         if num_envs < 1:
@@ -209,7 +211,9 @@ class BatchedRolloutStateEncoderFM:
             connections=connections, processes=processes, env_states=env_states,
             steps=np.zeros(num_envs, dtype=np.int32),
             terminated=np.zeros(num_envs, dtype=np.bool_), num_envs=num_envs,
-            prng=prng, dense_reward=bool(getattr(env, "reward_shaping", False)),
+            prng=prng,
+            dense_reward=bool(getattr(env, "reward_shaping", False)),
+            terminate_on_success=bool(terminate_on_success),
         )
         atexit.register(instance.close)
         return instance
@@ -340,7 +344,7 @@ class BatchedRolloutStateEncoderFM:
                     next_step = self.steps[env_index] + 1
                     success = bool(next_state.info.get("success", False))
                     reached_episode_limit = next_step >= episode_length
-                    done = success or reached_episode_limit
+                    done = ((self.terminate_on_success and success) or reached_episode_limit)
                     reward = float(np.asarray(next_state.reward))
                     if success and self.dense_reward:
                         reward += self.success_reward_bonus
@@ -395,7 +399,7 @@ class BatchedRolloutStateEncoderFM:
             for env_index, response in enumerate(responses):
                 next_state = self._state(response); next_step = self.steps[env_index] + 1
                 success = bool(next_state.info.get("success", False))
-                done = success or next_step >= episode_length
+                done = ((self.terminate_on_success and success) or next_step >= episode_length)
                 reward = float(np.asarray(next_state.reward))
                 if success and self.dense_reward:
                     reward += self.success_reward_bonus
@@ -430,10 +434,12 @@ def eval_policy_encoder_fm(
     num_envs: int,
     max_episode_length: int,
     apply_tanh_in_rollout: bool = True,
+    terminate_on_success: bool = True,
 ) -> rollouts.EvalOutputs:
+
     """Run policy evaluation for Encoder with FM decoder."""
     rollout_state = BatchedRolloutStateEncoderFM.init(
-        agent_state.env, prng, num_envs
+        agent_state.env, prng, num_envs, terminate_on_success=terminate_on_success
     )
 
     try:
