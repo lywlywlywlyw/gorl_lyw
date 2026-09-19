@@ -570,6 +570,7 @@ def evaluate(config: EvaluationConfig) -> dict[str, Any]:
         )
 
     policy = load_policy(config)
+    env_config = EnvConfig().to_dict()
     print(
         f"Loaded {policy.checkpoint_kind} checkpoint: {policy.checkpoint_path}\n"
         f"Encoder checkpoint: {policy.encoder_checkpoint_path}\n"
@@ -616,8 +617,8 @@ def evaluate(config: EvaluationConfig) -> dict[str, Any]:
                     state = policy.env.step(state, action)
                     step_success = _success(state.info)
                     step_reward = float(np.asarray(state.reward))
-                    if step_success:
-                        step_reward += 150.0
+                    if step_success and env_config["dense_reward"]:
+                        step_reward += env_config["success_reward_bonus"]
                     episode_return += step_reward
                     length = step + 1
                     success = success or step_success

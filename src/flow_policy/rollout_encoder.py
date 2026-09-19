@@ -6,7 +6,7 @@ import atexit
 import multiprocessing as mp
 import os
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import jax
@@ -20,9 +20,9 @@ from envs.base_env import State
 from envs.robomimic.online_config.env_config import EnvConfig
 
 
-SUCCESS_REWARD_BONUS = 150.0
-
-def _environment_worker(connection: Any, env_type: type, dataset_path: str) -> None:
+def _environment_worker(
+    connection: Any, env_type: type, dataset_path: str, dense_reward: bool
+) -> None:
     """Own and step one Robomimic environment in a child process."""
     for variable in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
         os.environ[variable] = "1"
@@ -32,9 +32,8 @@ def _environment_worker(connection: Any, env_type: type, dataset_path: str) -> N
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     env = None
     state = None
-    config = EnvConfig().to_dict()
     try:
-        env = env_type(dataset_path=dataset_path, reward_shaping=config['dense_reward'])
+        env = env_type(dataset_path=dataset_path, reward_shaping=dense_reward)
         while True:
             command, payload = connection.recv()
             try:
@@ -133,6 +132,10 @@ class BatchedRolloutStateEncoderFM:
     terminated: np.ndarray
     num_envs: int
     prng: Array
+    dense_reward: bool = False
+    success_reward_bonus: float = field(
+        default_factory=lambda: EnvConfig().success_reward_bonus
+    )
     last_transition_env_states: list[Any] | None = None
 
     @classmethod
@@ -174,7 +177,8 @@ class BatchedRolloutStateEncoderFM:
                 parent, child = context.Pipe()
                 process = context.Process(
                     target=_environment_worker,
-                    args=(child, type(env), env.dataset_path),
+                    args=(child, type(env), env.dataset_path,
+                          bool(getattr(env, "reward_shaping", False))),
                     daemon=True,
                 )
                 process.start()
@@ -201,7 +205,12 @@ class BatchedRolloutStateEncoderFM:
                 process.terminate()
             raise
         env_states = [cls._state(response) for response in responses]
-        instance = cls(connections=connections, processes=processes, env_states=env_states, steps=np.zeros(num_envs, dtype=np.int32), terminated=np.zeros(num_envs, dtype=np.bool_), num_envs=num_envs, prng=prng)
+        instance = cls(
+            connections=connections, processes=processes, env_states=env_states,
+            steps=np.zeros(num_envs, dtype=np.int32),
+            terminated=np.zeros(num_envs, dtype=np.bool_), num_envs=num_envs,
+            prng=prng, dense_reward=bool(getattr(env, "reward_shaping", False)),
+        )
         atexit.register(instance.close)
         return instance
 
@@ -333,8 +342,8 @@ class BatchedRolloutStateEncoderFM:
                     reached_episode_limit = next_step >= episode_length
                     done = success or reached_episode_limit
                     reward = float(np.asarray(next_state.reward))
-                    if success:
-                        reward += SUCCESS_REWARD_BONUS
+                    if success and self.dense_reward:
+                        reward += self.success_reward_bonus
                     next_state = next_state.replace(
                         reward=jnp.asarray(reward, dtype=jnp.float32),
                         done=jnp.asarray(done),
@@ -388,8 +397,8 @@ class BatchedRolloutStateEncoderFM:
                 success = bool(next_state.info.get("success", False))
                 done = success or next_step >= episode_length
                 reward = float(np.asarray(next_state.reward))
-                if success:
-                    reward += SUCCESS_REWARD_BONUS
+                if success and self.dense_reward:
+                    reward += self.success_reward_bonus
                 next_state = next_state.replace(
                     reward=jnp.asarray(reward, dtype=jnp.float32),
                     done=jnp.asarray(done),

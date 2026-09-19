@@ -30,7 +30,6 @@ from flow_policy.rollout_encoder import (
     eval_policy_encoder_fm
 )
 from envs.base_env import State
-from flow_policy.rollout_encoder import SUCCESS_REWARD_BONUS
 from envs.robomimic.RobomimicEnv import RobomimicEnv
 from envs.robomimic.online_config.training_config import TrainingConfig
 from envs.robomimic.online_config.env_config import EnvConfig
@@ -209,13 +208,12 @@ def _record_policy_evaluation(
         apply_tanh_in_rollout=apply_tanh_in_rollout,
     )
     rewards = onp.asarray(jax.device_get(transitions.reward))
-    successes = onp.any(rewards >= SUCCESS_REWARD_BONUS, axis=0)
-    returns = rewards.sum(axis=0) - SUCCESS_REWARD_BONUS * successes
-    lengths = onp.full(num_envs, int(config["episode_length"]), dtype=onp.int32)
-    for env_index in onp.flatnonzero(successes):
-        lengths[env_index] = int(
-            onp.argmax(rewards[:, env_index] >= SUCCESS_REWARD_BONUS) + 1
-        )
+    successes = onp.asarray(
+        [bool(state.info.get("success", False)) for state in rollout_state.env_states]
+    )
+    success_bonus = config["success_reward_bonus"] if config["dense_reward"] else 0.0
+    returns = rewards.sum(axis=0)# - success_bonus * successes  # ？？？lyw
+    lengths = rollout_state.steps.copy()
     metrics: dict[str, float | int | str] = {
         "pipeline/version": version,
         "eval/return_mean": float(onp.mean(returns)),
@@ -387,8 +385,8 @@ def _record_q_gap_evaluation(
                     state = eval_env.step(state, action)
                     reward = float(onp.asarray(state.reward))
                     success = eval_env.is_success()
-                    if success:
-                        reward += SUCCESS_REWARD_BONUS
+                    if success and config["dense_reward"]:
+                        reward += config["success_reward_bonus"]
                     discounted_return += discount * reward
                     discount *= gamma
                     if bool(onp.asarray(state.done)) or success:
@@ -487,8 +485,8 @@ def _record_fixed_q_gap_evaluation(
                     rollout_state.env_states[env_index] = next_state
                     reward = float(onp.asarray(next_state.reward))
                     success = bool(next_state.info.get("success", False))
-                    if success:
-                        reward += SUCCESS_REWARD_BONUS
+                    if success and config["dense_reward"]:
+                        reward += config["success_reward_bonus"]
                     returns[rollout_index, env_index] += discounts[env_index] * reward
                     discounts[env_index] *= gamma
                     if (
