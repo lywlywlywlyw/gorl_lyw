@@ -2,13 +2,14 @@
 
 处理规则：
 
-1. 若轨迹中存在原始 ``dones=True``，保留到第一个 True（包含该步），
-   删除后续数据；该轨迹的 ``success`` 仅最后一步为 True，并将该步
-   ``reward`` 额外加 99。
-2. 若原始 ``dones`` 全为 False，保留完整轨迹并把最后一步 ``dones``
-   改为 True；该轨迹的 ``success`` 全为 False。
-3. 从处理后的 HDF5 中选择最后一步 ``success=True`` 的轨迹，展平为
-   transition 字典并保存为 pickle，可直接用作项目中的 RLPD demo buffer。
+1. 保留每条轨迹的完整原始时间序列，不在成功时间步截断。
+2. 若轨迹中存在原始 ``dones=True``，把第一个 True 视为成功时间步，
+   从该时间步开始直到轨迹结束，``success`` 均为 True。
+3. 若原始 ``dones`` 全为 False，轨迹的 ``success`` 全为 False。
+4. 为了让完整轨迹仍是一个合法 episode，处理后的 ``dones`` 只在轨迹
+   最后一个时间步为 True。原始 ``rewards`` 完全保留，不添加任何 bonus。
+5. 从处理后的 HDF5 中选择末步 ``success=True`` 的轨迹，同时导出为
+   仅包含成功轨迹的 HDF5 和展平的 pickle（可直接用作 RLPD demo buffer）。
 """
 
 from __future__ import annotations
@@ -29,11 +30,15 @@ INPUT_PATH = Path(
 )
 PROCESSED_PATH = Path(
     "/root/GoRL/datasets/robomimic/"
-    "mg_can_low_dim_dense_done_processed_v141.hdf5"
+    "mg_can_low_dim_dense_done_processed_v141_nocut.hdf5"
 )
 SUCCESS_OUTPUT_PATH = Path(
     "/root/GoRL/datasets/robomimic/"
-    "mg_can_low_dim_dense_done_processed_success_v141.pkl"
+    "mg_can_low_dim_dense_done_processed_success_v141_nocut.pkl"
+)
+SUCCESS_HDF5_OUTPUT_PATH = Path(
+    "/root/GoRL/datasets/robomimic/"
+    "mg_can_low_dim_dense_done_processed_success_v141_nocut.hdf5"
 )
 
 TRANSITION_KEYS = (
@@ -67,7 +72,7 @@ def copy_demo_contents(
     original_length: int,
     kept_length: int,
 ) -> None:
-    """递归复制轨迹内容，并截断所有以时间维为首维的数据集。"""
+    """递归复制轨迹内容，并保留完整时间序列。"""
     copy_attributes(source_group.attrs, target_group.attrs)
 
     for name, source_item in source_group.items():
@@ -90,7 +95,7 @@ def copy_demo_contents(
 
 
 def process_done_labels(input_path: Path, output_path: Path) -> dict[str, int]:
-    """按首个原始 done 截断轨迹，并写入 done、success 和奖励加成。"""
+    """保留完整轨迹，并写入连续的 success 标签，不修改 rewards。"""
     input_path = input_path.expanduser().resolve()
     output_path = output_path.expanduser().resolve()
     if not input_path.is_file():
@@ -149,7 +154,8 @@ def process_done_labels(input_path: Path, output_path: Path) -> dict[str, int]:
 
                 done_indices = np.flatnonzero(original_dones.astype(bool))
                 is_success = bool(done_indices.size)
-                kept_length = int(done_indices[0] + 1) if is_success else original_length
+                success_start = int(done_indices[0]) if is_success else None
+                kept_length = original_length
 
                 target_demo = target_data.create_group(demo_name)
                 copy_demo_contents(
@@ -171,15 +177,7 @@ def process_done_labels(input_path: Path, output_path: Path) -> dict[str, int]:
 
                 success = np.zeros(kept_length, dtype=np.bool_)
                 if is_success:
-                    success[-1] = True
-                    processed_rewards = np.asarray(target_demo["rewards"])
-                    processed_rewards[-1] += 150
-                    del target_demo["rewards"]
-                    target_rewards = target_demo.create_dataset(
-                        "rewards",
-                        data=processed_rewards.astype(source_demo["rewards"].dtype),
-                    )
-                    copy_attributes(source_demo["rewards"].attrs, target_rewards.attrs)
+                    success[success_start:] = True
                     successful_count += 1
                 else:
                     failed_count += 1
@@ -201,6 +199,68 @@ def process_done_labels(input_path: Path, output_path: Path) -> dict[str, int]:
         "failed_trajectories": failed_count,
         "total_samples": total_samples,
     }
+
+
+def export_successful_demos_hdf5(input_path: Path, output_path: Path) -> tuple[int, int]:
+    """导出仅包含成功轨迹的 HDF5，并保留原始轨迹结构和 attributes。"""
+    input_path = input_path.expanduser().resolve()
+    output_path = output_path.expanduser().resolve()
+    if not input_path.is_file():
+        raise FileNotFoundError(f"处理后的输入数据集不存在: {input_path}")
+    if output_path.suffix.lower() not in {".h5", ".hdf5"}:
+        raise ValueError(f"输出路径必须使用 .h5 或 .hdf5 后缀: {output_path}")
+    if input_path == output_path:
+        raise ValueError("输入 HDF5 和成功轨迹输出 HDF5 路径不能相同")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output_path.name}.", suffix=".tmp", dir=output_path.parent
+    )
+    os.close(file_descriptor)
+    temporary_path = Path(temporary_name)
+    successful_count = 0
+    total_samples = 0
+
+    try:
+        with h5py.File(input_path, "r") as source, h5py.File(
+            temporary_path, "w"
+        ) as target:
+            if "data" not in source or not isinstance(source["data"], h5py.Group):
+                raise KeyError("输入 HDF5 文件中缺少根组 'data'")
+
+            copy_attributes(source.attrs, target.attrs)
+            for root_name, root_item in source.items():
+                if root_name != "data":
+                    source.copy(root_item, target, name=root_name)
+
+            source_data = source["data"]
+            target_data = target.create_group("data")
+            copy_attributes(source_data.attrs, target_data.attrs)
+            demo_names = sorted(source_data.keys(), key=demo_sort_key)
+            for demo_name in demo_names:
+                source_demo = source_data[demo_name]
+                if not isinstance(source_demo, h5py.Group):
+                    continue
+                if "success" not in source_demo:
+                    raise KeyError(f"轨迹 {source_demo.name} 中缺少 'success'")
+                success = np.asarray(source_demo["success"], dtype=np.bool_).reshape(-1)
+                if success.size == 0 or not bool(success[-1]):
+                    continue
+                source.copy(source_demo, target_data, name=demo_name)
+                successful_count += 1
+                total_samples += int(source_demo.attrs.get("num_samples", len(source_demo["actions"])))
+
+            target_data.attrs["total"] = total_samples
+            target.flush()
+
+        os.replace(temporary_path, output_path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+    if successful_count == 0:
+        raise ValueError(f"数据集中没有末步 success=True 的轨迹: {input_path}")
+    return successful_count, total_samples
 
 
 def flatten_observations(obs_group: h5py.Group, obs_keys: list[str]) -> np.ndarray:
@@ -326,24 +386,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, default=INPUT_PATH)
     parser.add_argument("--processed-output", type=Path, default=PROCESSED_PATH)
     parser.add_argument("--success-output", type=Path, default=SUCCESS_OUTPUT_PATH)
+    parser.add_argument(
+        "--success-hdf5-output", type=Path, default=SUCCESS_HDF5_OUTPUT_PATH
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     stats = process_done_labels(args.input, args.processed_output)
+    successful_hdf5_count, success_hdf5_samples = export_successful_demos_hdf5(
+        args.processed_output, args.success_hdf5_output
+    )
     successful_count, success_samples, buffer = export_successful_demos(
         args.processed_output, args.success_output
     )
 
     print(f"原始输入文件: {args.input}")
     print(f"处理后 HDF5: {args.processed_output}")
+    print(f"成功轨迹 HDF5: {args.success_hdf5_output}")
     print(f"成功轨迹 PKL: {args.success_output}")
     print(f"轨迹总数: {stats['trajectories']}")
     print(f"成功轨迹数: {stats['successful_trajectories']}")
     print(f"未成功轨迹数: {stats['failed_trajectories']}")
     print(f"处理后 transition 总数: {stats['total_samples']}")
     print(f"导出的成功轨迹数: {successful_count}")
+    print(f"成功轨迹 HDF5 数量: {successful_hdf5_count}")
+    print(f"成功轨迹 HDF5 transition 总数: {success_hdf5_samples}")
     print(f"成功轨迹 transition 总数: {success_samples}")
     print(f"observation shape: {buffer['observations'].shape}")
     print(f"action shape: {buffer['actions'].shape}")

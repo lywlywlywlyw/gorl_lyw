@@ -36,7 +36,7 @@ from envs.robomimic.online_config.env_config import EnvConfig
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["CUDA_VISIBLE_DEVICES"] = str(3)
+os.environ["CUDA_VISIBLE_DEVICES"] = str(0)
 @dataclass
 class EvaluationConfig:
     """CLI configuration for Robomimic policy evaluation."""

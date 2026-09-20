@@ -149,6 +149,7 @@ def _decoder_worker(settings: dict) -> None:
             encoder_checkpoint_path=str(encoder),
             previous_decoder_checkpoint_path=str(previous_decoder),
             replay_snapshot_path=str(snapshot),
+            demo_buffer_path=settings["demo_buffer_path"],
             output_checkpoint_path=str(temporary_output),
             version=version,
             train_steps=settings["decoder_train_steps"],
@@ -161,7 +162,10 @@ def _decoder_worker(settings: dict) -> None:
             "fixed_encoder_version": encoder_version,
             "previous_decoder_version": version - 1,
             "replay_snapshot": str(snapshot),
+            "demo_buffer": settings["demo_buffer_path"],
             "replay_size": replay_size,
+            "demo_ratio": 0.0,
+            "replay_ratio": 1.0,
             "train_steps": settings["decoder_train_steps"],
             "inherited_optimizer_state": version > 1,
         })

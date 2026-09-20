@@ -32,6 +32,7 @@ def train_async_stage(
     encoder_checkpoint_path: str,
     previous_decoder_checkpoint_path: str,
     replay_snapshot_path: str,
+    demo_buffer_path: str,
     output_checkpoint_path: str,
     version: int,
     train_steps: int,
@@ -39,12 +40,12 @@ def train_async_stage(
     inherit_optimizer_state: bool = True,
     decoder_type: str = "flow_matching",
 ) -> None:
-    """Train one Decoder_n from an immutable replay snapshot.
+    """Train one Decoder_n using replay-buffer transitions only.
 
-    This is the existing FM objective (``DecoderFMState.train_step``) without
-    success/reward filtering. The encoder checkpoint is loaded for provenance
-    and compatibility validation. The current FM implementation constructs its
-    own noise latent, so no alternate latent target is introduced here.
+    The demo-buffer argument is retained for pipeline/API compatibility, but
+    decoder minibatches and observation normalization are built exclusively
+    from the immutable replay snapshot. The encoder checkpoint is loaded for
+    provenance and compatibility validation.
     """
     if train_steps <= 0:
         raise ValueError("train_steps must be positive.")
@@ -66,14 +67,14 @@ def train_async_stage(
         raise ValueError(f"Previous decoder checkpoint is missing fields: {missing}")
 
     replay = load_transition_data(replay_snapshot_path)
-    states = replay["observations"]
-    actions = replay["actions"]
-    if len(states) < 2:
-        raise ValueError("Decoder stage requires at least two replay transitions.")
-    if states.shape[-1] != int(previous["obs_dim"]):
-        raise ValueError("Replay observation dimension does not match decoder.")
-    if actions.shape[-1] != int(previous["action_dim"]):
-        raise ValueError("Replay action dimension does not match decoder.")
+    replay_states = replay["observations"]
+    replay_actions = replay["actions"]
+    if len(replay_states) < 1:
+        raise ValueError("Decoder stage requires at least one replay transition.")
+    if replay_states.shape[-1] != int(previous["obs_dim"]):
+        raise ValueError("replay observation dimension does not match decoder.")
+    if replay_actions.shape[-1] != int(previous["action_dim"]):
+        raise ValueError("replay action dimension does not match decoder.")
 
     decoder_config = previous["config"]
     if decoder_type == "meanflow":
@@ -97,25 +98,26 @@ def train_async_stage(
             fm_state.prng = previous["decoder_prng"]
         if "decoder_steps" in previous:
             fm_state.steps = previous["decoder_steps"]
-        fm_state.obs_stats = fm_state.obs_stats.update(jnp.asarray(states))
+        # Decoder training uses replay only, so its observation statistics do too.
+        fm_state.obs_stats = fm_state.obs_stats.update(jnp.asarray(replay_states))
 
     rng = np.random.default_rng(config["seed"] + version)
-    permutation = rng.permutation(len(states))
-    training_indices = permutation
     batch_size = int(decoder_config.batch_size)
+    if batch_size < 1:
+        raise ValueError("Decoder batch_size must be positive.")
     started = time.time()
     metrics: dict[str, Any] = {}
     for step in tqdm(range(train_steps), desc=f"Decoder {version}"):
-        indices = training_indices[
-            rng.integers(0, len(training_indices), size=batch_size)
-        ]
+        replay_indices = rng.integers(0, len(replay_states), size=batch_size)
+        batch_states = replay_states[replay_indices]
+        batch_actions = replay_actions[replay_indices]
         if decoder_type == "meanflow":
             fm_state, metrics = fm_state.train_step(
-                fm_state.steps, jnp.asarray(states[indices]), jnp.asarray(actions[indices])
+                fm_state.steps, jnp.asarray(batch_states), jnp.asarray(batch_actions)
             )
         else:
             fm_state, metrics = fm_state.train_step(
-                jnp.asarray(states[indices]), jnp.asarray(actions[indices])
+                jnp.asarray(batch_states), jnp.asarray(batch_actions)
             )
         if metrics_file and ((step + 1) % 100 == 0 or step + 1 == train_steps):
             append_metrics(metrics_file, {
