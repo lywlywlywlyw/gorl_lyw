@@ -11,6 +11,8 @@ class TrainingConfig:
     # training overview config
     num_stages: Annotated[int, tyro.conf.arg(help="Number of training stages")] = 48
     seed: int = 1
+    environment: str = "robomimic"
+    dataset_path: str | None = None
     data_collection_iterations: int = 2#20
     z_regularization: float | None = None
     max_grad_norm: float = 0.5

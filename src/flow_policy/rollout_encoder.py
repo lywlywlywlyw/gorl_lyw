@@ -39,7 +39,7 @@ def _environment_worker(
             try:
                 if command == "reset":
                     state = env.reset(payload)
-                    result = (np.asarray(state.obs), 0.0, False, False, None)
+                    result = (np.asarray(state.obs), 0.0, False, False, None, dict(state.info))
                 elif command == "step":
                     if state is None:
                         raise RuntimeError("Environment must be reset before step().")
@@ -51,6 +51,7 @@ def _environment_worker(
                         bool(np.asarray(state.done)),
                         bool(state.info.get("success", False)),
                         env_state,
+                        dict(state.info),
                     )
                 elif command == "reset_to_dataset":
                     state = env.reset_to_dataset_state(**payload)
@@ -60,6 +61,7 @@ def _environment_worker(
                         False,
                         bool(state.info.get("success", False)),
                         None,
+                        dict(state.info),
                     )
                 elif command == "close":
                     break
@@ -297,13 +299,15 @@ class BatchedRolloutStateEncoderFM:
         return payload
 
     @staticmethod
-    def _state(response: tuple[np.ndarray, float, bool, bool]) -> State:
-        obs, reward, done, success, _ = response
+    def _state(response: tuple) -> State:
+        obs, reward, done, success, _ = response[:5]
+        info = dict(response[5]) if len(response) > 5 and isinstance(response[5], dict) else {}
+        info["success"] = success
         return State(
             obs=jnp.asarray(obs),
             reward=jnp.asarray(reward),
             done=jnp.asarray(done),
-            info={"success": success},
+            info=info,
         )
 
     def rollout(self, agent_state: EncoderAgentProtocol, episode_length: int,
@@ -343,8 +347,14 @@ class BatchedRolloutStateEncoderFM:
                     next_state = self._state(response)
                     next_step = self.steps[env_index] + 1
                     success = bool(next_state.info.get("success", False))
+                    d4rl_terminal = next_state.info.get("d4rl_terminal")
+                    d4rl_timeout = bool(next_state.info.get("d4rl_timeout", False))
                     reached_episode_limit = next_step >= episode_length
                     done = ((self.terminate_on_success and success) or reached_episode_limit)
+                    # D4RL must reset at both terminal and timeout boundaries,
+                    # while its bootstrap discount is based on terminal only.
+                    if d4rl_terminal is not None and (bool(d4rl_terminal) or d4rl_timeout):
+                        done = True
                     reward = float(np.asarray(next_state.reward))
                     if success and self.dense_reward:
                         reward += self.success_reward_bonus
@@ -352,13 +362,19 @@ class BatchedRolloutStateEncoderFM:
                         reward=jnp.asarray(reward, dtype=jnp.float32),
                         done=jnp.asarray(done),
                     )
-                # The requested online semantics treat both success and the
-                # configured episode-length limit as true terminal transitions,
-                # rather than bootstrappable time-limit truncations.
-                truncated = False
+                # Episode boundaries reset the rollout state. For D4RL,
+                # timeout boundaries are recorded as truncations but remain
+                # bootstrappable through the discount computed below.
+                truncated = bool(next_state.info.get("d4rl_timeout", False))
                 transition_next_states.append(next_state)
                 rewards.append(next_state.reward); truncations.append(truncated)
-                discounts.append(0.0 if done else 1.0)
+                if "d4rl_terminal" in next_state.info:
+                    # Timeouts remain bootstrappable; only true terminals stop
+                    # the RLPD Bellman backup.
+                    bootstrap_terminal = bool(next_state.info["d4rl_terminal"])
+                else:
+                    bootstrap_terminal = done
+                discounts.append(0.0 if bootstrap_terminal else 1.0)
                 if auto_reset and (done or truncated):
                     prng, reset_prng = jax.random.split(prng)
                     reset_indices.append(env_index); reset_keys.append(reset_prng)

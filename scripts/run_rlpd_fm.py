@@ -26,7 +26,6 @@ if str(SRC_ROOT) not in sys.path:
 
 import tyro
 from envs.robomimic.online_config.training_config import TrainingConfig
-from envs.robomimic.online_config.env_config import EnvConfig
 from scripts.components.online_pipeline_ipc import (
     ChunkReplayBuffer,
     VersionManager,
@@ -105,6 +104,8 @@ def _encoder_worker(settings: dict) -> None:
             learn_temperature=settings["learn_temperature"],
             initial_temperature=settings["initial_temperature"],
             target_entropy=settings["target_entropy"],
+            environment=settings["environment"],
+            dataset_path=settings.get("dataset_path"),
         )
         manager.publish_component("encoder", version, temporary_output, {
             "version": version,
@@ -186,6 +187,8 @@ def _collector_worker(settings: dict) -> None:
         replay_capacity=settings["replay_capacity"],
         metrics_file=settings["metrics_file"],
         decoder_type=settings["decoder_type"],
+        environment=settings["environment"],
+        dataset_path=settings.get("dataset_path"),
     )
 
 
@@ -202,6 +205,8 @@ def _evaluator_worker(settings: dict) -> None:
         evaluation_dir=settings["evaluation_dir"],
         replay_buffer_dir=settings["replay_dir"],
         q_gap_states_path=settings["q_gap_states_path"],
+        environment=settings["environment"],
+        dataset_path=settings.get("dataset_path"),
     )
 
 
@@ -257,9 +262,23 @@ def run_async_pipeline(
     learn_temperature: bool = True,
     initial_temperature: float = 0.02,
     target_entropy: float | None = None,
+    environment: str = "robomimic",
+    dataset_path: str | None = None,
 ) -> None:
     """Run collection, evaluation, and both trainers as independent processes."""
+    if environment == "robomimic":
+        from envs.robomimic.online_config.env_config import EnvConfig
+    elif environment == "d4rl":
+        from envs.d4rl.online_config.env_config import EnvConfig
+    else:
+        raise ValueError("environment must be 'robomimic' or 'd4rl'.")
     config = TrainingConfig().to_dict() | EnvConfig().to_dict()
+    config["environment"] = environment
+    if dataset_path is not None:
+        config["dataset_path"] = dataset_path
+    if environment == "d4rl":
+        from envs.d4rl.D4RLEnv import infer_env_name
+        config["env_name"] = infer_env_name(config["dataset_path"])
     decoder_type = config["decoder_type"]
     if decoder_type not in ("flow_matching", "meanflow"):
         raise ValueError("decoder_type must be 'flow_matching' or 'meanflow'.")
@@ -294,8 +313,12 @@ def run_async_pipeline(
     os.environ["MUJOCO_GL"] = "egl"
     os.environ["PYOPENGL_PLATFORM"] = "egl"
     os.environ["MUJOCO_EGL_DEVICE_ID"] = str(parent_gpu_id)
-    from envs.robomimic.RobomimicEnv import RobomimicEnv
-    env = RobomimicEnv(dataset_path=config["dataset_path"], reward_shaping=config["dense_reward"])
+    if environment == "d4rl":
+        from envs.d4rl.D4RLEnv import D4RLEnv
+        env = D4RLEnv(dataset_path=config["dataset_path"], reward_shaping=config["dense_reward"])
+    else:
+        from envs.robomimic.RobomimicEnv import RobomimicEnv
+        env = RobomimicEnv(dataset_path=config["dataset_path"], reward_shaping=config["dense_reward"])
     obs_dim = int(env.observation_size)
     action_dim = int(env.action_size)
     checkpoint = _validate_offline_checkpoint(
@@ -322,14 +345,15 @@ def run_async_pipeline(
         directory.mkdir(parents=True, exist_ok=True)
     evaluation_dir = root / "evaluations"
     evaluation_dir.mkdir(parents=True, exist_ok=True)
-    from scripts.components.q_gap_dataset import build_fixed_q_gap_states
-
-    q_gap_states_path = build_fixed_q_gap_states(
-        config["dataset_path"],
-        root / "q_gap_fixed_states.pkl",
-        config["q_gap_num_states"],
-        config["seed"],
-    )
+    if environment == "robomimic":
+        from scripts.components.q_gap_dataset import build_fixed_q_gap_states
+        q_gap_states_path = build_fixed_q_gap_states(
+            config["dataset_path"], root / "q_gap_fixed_states.pkl",
+            config["q_gap_num_states"], config["seed"],
+        )
+    else:
+        # D4RL does not expose robomimic's per-demo simulator-state bank.
+        q_gap_states_path = None
     stop = root / "STOP"
     stop.unlink(missing_ok=True)
     manager = VersionManager(versions)
@@ -340,7 +364,7 @@ def run_async_pipeline(
         "stop_file": str(stop), "demo_buffer_path": str(canonical_demo),
         "metrics_file": str(root / "async_metrics.jsonl"),
         "evaluation_dir": str(evaluation_dir),
-        "q_gap_states_path": str(q_gap_states_path),
+        "q_gap_states_path": str(q_gap_states_path) if q_gap_states_path is not None else None,
         "seed": config["seed"],
         # Version workers run until STOP; there is intentionally no maximum.
         "start_version": 1,
@@ -361,6 +385,8 @@ def run_async_pipeline(
         "learn_temperature": learn_temperature,
         "initial_temperature": initial_temperature,
         "target_entropy": target_entropy,
+        "environment": environment,
+        "dataset_path": config["dataset_path"],
     }
     atomic_pickle_dump(settings, root / "pipeline_settings.pkl")
     print(
@@ -618,6 +644,8 @@ def main(
     learn_temperature: bool = True,
     initial_temperature: float = 0.02,
     target_entropy: float | None = None,
+    environment: str = "robomimic",
+    dataset_path: str | None = None,
 ) -> None:
     """Run the asynchronous RLPD encoder + FM decoder training pipeline."""
     run_async_pipeline(
@@ -641,6 +669,8 @@ def main(
         learn_temperature=learn_temperature,
         initial_temperature=initial_temperature,
         target_entropy=target_entropy,
+        environment=environment,
+        dataset_path=dataset_path,
     )
 
 

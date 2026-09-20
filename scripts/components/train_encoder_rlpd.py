@@ -19,8 +19,6 @@ import numpy as np
 import tyro
 from tqdm import tqdm
 
-from envs.robomimic.RobomimicEnv import RobomimicEnv
-from envs.robomimic.online_config.env_config import EnvConfig
 from envs.robomimic.online_config.training_config import TrainingConfig
 from flow_policy import encoder_rlpd
 from flow_policy.agent import EncoderFMAgent
@@ -37,6 +35,23 @@ try:
 except ImportError:  # Direct execution: python scripts/components/train_encoder_rlpd.py
     from metrics_ipc import append_metrics
     from online_pipeline_ipc import atomic_pickle_dump, load_transition_data
+
+
+def _runtime_env_config(environment: str):
+    if environment == "d4rl":
+        from envs.d4rl.online_config.env_config import EnvConfig
+    elif environment == "robomimic":
+        from envs.robomimic.online_config.env_config import EnvConfig
+    else:
+        raise ValueError("environment must be 'robomimic' or 'd4rl'.")
+    return EnvConfig
+
+def _make_runtime_env(config: dict):
+    if config.get("environment", "robomimic") == "d4rl":
+        from envs.d4rl.D4RLEnv import D4RLEnv
+        return D4RLEnv(dataset_path=config.get("dataset_path"), reward_shaping=config["dense_reward"])
+    from envs.robomimic.RobomimicEnv import RobomimicEnv
+    return RobomimicEnv(dataset_path=config["dataset_path"], reward_shaping=config["dense_reward"])
 
 
 @dataclass
@@ -338,6 +353,8 @@ def train_async_stage(
     learn_temperature: bool | None = None,
     initial_temperature: float | None = None,
     target_entropy: float | None = None,
+    environment: str = "robomimic",
+    dataset_path: str | None = None,
 ) -> None:
     """Train one immutable Encoder_n stage without collecting environment data.
 
@@ -350,7 +367,14 @@ def train_async_stage(
     if not np.isclose(demo_ratio + replay_ratio, 1.0):
         raise ValueError("encoder demo/replay ratios must sum to 1.0.")
 
+    EnvConfig = _runtime_env_config(environment)
     config = TrainingConfig().to_dict() | EnvConfig().to_dict()
+    config["environment"] = environment
+    if dataset_path is not None:
+        config["dataset_path"] = dataset_path
+    if environment == "d4rl":
+        from envs.d4rl.D4RLEnv import infer_env_name
+        config["env_name"] = infer_env_name(config["dataset_path"])
     config["decoder_type"] = decoder_type
     if temperature_learning_rate is not None:
         config["rlpd_temperature_learning_rate"] = temperature_learning_rate
@@ -360,9 +384,7 @@ def train_async_stage(
         config["rlpd_initial_temperature"] = initial_temperature
     if target_entropy is not None:
         config["rlpd_target_entropy"] = target_entropy
-    env = RobomimicEnv(
-        dataset_path=config["dataset_path"], reward_shaping=config["dense_reward"]
-    )
+    env = _make_runtime_env(config)
     z_dim = int(env.action_size)
     encoder_config = encoder_rlpd.EncoderConfig(
         learning_rate=config["rlpd_actor_learning_rate"],

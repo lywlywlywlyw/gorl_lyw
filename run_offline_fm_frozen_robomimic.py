@@ -58,8 +58,6 @@ from jax import Array
 from jax import numpy as jnp
 from tqdm import trange
 
-from envs.robomimic.RobomimicEnv import RobomimicEnv
-from envs.robomimic.offline_config.env_config import EnvConfig
 from envs.robomimic.offline_config.training_config import TrainingConfig
 from envs.robomimic.online_config.encoder_configs.rlpd_config import RLPDConfig
 from flow_policy import encoder_rlpd, math_utils, networks
@@ -84,11 +82,24 @@ class ConfigView(dict[str, Any]):
 
 
 def build_config(training_config: TrainingConfig | None = None) -> ConfigView:
-    """Compose the robomimic frozen-IQL configuration from offline configs."""
+    """Compose a robomimic or D4RL frozen-IQL configuration."""
     training_config = training_config or TrainingConfig()
+    backend = getattr(training_config, "environment", "robomimic")
+    if backend == "robomimic":
+        from envs.robomimic.offline_config.env_config import EnvConfig
+    elif backend == "d4rl":
+        from envs.d4rl.offline_config.env_config import EnvConfig
+    else:
+        raise ValueError("environment must be 'robomimic' or 'd4rl'.")
     config = ConfigView(
         training_config.to_dict() | EnvConfig().to_dict() | RLPDConfig().to_dict()
     )
+    config["environment"] = backend
+    if getattr(training_config, "dataset_path", None):
+        config["dataset_path"] = training_config.dataset_path
+    if backend == "d4rl":
+        from envs.d4rl.D4RLEnv import infer_env_name
+        config["env_name"] = infer_env_name(config["dataset_path"])
     # Internal aliases keep the implementation names aligned with the generic
     # reference script while all values remain owned by offline_config.
     if config["decoder_type"] == "flow_matching":
@@ -165,8 +176,26 @@ def flatten_robomimic_observations(
 
 
 def load_replay_buffer(
-    config: ConfigView, environment: RobomimicEnv
+    config: ConfigView, environment: Any
 ) -> ReplayBuffer:
+    """Load transitions from the selected robomimic or D4RL dataset."""
+    if config.get("environment", "robomimic") == "d4rl":
+        dataset = environment.get_dataset()
+        observations = np.asarray(dataset["observations"], dtype=np.float32)
+        actions = np.asarray(dataset["actions"], dtype=np.float32)
+        rewards = np.asarray(dataset.get("rewards", np.zeros(len(actions))), dtype=np.float32).reshape(-1)
+        next_observations = np.asarray(dataset["next_observations"], dtype=np.float32)
+        if "dones" not in dataset:
+            raise KeyError("D4RL training data must contain dones; run the preprocessing script first.")
+        done = np.asarray(dataset["dones"], dtype=np.float32).reshape(-1)
+        if not (len(observations) == len(actions) == len(rewards) == len(next_observations) == len(done)):
+            raise ValueError("D4RL dataset transition arrays have inconsistent lengths.")
+        buffer = ReplayBuffer(observations, actions, rewards, next_observations, 1.0 - done)
+        if config.max_samples is not None and len(buffer) > config.max_samples:
+            rng = np.random.default_rng(config.seed)
+            indices = rng.choice(len(buffer), config.max_samples, replace=False)
+            buffer = ReplayBuffer(*(array[indices] for array in (buffer.observations, buffer.actions, buffer.rewards, buffer.next_observations, buffer.masks)))
+        return buffer
     """Load transitions from the robomimic HDF5 dataset used by the env."""
     try:
         import h5py
@@ -281,12 +310,12 @@ def validate_config(config: ConfigView) -> None:
         raise ValueError("wandb_mode must be online, offline, or disabled.")
 
 
-def make_dataset_environment(
-    config: ConfigView,
-) -> tuple[RobomimicEnv, str]:
-    """Create robomimic exactly as in ``scripts/run_gorl_fm.py``."""
-    environment = RobomimicEnv(dataset_path=config.dataset_path, reward_shaping=config.dense_reward)
-    return environment, config.env_name
+def make_dataset_environment(config: ConfigView) -> tuple[Any, str]:
+    if config.get("environment", "robomimic") == "d4rl":
+        from envs.d4rl.D4RLEnv import D4RLEnv
+        return D4RLEnv(dataset_path=config.dataset_path, reward_shaping=config.dense_reward), config.env_name
+    from envs.robomimic.RobomimicEnv import RobomimicEnv
+    return RobomimicEnv(dataset_path=config.dataset_path, reward_shaping=config.dense_reward), config.env_name
 
 
 def make_rlpd_encoder_config(
@@ -1093,13 +1122,13 @@ def main(config: ConfigView) -> None:
         if env.observation_size != obs_dim:
             raise ValueError(
                 f"Dataset observation dim {obs_dim} does not match "
-                f"{environment_id} robomimic observation size "
+                f"{environment_id} selected environment observation size "
                 f"{env.observation_size}."
             )
         if env.action_size != action_dim:
             raise ValueError(
                 f"Dataset action dim {action_dim} does not match "
-                f"{environment_id} robomimic action size {env.action_size}."
+                f"{environment_id} selected environment action size {env.action_size}."
             )
         episode_length = int(config.episode_length)
         rlpd_config = make_rlpd_encoder_config(

@@ -30,9 +30,7 @@ from flow_policy.rollout_encoder import (
     eval_policy_encoder_fm
 )
 from envs.base_env import State
-from envs.robomimic.RobomimicEnv import RobomimicEnv
 from envs.robomimic.online_config.training_config import TrainingConfig
-from envs.robomimic.online_config.env_config import EnvConfig
 try:
     from .metrics_ipc import append_metrics
     from .online_pipeline_ipc import ChunkReplayBuffer, VersionManager
@@ -41,10 +39,30 @@ except ImportError:  # Direct execution: python scripts/components/collect_data_
     from online_pipeline_ipc import ChunkReplayBuffer, VersionManager
 
 
+def _runtime_env_config(environment: str):
+    if environment == "d4rl":
+        from envs.d4rl.online_config.env_config import EnvConfig
+    elif environment == "robomimic":
+        from envs.robomimic.online_config.env_config import EnvConfig
+    else:
+        raise ValueError("environment must be 'robomimic' or 'd4rl'.")
+    return EnvConfig
+
+
+def _make_runtime_env(config: dict, render_offscreen: bool = False):
+    if config.get("environment", "robomimic") == "d4rl":
+        from envs.d4rl.D4RLEnv import D4RLEnv
+        return D4RLEnv(dataset_path=config.get("dataset_path"), env_name=config["env_name"],
+                       render_offscreen=render_offscreen, reward_shaping=config["dense_reward"])
+    from envs.robomimic.RobomimicEnv import RobomimicEnv
+    return RobomimicEnv(dataset_path=config["dataset_path"], render_offscreen=render_offscreen,
+                        reward_shaping=config["dense_reward"])
+
+
 def _load_policy_pair(
     encoder_path: Path,
     decoder_path: Path,
-    env: RobomimicEnv,
+    env: Any,
     config: dict,
 ) -> tuple[EncoderFMAgent, bool]:
     """Load one explicit matching policy pair; never reads trainer memory."""
@@ -101,11 +119,7 @@ def _record_policy_evaluation_serial(
     num_episodes = int(config["eval_num_envs"])
     if num_episodes < 1:
         raise ValueError("eval_num_envs must be positive.")
-    video_env = RobomimicEnv(
-        dataset_path=config["dataset_path"],
-        render_offscreen=True,
-        reward_shaping=config["dense_reward"],
-    )
+    video_env = _make_runtime_env(config, render_offscreen=True)
     returns: list[float] = []
     lengths: list[int] = []
     successes: list[float] = []
@@ -179,6 +193,11 @@ def _record_policy_evaluation_serial(
         "eval/episode_length_mean": float(onp.mean(lengths)),
         "eval/success_rate": float(onp.mean(successes)),
     }
+    if config.get("environment") == "d4rl":
+        from envs.d4rl.D4RLEnv import normalized_d4rl_return
+        metrics["eval/normalized_return"] = normalized_d4rl_return(
+            metrics["eval/return_mean"], config["env_name"]
+        )
     if output_path is not None:
         metrics["_video_path"] = str(output_path.resolve())
     return metrics
@@ -224,6 +243,11 @@ def _record_policy_evaluation(
         "eval/success_rate": float(onp.mean(successes)),
         "eval/num_envs": num_envs,
     }
+    if config.get("environment") == "d4rl":
+        from envs.d4rl.D4RLEnv import normalized_d4rl_return
+        metrics["eval/normalized_return"] = normalized_d4rl_return(
+            metrics["eval/return_mean"], config["env_name"]
+        )
     if output_path is not None:
         video_config = dict(config)
         video_config["eval_num_envs"] = 1
@@ -528,20 +552,27 @@ def run_async_collector(
     replay_capacity: int | None = None,
     metrics_file: str | None = None,
     decoder_type: str = "flow_matching",
+    environment: str = "robomimic",
+    dataset_path: str | None = None,
 ) -> None:
     """Continuously collect transitions with the latest complete Policy_n.
 
     Policy evaluation is handled by run_async_evaluator, so slow evaluation
     cannot block collection or skip intermediate policy versions.
     """
+    EnvConfig = _runtime_env_config(environment)
     config = TrainingConfig().to_dict() | EnvConfig().to_dict()
+    config["environment"] = environment
+    if dataset_path is not None:
+        config["dataset_path"] = dataset_path
+    if environment == "d4rl":
+        from envs.d4rl.D4RLEnv import infer_env_name
+        config["env_name"] = infer_env_name(config["dataset_path"])
     config["decoder_type"] = decoder_type
     manager = VersionManager(pipeline_root)
     replay = ChunkReplayBuffer(replay_buffer_dir, replay_capacity)
     stop = Path(stop_file)
-    env = RobomimicEnv(
-        dataset_path=config["dataset_path"], reward_shaping=config["dense_reward"]
-    )
+    env = _make_runtime_env(config)
     rollout_state = BatchedRolloutStateEncoderFM.init(
         env, jax.random.key(config["seed"] + 1), config["num_envs"], terminate_on_success=config["terminate_on_success"]
     )
@@ -614,19 +645,26 @@ def run_async_evaluator(
     replay_buffer_dir: str | None = None,
     q_gap_states_path: str | None = None,
     decoder_type: str = "flow_matching",
+    environment: str = "robomimic",
+    dataset_path: str | None = None,
 ) -> None:
     """Evaluate every Policy_n exactly once and strictly in version order."""
+    EnvConfig = _runtime_env_config(environment)
     config = TrainingConfig().to_dict() | EnvConfig().to_dict()
+    config["environment"] = environment
+    if dataset_path is not None:
+        config["dataset_path"] = dataset_path
+    if environment == "d4rl":
+        from envs.d4rl.D4RLEnv import infer_env_name
+        config["env_name"] = infer_env_name(config["dataset_path"])
     config["decoder_type"] = decoder_type
     manager = VersionManager(pipeline_root)
     stop = Path(stop_file)
-    env = RobomimicEnv(
-        dataset_path=config["dataset_path"], reward_shaping=config["dense_reward"]
-    )
-    if q_gap_states_path is None:
-        raise ValueError("q_gap_states_path is required for fixed Q-gap evaluation.")
-    with Path(q_gap_states_path).expanduser().open("rb") as file:
-        q_gap_records = pickle.load(file)
+    env = _make_runtime_env(config)
+    q_gap_records = None
+    if q_gap_states_path is not None:
+        with Path(q_gap_states_path).expanduser().open("rb") as file:
+            q_gap_records = pickle.load(file)
     evaluation_pool = BatchedRolloutStateEncoderFM.init(
         env,
         jax.random.key(int(config["seed"]) + 5000),
@@ -658,9 +696,10 @@ def run_async_evaluator(
                 apply_tanh,
                 evaluation_pool,
             )
-            metrics.update(_record_fixed_q_gap_evaluation(
-                agent, config, version, q_gap_records, evaluation_pool
-            ))
+            if q_gap_records is not None:
+                metrics.update(_record_fixed_q_gap_evaluation(
+                    agent, config, version, q_gap_records, evaluation_pool
+                ))
             if metrics_file:
                 append_metrics(metrics_file, metrics)
             print(f"Evaluation completed for Policy_{version}.", flush=True)

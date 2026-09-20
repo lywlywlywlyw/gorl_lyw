@@ -13,6 +13,8 @@ class TrainingConfig:
     """Top-level frozen-FM offline training configuration."""
 
     seed: int = 0
+    environment: str = "robomimic"
+    dataset_path: str | None = None
     output_dir: str = (
         "results/offline_fm_frozen_robomimic_"
         + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
