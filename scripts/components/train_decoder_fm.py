@@ -40,6 +40,7 @@ def train_async_stage(
     inherit_optimizer_state: bool = True,
     decoder_type: str = "flow_matching",
     anchor_weight: float = 1.0,
+    inverse_anchor_weight: float = 1.0,
 ) -> None:
     """Train one Decoder_n using replay-buffer transitions only.
 
@@ -52,6 +53,8 @@ def train_async_stage(
         raise ValueError("train_steps must be positive.")
     if anchor_weight < 0:
         raise ValueError("anchor_weight must be non-negative.")
+    if inverse_anchor_weight < 0:
+        raise ValueError("inverse_anchor_weight must be non-negative.")
     config = TrainingConfig().to_dict() | EnvConfig().to_dict()
     if decoder_type not in ("flow_matching", "meanflow"):
         raise ValueError("decoder_type must be 'flow_matching' or 'meanflow'.")
@@ -131,17 +134,24 @@ def train_async_stage(
         anchor_actions = anchor_state.sample_action_from_z(
             batch_states_j, anchor_z, action_key, deterministic=True
         )
+        inverse_anchor_latents = anchor_state.inverse_fm_batch(
+            batch_states_j, batch_actions_j
+        )
         if decoder_type == "meanflow":
             fm_state, metrics = fm_state.train_step(
                 fm_state.steps, batch_states_j, batch_actions_j,
                 anchor_z=anchor_z, anchor_actions=anchor_actions,
                 anchor_prng=action_key, anchor_weight=anchor_weight,
+                inverse_anchor_latents=inverse_anchor_latents,
+                inverse_anchor_weight=inverse_anchor_weight,
             )
         else:
             fm_state, metrics = fm_state.train_step(
                 batch_states_j, batch_actions_j,
                 anchor_z=anchor_z, anchor_actions=anchor_actions,
                 anchor_prng=action_key, anchor_weight=anchor_weight,
+                inverse_anchor_latents=inverse_anchor_latents,
+                inverse_anchor_weight=inverse_anchor_weight,
             )
         if metrics_file and ((step + 1) % 100 == 0 or step + 1 == train_steps):
             append_metrics(metrics_file, {
@@ -166,6 +176,7 @@ def train_async_stage(
         "previous_decoder_checkpoint": str(Path(previous_decoder_checkpoint_path).resolve()),
         "train_steps": train_steps,
         "online_anchor_weight": anchor_weight,
+        "online_inverse_anchor_weight": inverse_anchor_weight,
         "inherited_optimizer_state": inherit_optimizer_state,
         "final_loss": float(np.asarray(metrics.get("loss", np.nan))),
         "wall_time_seconds": time.time() - started,

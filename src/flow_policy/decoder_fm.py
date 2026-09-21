@@ -119,6 +119,7 @@ class DecoderFMState:
         observations: Array,
         actions: Array,
         num_steps: int | None = None,
+        params: Any | None = None,
     ) -> Array:
         """Map environment actions back to this decoder's input latent ``z``.
 
@@ -154,7 +155,7 @@ class DecoderFMState:
             current, following = pair
             t = jnp.full((*x_t.shape[:-1], 1), current)
             velocity = self.flow_forward(
-                obs_norm, x_t, self.embed_timestep(t)
+                obs_norm, x_t, self.embed_timestep(t), params=params
             )
             return x_t + (following - current) * velocity, None
 
@@ -419,6 +420,8 @@ class DecoderFMState:
         anchor_actions: Array | None = None,
         anchor_prng: Array | None = None,
         anchor_weight: float = 0.0,
+        inverse_anchor_latents: Array | None = None,
+        inverse_anchor_weight: float = 0.0,
     ) -> tuple[DecoderFMState, dict[str, Array]]:
         """Training step - based on FPO's training logic."""
 
@@ -474,9 +477,24 @@ class DecoderFMState:
                 anchor_loss = jnp.zeros((), dtype=loss.dtype)
             loss = loss + anchor_weight * anchor_loss
 
+            if inverse_anchor_latents is not None:
+                inverse_latents = state_with_params.inverse_fm_batch(
+                    batch_obs, batch_actions, params=params
+                )
+                inverse_anchor_loss = jnp.mean(
+                    jnp.square(
+                        inverse_latents
+                        - jax.lax.stop_gradient(inverse_anchor_latents)
+                    )
+                )
+            else:
+                inverse_anchor_loss = jnp.zeros((), dtype=loss.dtype)
+            loss = loss + inverse_anchor_weight * inverse_anchor_loss
+
             metrics = {
                 "loss": loss,
                 "anchor_loss": anchor_loss,
+                "inverse_anchor_loss": inverse_anchor_loss,
                 "velocity_mean": 0.0,  # Placeholder
                 "velocity_std": 0.0,   # Placeholder
             }

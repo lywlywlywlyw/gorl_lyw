@@ -392,6 +392,7 @@ class Decoder1StepFMState:
         self,
         observations: Array,
         actions: Array,
+        params: Any | None = None,
     ) -> Array:
         """Invert actions with ``z <- action + u(obs, z, 1, 0)``.
 
@@ -407,7 +408,7 @@ class Decoder1StepFMState:
                 "MeanFlow inversion observations and actions must share a batch size."
             )
         return self._inverse_fm_batch_normalized(
-            self._normalize_obs(observations), actions
+            self._normalize_obs(observations), actions, params=params
         )
 
     def _inverse_fm_batch_normalized(
@@ -628,6 +629,8 @@ class Decoder1StepFMState:
         anchor_actions: Array | None = None,
         anchor_prng: Array | None = None,
         anchor_weight: float = 0.0,
+        inverse_anchor_latents: Array | None = None,
+        inverse_anchor_weight: float = 0.0,
     ) -> tuple["Decoder1StepFMState", dict[str, Array]]:
         batch_size = batch_obs.shape[0]
         obs_norm = self._normalize_obs(batch_obs)
@@ -655,9 +658,23 @@ class Decoder1StepFMState:
             else:
                 anchor_loss = jnp.zeros((), dtype=loss.dtype)
             loss = loss + anchor_weight * anchor_loss
+            if inverse_anchor_latents is not None:
+                inverse_latents = self._inverse_fm_batch_normalized(
+                    obs_norm, batch_actions, params=params
+                )
+                inverse_anchor_loss = jnp.mean(
+                    jnp.square(
+                        inverse_latents
+                        - jax.lax.stop_gradient(inverse_anchor_latents)
+                    )
+                )
+            else:
+                inverse_anchor_loss = jnp.zeros((), dtype=loss.dtype)
+            loss = loss + inverse_anchor_weight * inverse_anchor_loss
             return loss, {
                 "loss": loss,
                 "anchor_loss": anchor_loss,
+                "inverse_anchor_loss": inverse_anchor_loss,
                 "meanflow_loss": meanflow_loss,
                 "dis_loss": dis_loss,
                 "bifm_loss": bifm_loss,
