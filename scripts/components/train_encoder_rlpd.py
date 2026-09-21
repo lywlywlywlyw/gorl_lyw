@@ -353,6 +353,8 @@ def train_async_stage(
     learn_temperature: bool | None = None,
     initial_temperature: float | None = None,
     target_entropy: float | None = None,
+    iql_bellman_bridge_updates: int = 2000,
+    iql_operator_transition_updates: int = 2000,
     environment: str = "robomimic",
     dataset_path: str | None = None,
 ) -> None:
@@ -364,6 +366,8 @@ def train_async_stage(
     """
     if train_env_steps <= 0:
         raise ValueError("train_env_steps must be positive.")
+    if iql_bellman_bridge_updates < 0 or iql_operator_transition_updates < 0:
+        raise ValueError("IQL bridge and operator transition updates must be non-negative.")
     if not np.isclose(demo_ratio + replay_ratio, 1.0):
         raise ValueError("encoder demo/replay ratios must sum to 1.0.")
 
@@ -440,6 +444,16 @@ def train_async_stage(
                 "Online encoder continuation requires optimizer state; "
                 f"missing fields: {missing_optimizer}"
             )
+    is_initial_online_stage = version == 1
+    if is_initial_online_stage and (
+        iql_bellman_bridge_updates + iql_operator_transition_updates > 0
+    ):
+        missing_value = sorted({"value_params", "iql_z_obs_stats"}.difference(previous))
+        if missing_value:
+            raise ValueError(
+                "The initial online IQL Bellman bridge requires the offline "
+                f"value function fields: {missing_value}."
+            )
     with jdc.copy_and_mutate(encoder_state) as encoder_state:
         encoder_state.actor_params = previous["rlpd_z_actor_params"]
         encoder_state.critic_params = previous["rlpd_z_critic_params"]
@@ -490,6 +504,67 @@ def train_async_stage(
     latest_actor_metrics: dict[str, Any] = {}
     latest_actor_step: int | None = None
     started = time.time()
+
+    # The initial offline-to-online transition uses only critic updates.  The
+    # frozen IQL value is the exact phase-one Bellman bootstrap; phase two
+    # linearly replaces it with the normal RLPD target.  Actor and temperature
+    # are intentionally not called in either phase.
+    if is_initial_online_stage and (
+        iql_bellman_bridge_updates + iql_operator_transition_updates > 0
+    ):
+        offline_value_params = previous["value_params"]
+        offline_value_obs_stats = previous["iql_z_obs_stats"]
+        total_bridge_updates = (
+            iql_bellman_bridge_updates + iql_operator_transition_updates
+        )
+        for bridge_update in tqdm(
+            range(total_bridge_updates), desc="IQL-to-RLPD bridge"
+        ):
+            batch = _sample_async_mixed_batch(
+                replay,
+                demo,
+                demo_ratio,
+                config["rlpd_batch_size"],
+                rng,
+                inverse_decoder_batch,
+            )
+            if bridge_update == 0:
+                encoder_state = encoder_state.update_observation_stats(
+                    jnp.concatenate([batch.observations, batch.next_observations], axis=0)
+                )
+            if bridge_update < iql_bellman_bridge_updates:
+                bellman_mix = 0.0
+                phase = 1
+            else:
+                transition_step = (
+                    bridge_update - iql_bellman_bridge_updates + 1
+                )
+                bellman_mix = transition_step / max(
+                    1, iql_operator_transition_updates
+                )
+                bellman_mix = min(1.0, bellman_mix)
+                phase = 2
+            encoder_state, bridge_metrics = encoder_state.update_critic_with_offline_value(
+                batch,
+                offline_value_params,
+                offline_value_obs_stats,
+                jnp.asarray(bellman_mix, dtype=jnp.float32),
+            )
+            if metrics_file and (
+                (bridge_update + 1) % 100 == 0
+                or bridge_update + 1 == total_bridge_updates
+            ):
+                append_metrics(metrics_file, {
+                    "pipeline/version": version,
+                    "pipeline/encoder_step": online_encoder_updates + bridge_update + 1,
+                    "train/bridge_phase": phase,
+                    **{
+                        f"train/{key}": float(np.asarray(value))
+                        for key, value in bridge_metrics.items()
+                    },
+                })
+        online_encoder_updates += total_bridge_updates
+
     for update in tqdm(range(updates), desc=f"Encoder {version}"):
         batch = _sample_async_mixed_batch(
             replay,

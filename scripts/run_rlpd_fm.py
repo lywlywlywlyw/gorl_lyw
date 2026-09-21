@@ -104,6 +104,8 @@ def _encoder_worker(settings: dict) -> None:
             learn_temperature=settings["learn_temperature"],
             initial_temperature=settings["initial_temperature"],
             target_entropy=settings["target_entropy"],
+            iql_bellman_bridge_updates=settings["iql_bellman_bridge_updates"],
+            iql_operator_transition_updates=settings["iql_operator_transition_updates"],
             environment=settings["environment"],
             dataset_path=settings.get("dataset_path"),
         )
@@ -262,6 +264,8 @@ def run_async_pipeline(
     learn_temperature: bool = True,
     initial_temperature: float = 0.02,
     target_entropy: float | None = None,
+    iql_bellman_bridge_updates: int = 2000,
+    iql_operator_transition_updates: int = 2000,
     environment: str = "robomimic",
     dataset_path: str | None = None,
 ) -> None:
@@ -385,6 +389,8 @@ def run_async_pipeline(
         "learn_temperature": learn_temperature,
         "initial_temperature": initial_temperature,
         "target_entropy": target_entropy,
+        "iql_bellman_bridge_updates": iql_bellman_bridge_updates,
+        "iql_operator_transition_updates": iql_operator_transition_updates,
         "environment": environment,
         "dataset_path": config["dataset_path"],
     }
@@ -644,6 +650,8 @@ def main(
     learn_temperature: bool = True,
     initial_temperature: float = 0.02,
     target_entropy: float | None = None,
+    iql_bellman_bridge_updates: int = 2000,
+    iql_operator_transition_updates: int = 2000,
     environment: str = "robomimic",
     dataset_path: str | None = None,
 ) -> None:
@@ -669,6 +677,8 @@ def main(
         learn_temperature=learn_temperature,
         initial_temperature=initial_temperature,
         target_entropy=target_entropy,
+        iql_bellman_bridge_updates=iql_bellman_bridge_updates,
+        iql_operator_transition_updates=iql_operator_transition_updates,
         environment=environment,
         dataset_path=dataset_path,
     )

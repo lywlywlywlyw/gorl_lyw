@@ -298,6 +298,108 @@ class EncoderState:
         }
 
     @jax.jit
+    def update_critic_with_offline_value(
+        self,
+        batch: RLPDTransitionBatch,
+        offline_value_params: networks.MlpWeights,
+        offline_value_obs_stats: math_utils.RunningStats,
+        bellman_mix: Array,
+    ) -> tuple["EncoderState", dict[str, Array]]:
+        """Update the critic while interpolating from IQL-V to the RLPD target.
+
+        ``bellman_mix=0`` gives the offline IQL backup
+        ``r + gamma * V_offline(s')``.  ``bellman_mix=1`` gives the normal
+        online RLPD backup using the target critic and actor-sampled latent.
+        The actor and temperature are untouched by this method.
+        """
+        rng, action_key, subset_key = jax.random.split(self.prng, 3)
+        next_actions, next_log_probs = self._sample_with_params(
+            self.actor_params, batch.next_observations, action_key
+        )
+        target_next_qs = self._critic_values(
+            self.target_critic_params, batch.next_observations, next_actions
+        )
+        if self.config.critic_subsample_size is not None:
+            subset_size = min(
+                self.config.critic_subsample_size, self.config.critic_ensemble_size
+            )
+            subset = jax.random.choice(
+                subset_key,
+                self.config.critic_ensemble_size,
+                shape=(subset_size,),
+                replace=False,
+            )
+            target_next_qs = target_next_qs[subset]
+        online_next_value = jnp.min(target_next_qs, axis=0)
+
+        offline_obs = (
+            batch.next_observations - offline_value_obs_stats.mean
+        ) / (offline_value_obs_stats.std + 1e-8)
+        offline_next_value = networks.value_mlp_fwd(
+            offline_value_params, offline_obs
+        )
+        mixed_next_value = (
+            (1.0 - bellman_mix) * offline_next_value
+            + bellman_mix * online_next_value
+        )
+        target_q = (
+            self.config.reward_scaling * batch.rewards
+            + self.config.reward_bias
+            + self.config.discounting * batch.masks * mixed_next_value
+        )
+        if self.config.backup_entropy:
+            target_q = target_q - jax.lax.stop_gradient(
+                bellman_mix * self.temperature
+            ) * next_log_probs
+        target = jax.lax.stop_gradient(target_q)
+
+        def loss_fn(params: Any) -> tuple[Array, tuple[Array, Array]]:
+            predicted = self._critic_values(params, batch.observations, batch.actions)
+            loss = jnp.mean(jnp.square(predicted - target[None, :]))
+            return loss, (jnp.mean(predicted), jnp.mean(target))
+
+        (loss, (predicted_q, target_q_mean)), grads = jax.value_and_grad(
+            loss_fn, has_aux=True
+        )(self.critic_params)
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(self.config.max_grad_norm),
+            optax.adam(self.config.critic_learning_rate),
+        )
+        updates, opt_state = optimizer.update(
+            grads, self.critic_opt_state, self.critic_params
+        )
+        critic_params = optax.apply_updates(self.critic_params, updates)
+        state = jdc.replace(
+            self,
+            critic_params=critic_params,
+            target_critic_params=_tree_soft_update(
+                self.target_critic_params,
+                critic_params,
+                self.config.target_update_rate,
+            ),
+            critic_opt_state=opt_state,
+            prng=rng,
+            steps=self.steps + 1,
+        )
+        predicted_q_mean = jnp.mean(predicted_q)
+        td_rmse = jnp.sqrt(loss)
+        q_scale = jnp.mean(jnp.abs(predicted_q)) + 1e-6
+        return state, {
+            "critic_loss": loss,
+            "predicted_qs": predicted_q,
+            "target_qs": target_q_mean,
+            "td_rmse": td_rmse,
+            "q_scale": q_scale,
+            "relative_td_rmse": td_rmse / q_scale,
+            "q_gap_ratio": jnp.abs(target_q_mean - predicted_q_mean) / q_scale,
+            "critic_grad_norm": _global_norm(grads),
+            "rewards": jnp.mean(batch.rewards),
+            "bellman_mix": bellman_mix,
+            "offline_next_value": jnp.mean(offline_next_value),
+            "online_next_value": jnp.mean(online_next_value),
+        }
+
+    @jax.jit
     def update_actor_and_temperature(
         self, batch: RLPDTransitionBatch
     ) -> tuple["EncoderState", dict[str, Array]]:
