@@ -78,7 +78,7 @@ def _base_task_name(name: str) -> str:
     )
 
 
-def _make_env(env_name: str):
+def _make_env(env_name: str, render_mode: str | None = None):
     try:
         import gym
     except ImportError:
@@ -87,13 +87,15 @@ def _make_env(env_name: str):
     # D4RL registers ids such as halfcheetah-medium-v2.  If D4RL is not
     # installed, the native MuJoCo task remains usable for online rollouts.
     try:
-        return gym.make(env_name)
+        make_kwargs = {} if render_mode is None else {"render_mode": render_mode}
+        return gym.make(env_name, **make_kwargs)
     except Exception as original:
         fallback = _TASK_IDS[_base_task_name(env_name)]
         if fallback == env_name:
             raise
         try:
-            return gym.make(fallback)
+            make_kwargs = {} if render_mode is None else {"render_mode": render_mode}
+            return gym.make(fallback, **make_kwargs)
         except Exception:
             raise original
 
@@ -113,7 +115,14 @@ class D4RLEnv(BaseEnv):
         self.env_name = env_name or infer_env_name(self.dataset_path)
         self.render_offscreen = render_offscreen
         self.reward_shaping = bool(reward_shaping)
-        self.env = _make_env(self.env_name)
+        # Gymnasium selects the renderer when the environment is created.
+        # Video evaluation requests RGB frames, so configure that mode here;
+        # calling render(mode=...) later cannot change an already-created
+        # MuJoCo renderer.
+        self.env = _make_env(
+            self.env_name,
+            render_mode="rgb_array" if render_offscreen else None,
+        )
         self._closed = False
         self.obs_keys: list[str] = []
         self.shape_meta = {"ac_dim": int(np.prod(self.env.action_space.shape))}
@@ -240,10 +249,19 @@ class D4RLEnv(BaseEnv):
         return result
 
     def render(self, mode="human", height=None, width=None, camera_name=None):
+        # Gymnasium fixes the render mode at environment creation time.  The
+        # offscreen environment is created with rgb_array, so render directly
+        # and resize to the dimensions requested by the video writer.
         try:
-            return self.env.render()
+            frame = self.env.render()
         except TypeError:
-            return self.env.render(mode=mode)
+            frame = self.env.render(mode=mode)
+        if frame is not None and width is not None and height is not None:
+            frame = np.asarray(frame)
+            if frame.ndim >= 2 and (frame.shape[1] != int(width) or frame.shape[0] != int(height)):
+                import cv2
+                frame = cv2.resize(frame, (int(width), int(height)), interpolation=cv2.INTER_AREA)
+        return frame
 
     def close(self) -> None:
         if not self._closed:
