@@ -39,6 +39,7 @@ def train_async_stage(
     metrics_file: str | None = None,
     inherit_optimizer_state: bool = True,
     decoder_type: str = "flow_matching",
+    anchor_weight: float = 1.0,
 ) -> None:
     """Train one Decoder_n using replay-buffer transitions only.
 
@@ -49,6 +50,8 @@ def train_async_stage(
     """
     if train_steps <= 0:
         raise ValueError("train_steps must be positive.")
+    if anchor_weight < 0:
+        raise ValueError("anchor_weight must be non-negative.")
     config = TrainingConfig().to_dict() | EnvConfig().to_dict()
     if decoder_type not in ("flow_matching", "meanflow"):
         raise ValueError("decoder_type must be 'flow_matching' or 'meanflow'.")
@@ -89,6 +92,15 @@ def train_async_stage(
     if inherit_optimizer_state and "decoder_opt_state" not in previous:
         raise ValueError("Online decoder continuation requires optimizer state.")
     fm_state = state_cls.init(jax.random.PRNGKey(config["seed"] + 2000 + version), int(previous["obs_dim"]), int(previous["action_dim"]), decoder_config)
+    # Keep an immutable copy of Decoder_{n-1}.  Its action outputs are the
+    # stop-gradient targets for the online decoder anchor loss.
+    anchor_state = state_cls.init(
+        jax.random.PRNGKey(config["seed"] + 4000 + version),
+        int(previous["obs_dim"]), int(previous["action_dim"]), decoder_config,
+    )
+    with jdc.copy_and_mutate(anchor_state) as anchor_state:
+        anchor_state.params = previous["params"]
+        anchor_state.obs_stats = previous["obs_stats"]
     with jdc.copy_and_mutate(fm_state) as fm_state:
         fm_state.params = previous["params"]
         fm_state.obs_stats = previous["obs_stats"]
@@ -107,17 +119,29 @@ def train_async_stage(
         raise ValueError("Decoder batch_size must be positive.")
     started = time.time()
     metrics: dict[str, Any] = {}
+    anchor_prng = jax.random.PRNGKey(config["seed"] + 6000 + version)
     for step in tqdm(range(train_steps), desc=f"Decoder {version}"):
         replay_indices = rng.integers(0, len(replay_states), size=batch_size)
         batch_states = replay_states[replay_indices]
         batch_actions = replay_actions[replay_indices]
+        batch_states_j = jnp.asarray(batch_states)
+        batch_actions_j = jnp.asarray(batch_actions)
+        anchor_prng, z_key, action_key = jax.random.split(anchor_prng, 3)
+        anchor_z = jax.random.normal(z_key, batch_actions_j.shape)
+        anchor_actions = anchor_state.sample_action_from_z(
+            batch_states_j, anchor_z, action_key, deterministic=True
+        )
         if decoder_type == "meanflow":
             fm_state, metrics = fm_state.train_step(
-                fm_state.steps, jnp.asarray(batch_states), jnp.asarray(batch_actions)
+                fm_state.steps, batch_states_j, batch_actions_j,
+                anchor_z=anchor_z, anchor_actions=anchor_actions,
+                anchor_prng=action_key, anchor_weight=anchor_weight,
             )
         else:
             fm_state, metrics = fm_state.train_step(
-                jnp.asarray(batch_states), jnp.asarray(batch_actions)
+                batch_states_j, batch_actions_j,
+                anchor_z=anchor_z, anchor_actions=anchor_actions,
+                anchor_prng=action_key, anchor_weight=anchor_weight,
             )
         if metrics_file and ((step + 1) % 100 == 0 or step + 1 == train_steps):
             append_metrics(metrics_file, {
@@ -141,6 +165,7 @@ def train_async_stage(
         "fixed_encoder_checkpoint": str(Path(encoder_checkpoint_path).resolve()),
         "previous_decoder_checkpoint": str(Path(previous_decoder_checkpoint_path).resolve()),
         "train_steps": train_steps,
+        "online_anchor_weight": anchor_weight,
         "inherited_optimizer_state": inherit_optimizer_state,
         "final_loss": float(np.asarray(metrics.get("loss", np.nan))),
         "wall_time_seconds": time.time() - started,

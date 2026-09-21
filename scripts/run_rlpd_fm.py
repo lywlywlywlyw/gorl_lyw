@@ -159,6 +159,7 @@ def _decoder_worker(settings: dict) -> None:
             metrics_file=settings["metrics_file"],
             inherit_optimizer_state=version > 1,
             decoder_type=settings["decoder_type"],
+            anchor_weight=settings["online_decoder_anchor_weight"],
         )
         manager.publish_component("decoder", version, temporary_output, {
             "version": version,
@@ -266,6 +267,7 @@ def run_async_pipeline(
     target_entropy: float | None = None,
     iql_bellman_bridge_updates: int = 2000,
     iql_operator_transition_updates: int = 2000,
+    online_decoder_anchor_weight: float = 1.0,
     environment: str = "robomimic",
     dataset_path: str | None = None,
 ) -> None:
@@ -292,6 +294,8 @@ def run_async_pipeline(
         raise ValueError("minimum_replay_size must be positive")
     if decoder_train_steps < 1:
         raise ValueError("Decoder train steps must be positive")
+    if online_decoder_anchor_weight < 0:
+        raise ValueError("online_decoder_anchor_weight must be non-negative")
     if config["q_gap_num_states"] < 6 or config["q_gap_rollouts_per_state"] < 1:
         raise ValueError("Q-gap requires at least six states and one rollout per state.")
     if config["eval_num_envs"] < 1:
@@ -391,6 +395,7 @@ def run_async_pipeline(
         "target_entropy": target_entropy,
         "iql_bellman_bridge_updates": iql_bellman_bridge_updates,
         "iql_operator_transition_updates": iql_operator_transition_updates,
+        "online_decoder_anchor_weight": online_decoder_anchor_weight,
         "environment": environment,
         "dataset_path": config["dataset_path"],
     }
@@ -652,6 +657,7 @@ def main(
     target_entropy: float | None = None,
     iql_bellman_bridge_updates: int = 2000,
     iql_operator_transition_updates: int = 2000,
+    online_decoder_anchor_weight: float = 1.0,
     environment: str = "robomimic",
     dataset_path: str | None = None,
 ) -> None:
@@ -679,6 +685,7 @@ def main(
         target_entropy=target_entropy,
         iql_bellman_bridge_updates=iql_bellman_bridge_updates,
         iql_operator_transition_updates=iql_operator_transition_updates,
+        online_decoder_anchor_weight=online_decoder_anchor_weight,
         environment=environment,
         dataset_path=dataset_path,
     )

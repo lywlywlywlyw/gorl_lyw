@@ -7,7 +7,7 @@ import jax_dataclasses as jdc
 import optax
 from jax import Array
 from jax import numpy as jnp
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from flow_policy.networks import MlpWeights
 from . import math_utils, networks
@@ -166,6 +166,7 @@ class DecoderFMState:
         obs_norm: Array,
         x_t: Array,
         t_embed: Array,
+        params: Any | None = None,
     ) -> Array:
         """Forward pass through flow network - like FPO.
 
@@ -179,7 +180,7 @@ class DecoderFMState:
         """
         # Use networks.flow_mlp_fwd like FPO
         velocity = networks.flow_mlp_fwd(
-            self.params,
+            self.params if params is None else params,
             obs_norm,
             x_t,
             t_embed,
@@ -271,7 +272,8 @@ class DecoderFMState:
         return action
 
     def sample_action_from_z(
-        self, obs: Array, z: Array, prng: Array, deterministic: bool = True
+        self, obs: Array, z: Array, prng: Array, deterministic: bool = True,
+        params: Any | None = None,
     ) -> Array:
         """Sample action starting from given z instead of N(0,I).
 
@@ -298,7 +300,7 @@ class DecoderFMState:
             z = z[None, :]
 
         (*batch_dims, obs_dim) = obs_norm.shape
-        action_dim = self.params[-1][0].shape[-1]
+        action_dim = (self.params if params is None else params)[-1][0].shape[-1]
 
         # Define euler step - same as in sample_action
         def euler_step(
@@ -322,6 +324,7 @@ class DecoderFMState:
                     self.embed_timestep(schedule_t.t_current[None]),
                     (*batch_dims, self.config.timestep_embed_dim),
                 ),
+                params=params,
             )
 
             # SDE step with optional noise
@@ -412,6 +415,10 @@ class DecoderFMState:
         self,
         batch_obs: Array,
         batch_actions: Array,
+        anchor_z: Array | None = None,
+        anchor_actions: Array | None = None,
+        anchor_prng: Array | None = None,
+        anchor_weight: float = 0.0,
     ) -> tuple[DecoderFMState, dict[str, Array]]:
         """Training step - based on FPO's training logic."""
 
@@ -452,8 +459,24 @@ class DecoderFMState:
             # Average over samples and batch
             loss = jnp.mean(cfm_loss)
 
+            if anchor_z is not None:
+                if anchor_actions is None or anchor_prng is None:
+                    raise ValueError("anchor_actions and anchor_prng are required with anchor_z")
+                anchored_actions = state_with_params.sample_action_from_z(
+                    batch_obs, anchor_z, anchor_prng, deterministic=True, params=params
+                )
+                anchor_loss = jnp.mean(
+                    jnp.square(
+                        anchored_actions - jax.lax.stop_gradient(anchor_actions)
+                    )
+                )
+            else:
+                anchor_loss = jnp.zeros((), dtype=loss.dtype)
+            loss = loss + anchor_weight * anchor_loss
+
             metrics = {
                 "loss": loss,
+                "anchor_loss": anchor_loss,
                 "velocity_mean": 0.0,  # Placeholder
                 "velocity_std": 0.0,   # Placeholder
             }

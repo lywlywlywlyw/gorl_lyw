@@ -316,9 +316,12 @@ class Decoder1StepFMState:
         return velocity * self.config.policy_output_scale, features
 
     def meanflow_forward(
-        self, obs_norm: Array, x_t: Array, t: Array, r: Array
+        self, obs_norm: Array, x_t: Array, t: Array, r: Array,
+        params: Any | None = None,
     ) -> Array:
-        velocity, _ = self._forward(self.params, obs_norm, x_t, t, r)
+        velocity, _ = self._forward(
+            self.params if params is None else params, obs_norm, x_t, t, r
+        )
         return velocity
 
     def _normalize_obs(self, obs: Array) -> Array:
@@ -360,10 +363,12 @@ class Decoder1StepFMState:
         action = jnp.clip(action, -1.0, 1.0)
         return action[0] if single_obs else action
 
-    def _decode_normalized(self, obs_norm: Array, z: Array) -> Array:
+    def _decode_normalized(
+        self, obs_norm: Array, z: Array, params: Any | None = None
+    ) -> Array:
         t = jnp.ones((z.shape[0], 1))
         r = jnp.zeros((z.shape[0], 1))
-        return z - self.meanflow_forward(obs_norm, z, t, r)
+        return z - self.meanflow_forward(obs_norm, z, t, r, params=params)
 
     def sample_action_from_z(
         self,
@@ -371,12 +376,13 @@ class Decoder1StepFMState:
         z: Array,
         prng: Array,
         deterministic: bool = True,
+        params: Any | None = None,
     ) -> Array:
         obs_norm = self._normalize_obs(obs)
         single_obs = obs.ndim == 1
         if single_obs:
             obs_norm, z = obs_norm[None, :], z[None, :]
-        action = self._decode_normalized(obs_norm, z)
+        action = self._decode_normalized(obs_norm, z, params=params)
         if not deterministic:
             action += jax.random.normal(prng, action.shape) * self.config.feather_std
         action = jnp.clip(action, -1.0, 1.0)
@@ -617,7 +623,11 @@ class Decoder1StepFMState:
 
     @jax.jit
     def train_step(
-        self, epoch, batch_obs: Array, batch_actions: Array
+        self, epoch, batch_obs: Array, batch_actions: Array,
+        anchor_z: Array | None = None,
+        anchor_actions: Array | None = None,
+        anchor_prng: Array | None = None,
+        anchor_weight: float = 0.0,
     ) -> tuple["Decoder1StepFMState", dict[str, Array]]:
         batch_size = batch_obs.shape[0]
         obs_norm = self._normalize_obs(batch_obs)
@@ -631,8 +641,23 @@ class Decoder1StepFMState:
                     epoch, obs_norm, batch_actions, eps, t, r, params=params
                 )
             )
+            if anchor_z is not None:
+                if anchor_actions is None or anchor_prng is None:
+                    raise ValueError("anchor_actions and anchor_prng are required with anchor_z")
+                anchored_actions = self.sample_action_from_z(
+                    batch_obs, anchor_z, anchor_prng, deterministic=True, params=params
+                )
+                anchor_loss = jnp.mean(
+                    jnp.square(
+                        anchored_actions - jax.lax.stop_gradient(anchor_actions)
+                    )
+                )
+            else:
+                anchor_loss = jnp.zeros((), dtype=loss.dtype)
+            loss = loss + anchor_weight * anchor_loss
             return loss, {
                 "loss": loss,
+                "anchor_loss": anchor_loss,
                 "meanflow_loss": meanflow_loss,
                 "dis_loss": dis_loss,
                 "bifm_loss": bifm_loss,
