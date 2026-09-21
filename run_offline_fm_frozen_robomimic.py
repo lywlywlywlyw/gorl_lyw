@@ -290,8 +290,6 @@ def validate_config(config: ConfigView) -> None:
         raise ValueError("latent_inverse_steps must be positive for Flow Matching.")
     if config.max_grad_norm <= 0.0:
         raise ValueError("max_grad_norm must be positive.")
-    if config.early_stopping_min_delta < 0.0:
-        raise ValueError("early_stopping_min_delta must be non-negative.")
     if config.early_stopping_actor_nll_weight < 0.0:
         raise ValueError(
             "early_stopping_actor_nll_weight must be non-negative."
@@ -1097,6 +1095,25 @@ def save_offline_checkpoint(
         pickle.dump(checkpoint, file)
 
 
+def validate_online_rlpd_checkpoint(path: Path) -> None:
+    """Verify an offline checkpoint can initialize the online RLPD pipeline."""
+    with path.open("rb") as file:
+        checkpoint = pickle.load(file)
+    required = {
+        "params", "obs_stats", "config", "obs_dim", "action_dim",
+        "decoder_type", "rlpd_encoder_config",
+        "rlpd_z_actor_params", "rlpd_z_critic_params",
+        "rlpd_z_target_critic_params", "rlpd_z_log_temperature",
+        "rlpd_z_obs_stats",
+    }
+    missing = sorted(required.difference(checkpoint))
+    if missing:
+        raise RuntimeError(
+            f"Saved offline checkpoint is not online-compatible; missing fields: {missing}"
+        )
+
+
+
 def main(config: ConfigView) -> None:
     validate_config(config)
     output_dir = Path(config.output_dir)
@@ -1387,7 +1404,7 @@ def main(config: ConfigView) -> None:
                 {k: v for k, v in record.items() if isinstance(v, (int, float))},
                 global_step,
             )
-            if validation_loss < best_validation - config.decoder_min_delta:
+            if validation_loss < best_validation:
                 best_validation = validation_loss
                 best_params = jax.tree.map(jnp.copy, decoder.params)
                 stale_epochs = 0
@@ -1600,9 +1617,7 @@ def main(config: ConfigView) -> None:
                     validation_eval_indices,
                 )
                 validation_score = latest_validation_metrics["validation_score"]
-                if validation_score < (
-                    best_validation_score - config.early_stopping_min_delta
-                ):
+                if validation_score < best_validation_score:
                     # Always retain the best validation state. The minimum
                     # step only gates early stopping, not best-state tracking.
                     best_validation_score = validation_score
@@ -1723,6 +1738,41 @@ def main(config: ConfigView) -> None:
         print(
             f"Restored best encoder from IQL step {best_iql_step}."
         )
+        # Persist the selected IQL optimum before alignment changes the critics.
+        # This is deliberately separate from periodic and final checkpoints.
+        iql_best_checkpoint_path = (
+            output_dir / f"checkpoint_iql_best_step_{best_iql_step:09d}.pkl"
+        )
+        save_offline_checkpoint(
+            iql_best_checkpoint_path,
+            config,
+            rlpd_config,
+            decoder,
+            actor_params,
+            encoder_obs_stats,
+            q1_params,
+            q2_params,
+            value_params,
+            decoder_epoch,
+            best_iql_step,
+            actor_opt_state,
+            critic_opt_state,
+            value_opt_state,
+            target_q1_params,
+            target_q2_params,
+            rng,
+            key,
+            bridge_metadata={
+                "iql_best_checkpoint": True,
+                "alignment_completed": False,
+                "best_validation_score": best_validation_score,
+            },
+        )
+        validate_online_rlpd_checkpoint(iql_best_checkpoint_path)
+        print(
+            "Saved and validated best IQL checkpoint before alignment: "
+            f"{iql_best_checkpoint_path}"
+        )
 
         # Alignment: freeze actor/value and distill both IQL critics while
         # adapting only their latent score geometry.
@@ -1829,7 +1879,8 @@ def main(config: ConfigView) -> None:
                 "alignment_teacher_frozen": True,
             },
         )
-        print(f"Saved final offline RLPD checkpoint: {decoder_path}")
+        validate_online_rlpd_checkpoint(decoder_path)
+        print(f"Saved and validated final offline RLPD checkpoint: {decoder_path}")
     finally:
         if env is not None:
             env.close()

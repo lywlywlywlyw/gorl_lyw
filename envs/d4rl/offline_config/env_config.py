@@ -3,8 +3,8 @@ from dataclasses import asdict, dataclass
 
 @dataclass
 class EnvConfig:
-    """D4RL task settings shared by the offline entry point."""
-    dataset_path: str = "/root/GoRL/datasets/d4rl/halfcheetah-medium-expert-v2_processed.hdf5"
+    """Minari dataset and Gymnasium v5 task settings."""
+    dataset_path: str = "mujoco/halfcheetah/medium-v0"
     action_repeat: int = 1
     episode_length: int = 1000
     num_envs: int = 96

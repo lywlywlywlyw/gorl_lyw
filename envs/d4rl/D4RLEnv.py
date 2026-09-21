@@ -1,13 +1,12 @@
-"""A small ``BaseEnv`` adapter for the D4RL MuJoCo tasks.
+"""Minari MuJoCo dataset adapter backed by Gymnasium v5 environments.
 
-The adapter intentionally keeps the D4RL dataset interface separate from the
-rollout interface.  ``dataset_path`` may be a D4RL environment id (the usual
-case) or a ``.npz``/``.pkl`` q-learning dataset.  The latter is useful when a
-dataset has already been downloaded locally.
+``dataset_path`` is a Minari dataset id such as
+``mujoco/walker2d/medium-v0``. Legacy local files remain accepted.
 """
 
 from __future__ import annotations
 
+import os
 import pickle
 from pathlib import Path
 from typing import Any
@@ -21,9 +20,9 @@ from envs.base_env import BaseEnv, ObservationSize, State
 
 
 _TASK_IDS = {
-    "halfcheetah": "HalfCheetah-v4",
-    "hopper": "Hopper-v4",
-    "walker2d": "Walker2d-v4",
+    "halfcheetah": "HalfCheetah-v5",
+    "hopper": "Hopper-v5",
+    "walker2d": "Walker2d-v5",
 }
 
 # Official D4RL locomotion reference scores. These are not estimated from a
@@ -61,11 +60,7 @@ def infer_env_name(dataset_path: str) -> str:
         value = str(dataset_path)
     value = str(value).lower().replace("_", "-")
     task = _base_task_name(value)
-    # Preserve the D4RL version/dataset suffix when it is present.
-    for suffix in ("-v3", "-v4", "-v5", "-random-v2", "-medium-v2", "-medium-replay-v2", "-medium-expert-v2", "-expert-v2"):
-        if suffix in value:
-            return task + suffix
-    return {"halfcheetah": "halfcheetah-medium-v2", "hopper": "hopper-medium-v2", "walker2d": "walker2d-medium-v2"}[task]
+    return _TASK_IDS[task]
 
 
 def _base_task_name(name: str) -> str:
@@ -84,20 +79,8 @@ def _make_env(env_name: str, render_mode: str | None = None):
     except ImportError:
         import gymnasium as gym
 
-    # D4RL registers ids such as halfcheetah-medium-v2.  If D4RL is not
-    # installed, the native MuJoCo task remains usable for online rollouts.
-    try:
-        make_kwargs = {} if render_mode is None else {"render_mode": render_mode}
-        return gym.make(env_name, **make_kwargs)
-    except Exception as original:
-        fallback = _TASK_IDS[_base_task_name(env_name)]
-        if fallback == env_name:
-            raise
-        try:
-            make_kwargs = {} if render_mode is None else {"render_mode": render_mode}
-            return gym.make(fallback, **make_kwargs)
-        except Exception:
-            raise original
+    make_kwargs = {} if render_mode is None else {"render_mode": render_mode}
+    return gym.make(env_name, **make_kwargs)
 
 
 class D4RLEnv(BaseEnv):
@@ -110,8 +93,8 @@ class D4RLEnv(BaseEnv):
         render_offscreen: bool = False,
         reward_shaping: bool = False,
     ):
-        # For D4RL, dataset_path is commonly the registered environment id.
-        self.dataset_path = dataset_path or env_name or "halfcheetah-medium-v2"
+        # Minari dataset IDs select the corresponding v5 task by name.
+        self.dataset_path = dataset_path or env_name or "mujoco/walker2d/medium-v0"
         self.env_name = env_name or infer_env_name(self.dataset_path)
         self.render_offscreen = render_offscreen
         self.reward_shaping = bool(reward_shaping)
@@ -211,8 +194,45 @@ class D4RLEnv(BaseEnv):
         random_score, expert_score = D4RL_SCORE_RANGES[task]
         return (float(mean_return) - random_score) / (expert_score - random_score)
 
+    def _processed_cache_paths(self) -> tuple[Path, Path]:
+        """Return the canonical processed HDF5 and PKL paths for a Minari id."""
+        cache_dir = Path("/root/GoRL/datasets/d4rl")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        stem = str(self.dataset_path).strip("/").replace("/", "-").replace("_", "-")
+        return cache_dir / f"{stem}_processed.hdf5", cache_dir / f"{stem}_processed.pkl"
+
+    @staticmethod
+    def _write_processed_cache(
+        data: dict[str, np.ndarray], hdf5_path: Path, pkl_path: Path, dataset_id: str
+    ) -> None:
+        """Atomically store identical processed arrays in HDF5 and PKL formats."""
+        hdf5_tmp = hdf5_path.with_suffix(hdf5_path.suffix + ".tmp")
+        pkl_tmp = pkl_path.with_suffix(pkl_path.suffix + ".tmp")
+        hdf5_tmp.unlink(missing_ok=True)
+        pkl_tmp.unlink(missing_ok=True)
+        try:
+            with h5py.File(hdf5_tmp, "w") as handle:
+                handle.attrs["dataset_id"] = dataset_id
+                handle.attrs["env_name"] = infer_env_name(dataset_id)
+                for key, value in data.items():
+                    handle.create_dataset(key, data=np.asarray(value))
+                handle.flush()
+            with pkl_tmp.open("wb") as file:
+                pickle.dump({key: np.asarray(value) for key, value in data.items()}, file, protocol=pickle.HIGHEST_PROTOCOL)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(hdf5_tmp, hdf5_path)
+            os.replace(pkl_tmp, pkl_path)
+        except BaseException:
+            hdf5_tmp.unlink(missing_ok=True)
+            pkl_tmp.unlink(missing_ok=True)
+            raise
+
     def get_dataset(self) -> dict[str, np.ndarray]:
         path = Path(str(self.dataset_path)).expanduser()
+        cache_hdf5, cache_pkl = self._processed_cache_paths()
+        if not path.is_file() and cache_hdf5.is_file():
+            path = cache_hdf5
         if path.is_file():
             if path.suffix in {".h5", ".hdf5"}:
                 with h5py.File(path, "r") as handle:
@@ -231,19 +251,41 @@ class D4RLEnv(BaseEnv):
             else:
                 raise ValueError(f"Unsupported D4RL dataset file: {path}")
         else:
-            raw = None
             try:
-                import d4rl  # noqa: F401
-                import d4rl as _d4rl
-                raw = _d4rl.qlearning_dataset(self.env)
-            except Exception:
-                if hasattr(self.env, "get_dataset"):
-                    raw = self.env.get_dataset()
-            if raw is None:
-                raise RuntimeError("D4RL is not installed and the environment has no get_dataset().")
+                import minari
+                dataset = minari.load_dataset(str(self.dataset_path), download=True)
+            except Exception as error:
+                raise RuntimeError(f"Could not load Minari dataset {self.dataset_path!r}.") from error
+            observations, actions, rewards, next_observations = [], [], [], []
+            dones, truncations = [], []
+            for episode in dataset.iterate_episodes():
+                obs = np.asarray(episode.observations, dtype=np.float32)
+                act = np.asarray(episode.actions, dtype=np.float32)
+                rew = np.asarray(episode.rewards, dtype=np.float32).reshape(-1)
+                term = np.asarray(episode.terminations, dtype=np.bool_).reshape(-1)
+                trunc = np.asarray(episode.truncations, dtype=np.bool_).reshape(-1)
+                count = len(act)
+                if len(obs) != count + 1 or any(len(x) != count for x in (rew, term, trunc)):
+                    raise ValueError(f"Malformed Minari episode in {self.dataset_path!r}.")
+                observations.append(obs[:-1]); next_observations.append(obs[1:])
+                actions.append(act); rewards.append(rew); dones.append(term); truncations.append(trunc)
+            if not observations:
+                raise RuntimeError(f"Minari dataset {self.dataset_path!r} contains no episodes.")
+            raw = {"observations": np.concatenate(observations), "next_observations": np.concatenate(next_observations),
+                   "actions": np.concatenate(actions), "rewards": np.concatenate(rewards),
+                   "dones": np.concatenate(dones), "truncations": np.concatenate(truncations)}
+            raw["episode_ends"] = np.logical_or(raw["dones"], raw["truncations"])
+            self._write_processed_cache(raw, cache_hdf5, cache_pkl, str(self.dataset_path))
+            path = cache_hdf5
         result = {key: np.asarray(value) for key, value in raw.items()}
+        # Keep the PKL cache synchronized even if an older run created only HDF5.
+        if path == cache_hdf5 and not cache_pkl.exists():
+            with cache_pkl.open("wb") as file:
+                pickle.dump(result, file, protocol=pickle.HIGHEST_PROTOCOL)
+                file.flush()
+                os.fsync(file.fileno())
         if "dones" not in result:
-            raise KeyError("D4RL training data must contain dones; preprocess the source dataset first.")
+            raise KeyError("Dataset must contain Minari terminations/dones.")
         if "next_observations" not in result:
             result["next_observations"] = np.concatenate([result["observations"][1:], result["observations"][-1:]])
         return result
