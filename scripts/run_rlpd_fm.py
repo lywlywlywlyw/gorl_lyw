@@ -143,6 +143,17 @@ def _decoder_worker(settings: dict) -> None:
         encoder = manager.wait_component(
             "encoder", encoder_version, settings["poll_seconds"], stop
         )
+        if settings.get("freeze_decoder", False):
+            # Publish an immutable alias for this version so encoder and policy
+            # stages can keep progressing while reusing Decoder_{version - 1}.
+            manager.publish_component("decoder", version, previous_decoder, {
+                "version": version,
+                "fixed_encoder_version": encoder_version,
+                "previous_decoder_version": version - 1,
+                "frozen": True,
+            })
+            version += 1
+            continue
         _wait_for_replay(replay, settings["minimum_replay_size"], stop, settings["poll_seconds"])
         replay_size = replay.size()
         snapshot = Path(settings["snapshots_dir"]) / f"decoder_{version}_replay_{replay_size}.pkl"
@@ -382,6 +393,7 @@ def run_async_pipeline(
         "start_version": 1,
         "encoder_train_env_steps": encoder_train_env_steps,
         "decoder_train_steps": decoder_train_steps,
+        "freeze_decoder": config["freeze_decoder"],
         "encoder_demo_ratio": encoder_demo_ratio,
         "encoder_replay_ratio": encoder_replay_ratio,
         "minimum_replay_size": minimum_replay_size,

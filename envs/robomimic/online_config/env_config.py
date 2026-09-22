@@ -12,6 +12,8 @@ class EnvConfig:
     dense_reward: bool = True
     success_reward_bonus: float = 0.0
     terminate_on_success: bool = False
+    # Whether to keep the decoder fixed during online training.
+    freeze_decoder: bool = False
 
     def to_dict(self):
         return asdict(self)
