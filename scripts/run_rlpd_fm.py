@@ -41,10 +41,20 @@ def _wait_for_replay(replay: ChunkReplayBuffer, minimum: int, stop: Path, poll: 
         time.sleep(poll)
 
 
-def _write_replay_snapshot(replay: ChunkReplayBuffer, target: Path) -> Path:
+def _wait_for_collection_marker(replay_dir: str | Path, policy_version: int, stop: Path, poll: float) -> dict:
+    marker = Path(replay_dir) / "completed" / f"policy_{policy_version}.pkl"
+    while not marker.is_file():
+        if stop.exists():
+            raise InterruptedError("Pipeline stop requested.")
+        time.sleep(poll)
+    with marker.open("rb") as file:
+        return pickle.load(file)
+
+
+def _write_replay_snapshot(replay: ChunkReplayBuffer, target: Path, paths: list[Path] | None = None) -> Path:
     """Atomically freeze the chunk list and contents used by one trainer stage."""
-    paths = replay.snapshot_paths()
-    data = replay.load_snapshot(paths)
+    selected = replay.snapshot_paths() if paths is None else paths
+    data = replay.load_snapshot(selected)
     return atomic_pickle_dump(data, target)
 
 
@@ -84,17 +94,71 @@ def _encoder_worker(settings: dict) -> None:
         decoder = manager.wait_component(
             "decoder", decoder_version, settings["poll_seconds"], stop
         )
+        completion = _wait_for_collection_marker(
+            settings["replay_dir"], version - 1, stop, settings["poll_seconds"]
+        )
+        # The marker identifies exactly one completed collection chunk. The
+        # cumulative replay size is retained separately for bookkeeping.
+        replay_total = replay.size()
+        with previous_encoder.open("rb") as file:
+            previous_metadata = pickle.load(file)
+        previous_replay_total = int(
+            previous_metadata.get("online_replay_size", 0)
+        )
+        new_transition_count = int(completion.get("transition_count", 0))
+        if new_transition_count <= 0 or replay_total <= previous_replay_total:
+            raise RuntimeError(
+                f"Refusing to publish encoder_{version}: collection marker for "
+                f"policy {version - 1} has no new transitions."
+            )
         snapshot = Path(settings["snapshots_dir"]) / f"encoder_{version}_replay.pkl"
         _write_replay_snapshot(replay, snapshot)
+        latest_snapshot = Path(settings["snapshots_dir"]) / f"encoder_{version}_latest_replay.pkl"
+        chunk_path = completion.get("chunk_path")
+        if chunk_path is None:
+            # Backward compatibility for markers written before chunk paths
+            # were recorded: use the newest chunk from this policy version.
+            candidates = []
+            for path in replay.snapshot_paths():
+                with path.open("rb") as file:
+                    payload = pickle.load(file)
+                if int(payload.get("metadata", {}).get("policy_version", -1)) == version - 1:
+                    candidates.append(path)
+            if not candidates:
+                raise RuntimeError(f"No replay chunk found for policy {version - 1}")
+            latest_chunk = candidates[-1]
+        else:
+            latest_chunk = Path(chunk_path)
+        if not latest_chunk.is_file():
+            raise RuntimeError(f"Collection chunk is missing: {latest_chunk}")
+        _write_replay_snapshot(replay, latest_snapshot, [latest_chunk])
+        history_snapshot = Path(settings["snapshots_dir"]) / f"encoder_{version}_history_replay.pkl"
+        history_paths = []
+        for path in replay.snapshot_paths():
+            if path == latest_chunk:
+                continue
+            with path.open("rb") as file:
+                payload = pickle.load(file)
+            policy_version = int(payload.get("metadata", {}).get("policy_version", -1))
+            if policy_version < version - 1:
+                history_paths.append(path)
+        if not history_paths:
+            history_snapshot = latest_snapshot
+        else:
+            _write_replay_snapshot(replay, history_snapshot, history_paths)
         temporary_output = Path(settings["work_dir"]) / f"encoder_{version}.pkl"
         train_async_stage(
             decoder_checkpoint_path=str(decoder),
             previous_encoder_checkpoint_path=str(previous_encoder),
             demo_buffer_path=settings["demo_buffer_path"],
             replay_snapshot_path=str(snapshot),
+            latest_replay_snapshot_path=str(latest_snapshot),
+            historical_replay_snapshot_path=str(history_snapshot),
             output_checkpoint_path=str(temporary_output),
             version=version,
-            train_env_steps=settings["encoder_train_env_steps"],
+            train_env_steps=new_transition_count,
+            train_updates=max(1, (new_transition_count + 7) // 8),
+            online_replay_size=replay_total,
             demo_ratio=settings["encoder_demo_ratio"],
             replay_ratio=settings["encoder_replay_ratio"],
             metrics_file=settings["metrics_file"],
@@ -115,7 +179,13 @@ def _encoder_worker(settings: dict) -> None:
             "replay_snapshot": str(snapshot),
             "demo_ratio": settings["encoder_demo_ratio"],
             "replay_ratio": settings["encoder_replay_ratio"],
-            "train_env_steps": settings["encoder_train_env_steps"],
+            "latest_replay_ratio": 0.25,
+            "historical_replay_ratio": 0.25,
+            "demonstration_ratio": 0.50,
+            "collection_marker": str(Path(settings["replay_dir"]) / "completed" / f"policy_{version - 1}.pkl"),
+            "train_env_steps": new_transition_count,
+            "new_transition_count": new_transition_count,
+            "online_replay_size": replay_total,
             "inherited_optimizer_state": version > 1,
         })
         manager.publish_policy(
@@ -137,12 +207,19 @@ def _decoder_worker(settings: dict) -> None:
     version = settings["start_version"]
     while not stop.exists():
         previous_decoder = manager.wait_component("decoder", version - 1, settings["poll_seconds"], stop)
-        # Decoder_n starts only after Encoder_n has completed. There is no
-        # data-size gate: one decoder update stage follows every encoder stage.
+        # Publish Policy_n before training Decoder_n. The collector waits for
+        # Decoder_n, so its replay snapshot cannot include Policy_n data.
         encoder_version = version
         encoder = manager.wait_component(
             "encoder", encoder_version, settings["poll_seconds"], stop
         )
+        policy_encoder, policy_decoder = manager.wait_policy(
+            version, settings["poll_seconds"], stop
+        )
+        if policy_encoder != encoder or policy_decoder != previous_decoder:
+            raise RuntimeError(
+                f"Policy_{version} must pair Encoder_{version} with Decoder_{version - 1}."
+            )
         if settings.get("freeze_decoder", False):
             # Publish an immutable alias for this version so encoder and policy
             # stages can keep progressing while reusing Decoder_{version - 1}.
@@ -199,6 +276,7 @@ def _collector_worker(settings: dict) -> None:
         stop_file=settings["stop_file"],
         poll_seconds=settings["poll_seconds"],
         rollout_steps=settings["collector_rollout_steps"],
+        minimum_replay_size=settings["minimum_replay_size"],
         replay_capacity=settings["replay_capacity"],
         metrics_file=settings["metrics_file"],
         decoder_type=settings["decoder_type"],

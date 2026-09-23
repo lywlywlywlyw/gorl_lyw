@@ -228,7 +228,7 @@ def _sample_mixed_batch(
         # Always reconstruct z from the real (s, a) pair with Decoder_{n-1}.
         # Even a freshly collected latent was produced before this optimizer
         # update and must not bypass the fixed decoder coordinate transform.
-        environment_actions.append(sampled["actions"])
+        environment_actions.append(sampled.get("actions", sampled.get("env_actions")))
         for key in ("rewards", "next_observations", "masks"):
             pieces[key].append(sampled[key])
     if demo_count:
@@ -288,7 +288,7 @@ def _sample_async_mixed_batch(
         pieces["observations"].append(sampled["observations"])
         # Deliberately reconstruct every latent, including fresh replay data.
         # Thus no latent from a collector or an older stage is treated as GT.
-        environment_actions.append(sampled["actions"])
+        environment_actions.append(sampled.get("actions", sampled.get("env_actions")))
         for key in ("rewards", "next_observations", "masks"):
             pieces[key].append(sampled[key])
     observations = jnp.asarray(np.concatenate(pieces["observations"], axis=0))
@@ -301,6 +301,35 @@ def _sample_async_mixed_batch(
     batch["actions"] = inverse_decoder_batch(
         observations, jnp.asarray(np.concatenate(environment_actions, axis=0))
     )
+    return encoder_rlpd.RLPDTransitionBatch(**batch)
+
+
+def _sample_async_encoder_batch(
+    latest_replay: dict[str, np.ndarray], historical_replay: dict[str, np.ndarray],
+    demo: dict[str, np.ndarray], batch_size: int, rng: np.random.Generator,
+    inverse_decoder_batch: Any,
+) -> encoder_rlpd.RLPDTransitionBatch:
+    """50% previous-policy data, 25% online history, 25% demonstrations."""
+    latest_count = batch_size // 4
+    history_count = batch_size // 4
+    demo_count = batch_size - latest_count - history_count
+    sources = [(latest_replay, latest_count), (historical_replay, history_count), (demo, demo_count)]
+    pieces = {key: [] for key in ("observations", "actions", "rewards", "next_observations", "masks")}
+    environment_actions = []
+    for source, count in sources:
+        if count <= 0:
+            continue
+        if len(source["rewards"]) == 0:
+            raise ValueError("Encoder sampling source is empty.")
+        sampled = _sample_transition_arrays(source, count, rng)
+        pieces["observations"].append(sampled["observations"])
+        environment_actions.append(sampled.get("actions", sampled.get("env_actions")))
+        for key in ("rewards", "next_observations", "masks"):
+            pieces[key].append(sampled[key])
+    observations = jnp.asarray(np.concatenate(pieces["observations"], axis=0))
+    batch = {key: jnp.asarray(np.concatenate(values, axis=0)) for key, values in pieces.items() if key != "actions"}
+    batch["observations"] = observations
+    batch["actions"] = inverse_decoder_batch(observations, jnp.asarray(np.concatenate(environment_actions, axis=0)))
     return encoder_rlpd.RLPDTransitionBatch(**batch)
 
 
@@ -344,6 +373,10 @@ def train_async_stage(
     output_checkpoint_path: str,
     version: int,
     train_env_steps: int,
+    train_updates: int | None = None,
+    latest_replay_snapshot_path: str | None = None,
+    historical_replay_snapshot_path: str | None = None,
+    online_replay_size: int | None = None,
     demo_ratio: float = 0.5,
     replay_ratio: float = 0.5,
     metrics_file: str | None = None,
@@ -365,7 +398,9 @@ def train_async_stage(
     stage boundary converts every action to that decoder's latent coordinates.
     """
     if train_env_steps <= 0:
-        raise ValueError("train_env_steps must be positive.")
+        raise ValueError("train_env_steps must be positive; empty stages cannot be published.")
+    if online_replay_size is not None and online_replay_size < 0:
+        raise ValueError("online_replay_size must be non-negative.")
     if iql_bellman_bridge_updates < 0 or iql_operator_transition_updates < 0:
         raise ValueError("IQL bridge and operator transition updates must be non-negative.")
     if not np.isclose(demo_ratio + replay_ratio, 1.0):
@@ -464,7 +499,9 @@ def train_async_stage(
         ) and previous.get("rlpd_temperature_parameterization") != "softplus_raw"
         if encoder_config.learn_temperature and not previous_is_legacy_offline:
             encoder_state.log_temperature = previous["rlpd_z_log_temperature"]
-        encoder_state.obs_stats = previous["rlpd_z_obs_stats"]
+        encoder_state.obs_stats = previous.get(
+            "offline_obs_stats", previous["rlpd_z_obs_stats"]
+        )
         if inherit_optimizer_state:
             for name, key in optimizer_keys.items():
                 setattr(encoder_state, name, previous[key])
@@ -489,16 +526,22 @@ def train_async_stage(
         decoder_state.params, decoder_state.obs_stats = decoder_checkpoint["params"], decoder_checkpoint["obs_stats"]
     inverse_decoder_batch = _make_inverse_decoder_batch(decoder_state)
 
-    demo = load_transition_data(demo_buffer_path)
+    demo = _load_encoder_demo_buffer(demo_buffer_path, int(env.observation_size), int(env.action_size))
     replay = load_transition_data(replay_snapshot_path)
+    latest_replay = load_transition_data(latest_replay_snapshot_path) if latest_replay_snapshot_path else replay
+    historical_replay = load_transition_data(historical_replay_snapshot_path) if historical_replay_snapshot_path else replay
     if demo["observations"].shape[-1] != int(env.observation_size):
         raise ValueError("demo_buffer observation dimension does not match env.")
     if replay["observations"].shape[-1] != int(env.observation_size):
         raise ValueError("replay_buffer observation dimension does not match env.")
 
-    # One environment step corresponds to the same configurable high-UTD update
-    # multiplier used by the existing online implementation.
-    updates = max(1, int(train_env_steps * config["rlpd_updates_per_env_step"]))
+    offline_actor_params = previous.get("offline_actor_params")
+    if offline_actor_params is None:
+        offline_actor_params = previous["rlpd_z_actor_params"]
+    offline_obs_stats = previous.get("offline_obs_stats", previous["rlpd_z_obs_stats"])
+    # In the asynchronous pipeline, train_updates is derived from the current
+    # collection chunk: one critic minibatch per eight new transitions.
+    updates = int(train_updates) if train_updates is not None else max(1, (int(train_env_steps) + 7) // 8)
     rng = np.random.default_rng(config["seed"] + version)
     metrics: dict[str, Any] = {}
     latest_actor_metrics: dict[str, Any] = {}
@@ -520,17 +563,15 @@ def train_async_stage(
         for bridge_update in tqdm(
             range(total_bridge_updates), desc="IQL-to-RLPD bridge"
         ):
-            batch = _sample_async_mixed_batch(
-                replay,
-                demo,
-                demo_ratio,
-                config["rlpd_batch_size"],
-                rng,
-                inverse_decoder_batch,
-            )
-            if bridge_update == 0:
-                encoder_state = encoder_state.update_observation_stats(
-                    jnp.concatenate([batch.observations, batch.next_observations], axis=0)
+            if is_initial_online_stage:
+                batch = _sample_async_mixed_batch(
+                    replay, demo, 0.5, config["rlpd_batch_size"], rng,
+                    inverse_decoder_batch,
+                )
+            else:
+                batch = _sample_async_encoder_batch(
+                    latest_replay, historical_replay, demo,
+                    config["rlpd_batch_size"], rng, inverse_decoder_batch,
                 )
             if bridge_update < iql_bellman_bridge_updates:
                 bellman_mix = 0.0
@@ -557,6 +598,7 @@ def train_async_stage(
                 append_metrics(metrics_file, {
                     "pipeline/version": version,
                     "pipeline/encoder_step": online_encoder_updates + bridge_update + 1,
+                    "pipeline/online_env_steps": int(online_replay_size or 0),
                     "train/bridge_phase": phase,
                     **{
                         f"train/{key}": float(np.asarray(value))
@@ -566,17 +608,20 @@ def train_async_stage(
         online_encoder_updates += total_bridge_updates
 
     for update in tqdm(range(updates), desc=f"Encoder {version}"):
-        batch = _sample_async_mixed_batch(
-            replay,
-            demo,
-            demo_ratio,
-            config["rlpd_batch_size"],
-            rng,
-            inverse_decoder_batch,
-        )
+        if is_initial_online_stage:
+            batch = _sample_async_mixed_batch(
+                replay, demo, 0.5, config["rlpd_batch_size"], rng,
+                inverse_decoder_batch,
+            )
+        else:
+            batch = _sample_async_encoder_batch(
+                latest_replay, historical_replay, demo,
+                config["rlpd_batch_size"], rng, inverse_decoder_batch,
+            )
         if update == 0:
-            # Record the checkpoint critic before any online state mutation,
-            # including the first observation-statistics update.
+            # Record the checkpoint critic before the first online critic
+            # update. Observation normalization remains frozen to offline
+            # statistics throughout this stage.
             initial_critic_metrics = encoder_state.evaluate_critic(batch)
             if metrics_file:
                 append_metrics(metrics_file, {
@@ -588,13 +633,15 @@ def train_async_stage(
                         if key in ("predicted_qs", "target_qs")
                     },
                 })
-            encoder_state = encoder_state.update_observation_stats(
-                jnp.concatenate([batch.observations, batch.next_observations], axis=0)
-            )
         encoder_state, critic_metrics = encoder_state.update_critic(batch)
         metrics = dict(critic_metrics)
         if (update + 1) % config["rlpd_policy_update_period"] == 0:
-            encoder_state, actor_metrics = encoder_state.update_actor_and_temperature(batch)
+            encoder_state, actor_metrics = encoder_state.update_actor_and_temperature(
+                batch,
+                offline_actor_params,
+                offline_obs_stats,
+                5.0,
+            )
             latest_actor_metrics = dict(actor_metrics)
             latest_actor_step = online_encoder_updates + update + 1
             metrics.update(actor_metrics)
@@ -613,6 +660,7 @@ def train_async_stage(
                 # Encoder_n stages. A stage-local update would repeatedly write
                 # x=0..updates and collapse all train curves onto the last stage.
                 "pipeline/encoder_step": online_encoder_updates + update + 1,
+                "pipeline/online_env_steps": int(online_replay_size or 0),
                 **{f"train/{key}": float(np.asarray(value)) for key, value in metrics.items()},
             })
 
@@ -623,12 +671,24 @@ def train_async_stage(
         "fixed_decoder_checkpoint": str(Path(decoder_checkpoint_path).resolve()),
         "previous_encoder_checkpoint": str(Path(previous_encoder_checkpoint_path).resolve()),
         "train_env_steps": train_env_steps,
+        "new_transition_count": train_env_steps,
+        "online_replay_size": (
+            int(online_replay_size)
+            if online_replay_size is not None
+            else int(previous.get("online_replay_size", 0) + train_env_steps)
+        ),
         "train_updates": updates,
         "online_encoder_updates": online_encoder_updates + updates,
         "demo_ratio": demo_ratio,
         "replay_ratio": replay_ratio,
+        "latest_replay_ratio": 0.25,
+        "historical_replay_ratio": 0.25,
+        "demonstration_ratio": 0.50,
         "inherited_optimizer_state": inherit_optimizer_state,
         "wall_time_seconds": time.time() - started,
+        "offline_actor_params": offline_actor_params,
+        "offline_obs_stats": offline_obs_stats,
+        "offline_actor_kl_weight": 5.0,
     })
     atomic_pickle_dump(checkpoint, output_checkpoint_path)
 

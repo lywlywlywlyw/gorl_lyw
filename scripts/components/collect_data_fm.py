@@ -33,10 +33,14 @@ from envs.base_env import State
 from envs.robomimic.online_config.training_config import TrainingConfig
 try:
     from .metrics_ipc import append_metrics
-    from .online_pipeline_ipc import ChunkReplayBuffer, VersionManager
+    from .online_pipeline_ipc import (
+        ChunkReplayBuffer,
+        VersionManager,
+        atomic_pickle_dump,
+    )
 except ImportError:  # Direct execution: python scripts/components/collect_data_fm.py
     from metrics_ipc import append_metrics
-    from online_pipeline_ipc import ChunkReplayBuffer, VersionManager
+    from online_pipeline_ipc import ChunkReplayBuffer, VersionManager, atomic_pickle_dump
 
 
 def _runtime_env_config(environment: str):
@@ -549,6 +553,7 @@ def run_async_collector(
     stop_file: str,
     poll_seconds: float = 2.0,
     rollout_steps: int = 100,
+    minimum_replay_size: int = 49152,
     replay_capacity: int | None = None,
     metrics_file: str | None = None,
     decoder_type: str = "flow_matching",
@@ -577,6 +582,7 @@ def run_async_collector(
         env, jax.random.key(config["seed"] + 1), config["num_envs"], terminate_on_success=config["terminate_on_success"]
     )
     current_version = -1
+    last_collected_policy_version = -1
     agent = None
     apply_tanh = True
     try:
@@ -586,6 +592,16 @@ def run_async_collector(
                 time.sleep(poll_seconds)
                 continue
             version, encoder_path, decoder_path = latest
+            # Policy_n is collected only after Decoder_n has finished. The
+            # next encoder then re-inverts these actions with Decoder_n.
+            manager.wait_component("decoder", version, poll_seconds, stop)
+            # After warmup, one policy is allowed exactly one rollout batch.
+            # The collector then waits until the learner publishes the next
+            # policy, so replay cannot run arbitrarily ahead of training.
+            warmup_complete = replay.size() >= minimum_replay_size
+            if warmup_complete and version <= last_collected_policy_version:
+                time.sleep(poll_seconds)
+                continue
             if version != current_version:
                 agent, apply_tanh = _load_policy_pair(
                     encoder_path, decoder_path, env, config
@@ -619,19 +635,32 @@ def run_async_collector(
                     rollout_state.last_transition_env_states, dtype=object
                 ),
             }
-            replay.append(payload, metadata={
+            chunk_path = replay.append(payload, metadata={
                 "policy_version": version,
                 "encoder_checkpoint": str(encoder_path),
                 "decoder_checkpoint": str(decoder_path),
             })
+            # This marker is the learner's stage barrier. It is written only
+            # after the complete rollout chunk is durable in the replay store.
+            completed_dir = Path(replay_buffer_dir) / "completed"
+            atomic_pickle_dump({
+                "policy_version": int(version),
+                "chunk_path": str(chunk_path),
+                "transition_count": int(len(rewards)),
+                "replay_size": int(replay.size()),
+            }, completed_dir / f"policy_{version}.pkl")
+            online_env_steps = replay.size()
             if metrics_file:
                 append_metrics(metrics_file, {
                     "pipeline/version": version,
                     "collector/policy_version": version,
                     "collector/transitions": len(rewards),
-                    "collector/replay_size": replay.size(),
+                    "collector/replay_size": online_env_steps,
+                    "pipeline/online_env_steps": online_env_steps,
                     "collector/reward_mean": float(rewards.mean()),
                 })
+            if warmup_complete or replay.size() >= minimum_replay_size:
+                last_collected_policy_version = version
     finally:
         rollout_state.close()
 
@@ -661,6 +690,11 @@ def run_async_evaluator(
     manager = VersionManager(pipeline_root)
     stop = Path(stop_file)
     env = _make_runtime_env(config)
+    replay = (
+        ChunkReplayBuffer(replay_buffer_dir)
+        if replay_buffer_dir is not None
+        else None
+    )
     q_gap_records = None
     if q_gap_states_path is not None:
         with Path(q_gap_states_path).expanduser().open("rb") as file:
@@ -700,6 +734,8 @@ def run_async_evaluator(
                 metrics.update(_record_fixed_q_gap_evaluation(
                     agent, config, version, q_gap_records, evaluation_pool
                 ))
+            if replay is not None:
+                metrics["pipeline/online_env_steps"] = replay.size()
             if metrics_file:
                 append_metrics(metrics_file, metrics)
             print(f"Evaluation completed for Policy_{version}.", flush=True)

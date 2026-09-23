@@ -401,7 +401,11 @@ class EncoderState:
 
     @jax.jit
     def update_actor_and_temperature(
-        self, batch: RLPDTransitionBatch
+        self,
+        batch: RLPDTransitionBatch,
+        offline_actor_params: networks.MlpWeights | None = None,
+        offline_obs_stats: math_utils.RunningStats | None = None,
+        offline_actor_kl_weight: float = 5.0,
     ) -> tuple["EncoderState", dict[str, Array]]:
         rng, actor_key, temperature_key = jax.random.split(self.prng, 3)
         temperature = jax.lax.stop_gradient(self.temperature)
@@ -421,10 +425,30 @@ class EncoderState:
                 jnp.square(mean) + jnp.square(std) - 1.0 - 2.0 * jnp.log(std),
                 axis=-1,
             )
+            offline_actor_kl = jnp.zeros_like(prior_kl)
+            if offline_actor_params is not None and offline_obs_stats is not None:
+                offline_obs = (
+                    batch.observations - offline_obs_stats.mean
+                ) / (offline_obs_stats.std + 1e-8)
+                # ``offline_obs`` is already normalized with the frozen
+                # offline statistics, so do not normalize it a second time.
+                offline_distribution = networks.gaussian_policy_fwd(
+                    offline_actor_params, offline_obs
+                )
+                offline_mean = jax.lax.stop_gradient(offline_distribution.loc)
+                offline_std = jax.lax.stop_gradient(offline_distribution.scale)
+                offline_actor_kl = jnp.sum(
+                    jnp.log(offline_std / std)
+                    + (jnp.square(std) + jnp.square(mean - offline_mean))
+                    / (2.0 * jnp.square(offline_std))
+                    - 0.5,
+                    axis=-1,
+                )
             loss = jnp.mean(
                 temperature * log_probs
                 - q
                 + self.config.latent_kl_weight * prior_kl
+                + offline_actor_kl_weight * offline_actor_kl
             )
             return loss, (
                 jnp.mean(-log_probs),
@@ -438,6 +462,7 @@ class EncoderState:
                 jnp.max(std),
                 jnp.mean(jnp.linalg.norm(actions, axis=-1)),
                 jnp.max(jnp.abs(actions)),
+                jnp.mean(offline_actor_kl),
             )
 
         (actor_loss, actor_aux), actor_grads = jax.value_and_grad(
@@ -455,6 +480,7 @@ class EncoderState:
             latent_std_max,
             latent_norm,
             latent_max_abs,
+            offline_actor_kl,
         ) = actor_aux
         actor_optimizer = optax.chain(
             optax.clip_by_global_norm(self.config.max_grad_norm),
@@ -519,4 +545,5 @@ class EncoderState:
             "latent_std_max": latent_std_max,
             "latent_norm": latent_norm,
             "latent_max_abs": latent_max_abs,
+            "offline_actor_kl": offline_actor_kl,
         }

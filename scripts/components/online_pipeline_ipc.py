@@ -186,6 +186,18 @@ class ChunkReplayBuffer:
             merged = {key: value[-self.capacity :] for key, value in merged.items()}
         return merged
 
+    def load_policy_snapshot(self, policy_version: int) -> dict[str, np.ndarray]:
+        """Load all immutable chunks collected by one policy version."""
+        paths = []
+        for path in self.snapshot_paths():
+            with path.open("rb") as file:
+                payload = pickle.load(file)
+            if int(payload.get("metadata", {}).get("policy_version", -1)) == int(policy_version):
+                paths.append(path)
+        if not paths:
+            raise ValueError(f"No replay chunks found for policy version {policy_version}.")
+        return self.load_snapshot(paths)
+
     def size(self) -> int:
         total = 0
         for path in self.snapshot_paths():
