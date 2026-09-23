@@ -26,6 +26,7 @@ import numpy as np
 TRANSITION_KEYS = (
     "observations",
     "actions",
+    "latents",
     "rewards",
     "next_observations",
     "masks",
@@ -73,6 +74,7 @@ def load_transition_data(path: str | Path) -> dict[str, np.ndarray]:
     aliases = {
         "observations": ("observations", "states", "obs"),
         "actions": ("actions", "env_actions"),
+        "latents": ("latents", "latent", "z"),
         "rewards": ("rewards", "reward"),
         "next_observations": ("next_observations", "next_states", "next_obs"),
         "masks": ("masks", "discounts", "discount"),
@@ -98,6 +100,8 @@ def load_transition_data(path: str | Path) -> dict[str, np.ndarray]:
     if "observations" not in result or "actions" not in result:
         raise KeyError(f"Transition buffer {path} must contain states and actions.")
     size = len(result["observations"])
+    if "latents" not in result:
+        result["latents"] = np.full_like(result["actions"], np.nan, dtype=np.float32)
     if "rewards" not in result:
         result["rewards"] = np.zeros(size, dtype=np.float32)
     if "next_observations" not in result:
@@ -159,6 +163,8 @@ class ChunkReplayBuffer:
             size = len(arrays["observations"])
             arrays["env_states"] = np.empty(size, dtype=object)
             arrays["env_states"][:] = None
+        if "latents" not in arrays:
+            arrays["latents"] = np.full_like(arrays["actions"], np.nan, dtype=np.float32)
         missing = set(TRANSITION_KEYS) - set(arrays)
         if missing:
             raise KeyError(f"Replay chunk is missing required keys: {sorted(missing)}")

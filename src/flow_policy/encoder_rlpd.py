@@ -261,14 +261,17 @@ class EncoderState:
         
         target = jax.lax.stop_gradient(target_q)
 
-        def loss_fn(params: Any) -> tuple[Array, tuple[Array, Array]]:
+        def loss_fn(params: Any) -> tuple[Array, tuple[Array, Array, Array]]:
             predicted = self._critic_values(params, batch.observations, batch.actions)
-            loss = jnp.mean(jnp.square(predicted - target[None, :]))
-            return loss, (jnp.mean(predicted), jnp.mean(target))
+            td_loss = jnp.mean(jnp.square(predicted - target[None, :]))
+            return td_loss, (jnp.mean(predicted), jnp.mean(target), td_loss)
 
-        (loss, (predicted_q, target_q_mean)), grads = jax.value_and_grad(
+        (loss, (predicted_q, target_q_mean, td_loss)), grads = jax.value_and_grad(
             loss_fn, has_aux=True
         )(self.critic_params)
+        td_grad_norm = _global_norm(
+            jax.grad(lambda p: loss_fn(p)[1][2])(self.critic_params)
+        )
         optimizer = optax.chain(
             optax.clip_by_global_norm(self.config.max_grad_norm),
             optax.adam(self.config.critic_learning_rate),
@@ -294,6 +297,8 @@ class EncoderState:
             "predicted_qs": predicted_q,
             "target_qs": target_q_mean,
             "critic_grad_norm": _global_norm(grads),
+            "critic_td_grad_norm": td_grad_norm,
+            "td_rmse": jnp.sqrt(td_loss + 1e-8),
             "rewards": jnp.mean(batch.rewards),
         }
 
@@ -353,14 +358,17 @@ class EncoderState:
             ) * next_log_probs
         target = jax.lax.stop_gradient(target_q)
 
-        def loss_fn(params: Any) -> tuple[Array, tuple[Array, Array]]:
+        def loss_fn(params: Any) -> tuple[Array, tuple[Array, Array, Array]]:
             predicted = self._critic_values(params, batch.observations, batch.actions)
-            loss = jnp.mean(jnp.square(predicted - target[None, :]))
-            return loss, (jnp.mean(predicted), jnp.mean(target))
+            td_loss = jnp.mean(jnp.square(predicted - target[None, :]))
+            return td_loss, (jnp.mean(predicted), jnp.mean(target), td_loss)
 
-        (loss, (predicted_q, target_q_mean)), grads = jax.value_and_grad(
+        (loss, (predicted_q, target_q_mean, td_loss)), grads = jax.value_and_grad(
             loss_fn, has_aux=True
         )(self.critic_params)
+        td_grad_norm = _global_norm(
+            jax.grad(lambda p: loss_fn(p)[1][2])(self.critic_params)
+        )
         optimizer = optax.chain(
             optax.clip_by_global_norm(self.config.max_grad_norm),
             optax.adam(self.config.critic_learning_rate),
@@ -382,7 +390,7 @@ class EncoderState:
             steps=self.steps + 1,
         )
         predicted_q_mean = jnp.mean(predicted_q)
-        td_rmse = jnp.sqrt(loss)
+        td_rmse = jnp.sqrt(td_loss + 1e-8)
         q_scale = jnp.mean(jnp.abs(predicted_q)) + 1e-6
         return state, {
             "critic_loss": loss,
@@ -393,6 +401,7 @@ class EncoderState:
             "relative_td_rmse": td_rmse / q_scale,
             "q_gap_ratio": jnp.abs(target_q_mean - predicted_q_mean) / q_scale,
             "critic_grad_norm": _global_norm(grads),
+            "critic_td_grad_norm": td_grad_norm,
             "rewards": jnp.mean(batch.rewards),
             "bellman_mix": bellman_mix,
             "offline_next_value": jnp.mean(offline_next_value),

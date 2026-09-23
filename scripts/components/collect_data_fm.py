@@ -620,6 +620,7 @@ def run_async_collector(
             payload = {
                 "observations": onp.asarray(jax.device_get(transitions.obs)).reshape(-1, int(env.observation_size)),
                 "actions": onp.asarray(jax.device_get(transitions.action_info.env_action)).reshape(-1, int(env.action_size)),
+                "latents": onp.asarray(jax.device_get(transitions.action)).reshape(-1, int(env.action_size)),
                 "rewards": rewards,
                 "next_observations": onp.asarray(jax.device_get(transitions.next_obs)).reshape(-1, int(env.observation_size)),
                 "masks": discounts,

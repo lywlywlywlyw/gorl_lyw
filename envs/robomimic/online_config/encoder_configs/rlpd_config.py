@@ -29,7 +29,8 @@ class RLPDConfig:
     rlpd_max_grad_norm: float = 10.0
     # KL regularization weight in the encoder actor objective. Keep this at 1.0
     # to match the normal offline-to-online gap&190min sr=1 experiment.
-    rlpd_latent_kl_weight: float = 5#1.0
+    rlpd_latent_kl_weight: float = 0#5#1.0
+    rlpd_offline_actor_kl_weight: float = 0#5.0
     rlpd_normalize_observations: bool = True
     rlpd_apply_tanh_in_rollout: bool = False
     rlpd_rollout_steps_per_iteration: int = 8

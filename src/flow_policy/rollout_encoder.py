@@ -108,6 +108,7 @@ class EncoderRolloutActionInfo:
 
     policy_info: Any
     env_action: Array
+    latent: Array
 
     @property
     def log_prob(self) -> Array:
@@ -391,6 +392,7 @@ class BatchedRolloutStateEncoderFM:
                 action_info=EncoderRolloutActionInfo(
                     policy_info=z_info,
                     env_action=env_action,
+                    latent=z,
                 ),
                 reward=jnp.asarray(rewards, dtype=jnp.float32),
                 truncation=jnp.asarray(truncations, dtype=jnp.float32),

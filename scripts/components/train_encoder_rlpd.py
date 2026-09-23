@@ -57,6 +57,7 @@ def _make_runtime_env(config: dict):
 class ReplayBuffer:
     observations: np.ndarray
     actions: np.ndarray
+    latents: np.ndarray
     rewards: np.ndarray
     next_observations: np.ndarray
     masks: np.ndarray
@@ -69,6 +70,7 @@ class ReplayBuffer:
         return cls(
             observations=np.empty((capacity, obs_dim), dtype=np.float32),
             actions=np.empty((capacity, action_dim), dtype=np.float32),
+            latents=np.full((capacity, action_dim), np.nan, dtype=np.float32),
             rewards=np.empty((capacity,), dtype=np.float32),
             next_observations=np.empty((capacity, obs_dim), dtype=np.float32),
             masks=np.empty((capacity,), dtype=np.float32),
@@ -83,6 +85,7 @@ class ReplayBuffer:
             "actions": np.asarray(
                 jax.device_get(transitions.action_info.env_action)
             ).reshape(-1, self.actions.shape[-1]),
+            "latents": np.asarray(jax.device_get(transitions.action)).reshape(-1, self.latents.shape[-1]),
             "rewards": np.asarray(jax.device_get(transitions.reward)).reshape(-1),
             "next_observations": np.asarray(
                 jax.device_get(transitions.next_obs)
@@ -108,6 +111,7 @@ class ReplayBuffer:
             for key in (
                 "observations",
                 "actions",
+                "latents",
                 "rewards",
                 "next_observations",
                 "masks",
@@ -142,7 +146,9 @@ class ReplayBuffer:
                         f"Encoder replay buffer has no environment actions: {source}"
                     )
                 replay.actions = replay.env_actions
-            for obsolete in ("latents", "env_actions", "is_new"):
+            if not hasattr(replay, "latents"):
+                replay.latents = np.full_like(replay.actions, np.nan, dtype=np.float32)
+            for obsolete in ("env_actions", "is_new"):
                 if hasattr(replay, obsolete):
                     delattr(replay, obsolete)
             return replay
@@ -221,13 +227,14 @@ def _sample_mixed_batch(
         )
     }
     environment_actions: list[np.ndarray] = []
+    stored_latents: list[np.ndarray] = []
     if online_count:
         sampled = online.sample(rng, online_count)
         pieces["observations"].append(sampled["observations"])
-        # Always reconstruct z from the real (s, a) pair with Decoder_{n-1}.
-        # Even a freshly collected latent was produced before this optimizer
-        # update and must not bypass the fixed decoder coordinate transform.
+        # Replay stores the exact latent used to execute each transition.
+        # Older replay files contain NaN here and are handled by the inverse fallback below.
         environment_actions.append(sampled.get("actions", sampled.get("env_actions")))
+        stored_latents.append(sampled.get("latents", np.full_like(environment_actions[-1], np.nan)))
         for key in ("rewards", "next_observations", "masks"):
             pieces[key].append(sampled[key])
     if demo_count:
@@ -236,7 +243,9 @@ def _sample_mixed_batch(
         indices = rng.integers(0, len(demo["rewards"]), size=demo_count)
         demo_obs = demo["observations"][indices]
         pieces["observations"].append(demo_obs)
-        environment_actions.append(demo["env_actions"][indices])
+        demo_actions = demo["env_actions"][indices]
+        environment_actions.append(demo_actions)
+        stored_latents.append(np.full_like(demo_actions, np.nan, dtype=np.float32))
         for key in ("rewards", "next_observations", "masks"):
             pieces[key].append(demo[key][indices])
     observations = jnp.asarray(np.concatenate(pieces["observations"], axis=0))
@@ -246,8 +255,12 @@ def _sample_mixed_batch(
         if key != "actions"
     }
     batch["observations"] = observations
-    batch["actions"] = inverse_decoder_batch(
-        observations, jnp.asarray(np.concatenate(environment_actions, axis=0))
+    env_actions = np.concatenate(environment_actions, axis=0)
+    decoded_latents = inverse_decoder_batch(observations, jnp.asarray(env_actions))
+    stored = np.concatenate(stored_latents, axis=0).astype(np.float32)
+    valid = np.isfinite(stored).all(axis=-1)
+    batch["actions"] = jnp.where(
+        jnp.asarray(valid)[:, None], jnp.asarray(stored), decoded_latents
     )
     return encoder_rlpd.RLPDTransitionBatch(**batch)
 
@@ -280,14 +293,20 @@ def _sample_async_mixed_batch(
 
     pieces = {key: [] for key in ("observations", "actions", "rewards", "next_observations", "masks")}
     environment_actions: list[np.ndarray] = []
+    stored_latents: list[np.ndarray] = []
     for source, count in ((demo, demo_count), (replay, replay_count)):
         if count == 0:
             continue
         sampled = _sample_transition_arrays(source, count, rng)
         pieces["observations"].append(sampled["observations"])
-        # Deliberately reconstruct every latent, including fresh replay data.
-        # Thus no latent from a collector or an older stage is treated as GT.
-        environment_actions.append(sampled.get("actions", sampled.get("env_actions")))
+        # Replay latents are kept in their execution coordinates; demo samples
+        # have no execution latent and fall back to decoder inversion below.
+        actions = sampled.get("actions", sampled.get("env_actions"))
+        environment_actions.append(actions)
+        if "latents" in sampled:
+            stored_latents.append(sampled["latents"])
+        else:
+            stored_latents.append(np.full_like(actions, np.nan, dtype=np.float32))
         for key in ("rewards", "next_observations", "masks"):
             pieces[key].append(sampled[key])
     observations = jnp.asarray(np.concatenate(pieces["observations"], axis=0))
@@ -297,8 +316,12 @@ def _sample_async_mixed_batch(
         if key != "actions"
     }
     batch["observations"] = observations
-    batch["actions"] = inverse_decoder_batch(
-        observations, jnp.asarray(np.concatenate(environment_actions, axis=0))
+    env_actions = np.concatenate(environment_actions, axis=0)
+    decoded_latents = inverse_decoder_batch(observations, jnp.asarray(env_actions))
+    stored = np.concatenate(stored_latents, axis=0).astype(np.float32)
+    valid = np.isfinite(stored).all(axis=-1)
+    batch["actions"] = jnp.where(
+        jnp.asarray(valid)[:, None], jnp.asarray(stored), decoded_latents
     )
     return encoder_rlpd.RLPDTransitionBatch(**batch)
 
@@ -315,6 +338,7 @@ def _sample_async_encoder_batch(
     sources = [(latest_replay, latest_count), (historical_replay, history_count), (demo, demo_count)]
     pieces = {key: [] for key in ("observations", "actions", "rewards", "next_observations", "masks")}
     environment_actions = []
+    stored_latents = []
     for source, count in sources:
         if count <= 0:
             continue
@@ -322,13 +346,24 @@ def _sample_async_encoder_batch(
             raise ValueError("Encoder sampling source is empty.")
         sampled = _sample_transition_arrays(source, count, rng)
         pieces["observations"].append(sampled["observations"])
-        environment_actions.append(sampled.get("actions", sampled.get("env_actions")))
+        actions = sampled.get("actions", sampled.get("env_actions"))
+        environment_actions.append(actions)
+        if "latents" in sampled:
+            stored_latents.append(sampled["latents"])
+        else:
+            stored_latents.append(np.full_like(actions, np.nan, dtype=np.float32))
         for key in ("rewards", "next_observations", "masks"):
             pieces[key].append(sampled[key])
     observations = jnp.asarray(np.concatenate(pieces["observations"], axis=0))
     batch = {key: jnp.asarray(np.concatenate(values, axis=0)) for key, values in pieces.items() if key != "actions"}
     batch["observations"] = observations
-    batch["actions"] = inverse_decoder_batch(observations, jnp.asarray(np.concatenate(environment_actions, axis=0)))
+    env_actions = np.concatenate(environment_actions, axis=0)
+    decoded_latents = inverse_decoder_batch(observations, jnp.asarray(env_actions))
+    stored = np.concatenate(stored_latents, axis=0).astype(np.float32)
+    valid = np.isfinite(stored).all(axis=-1)
+    batch["actions"] = jnp.where(
+        jnp.asarray(valid)[:, None], jnp.asarray(stored), decoded_latents
+    )
     return encoder_rlpd.RLPDTransitionBatch(**batch)
 
 
@@ -634,7 +669,7 @@ def train_async_stage(
                 batch,
                 offline_actor_params,
                 offline_obs_stats,
-                5.0,
+                config["rlpd_offline_actor_kl_weight"],
             )
             latest_actor_metrics = dict(actor_metrics)
             latest_actor_step = online_encoder_updates + update + 1
@@ -682,7 +717,7 @@ def train_async_stage(
         "wall_time_seconds": time.time() - started,
         "offline_actor_params": offline_actor_params,
         "offline_obs_stats": offline_obs_stats,
-        "offline_actor_kl_weight": 5.0,
+        "offline_actor_kl_weight": config["rlpd_offline_actor_kl_weight"],
     })
     atomic_pickle_dump(checkpoint, output_checkpoint_path)
 
