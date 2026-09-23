@@ -29,11 +29,10 @@ class MeanFlowConfig:
     meanflow_guidance_scale: float = 2.0
     use_dispersive: bool = False
     meanflow_dispersive_loss_weight: float = 0.5
-    meanflow_bifm_loss_weight: float = 0.05
-    meanflow_warm_up_epoch: int = 0
+    meanflow_cycle_z_weight: float = 1.0
+    meanflow_cycle_a_weight: float = 1.0
     meanflow_dispersive_tau: float = 1.0
     meanflow_dispersive_chunk_size: int = 512
-    meanflow_use_lbifm: bool = False
     meanflow_feather_std: float = 0.0
     meanflow_latent_kl_weight: float = 1.0
 

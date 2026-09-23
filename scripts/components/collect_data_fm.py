@@ -23,7 +23,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from flow_policy import encoder_ppo, encoder_rlpd
 from flow_policy.decoder_fm import DecoderFMState
 from flow_policy.decoder_1step_fm_residualMLP import Decoder1StepFMState
-from flow_policy.config_utils import fill_unspecified_config_values
 from flow_policy.agent import EncoderFMAgent
 from flow_policy.rollout_encoder import (
     BatchedRolloutStateEncoderFM,
@@ -99,11 +98,6 @@ def _load_policy_pair(
     if decoder_type != config["decoder_type"]: raise ValueError("Policy checkpoint decoder type does not match pipeline type.")
     state_cls = Decoder1StepFMState if decoder_type == "meanflow" else DecoderFMState
     decoder_config = decoder_checkpoint["config"]
-    if decoder_type == "meanflow":
-        decoder_config = fill_unspecified_config_values(
-            decoder_config,
-            warm_up_epoch=config["meanflow_warm_up_epoch"],
-        )
     decoder_state = state_cls.init(jax.random.PRNGKey(config["seed"] + 1000), decoder_checkpoint["obs_dim"], decoder_checkpoint["action_dim"], decoder_config)
     with jdc.copy_and_mutate(decoder_state) as decoder_state:
         decoder_state.params, decoder_state.obs_stats = decoder_checkpoint["params"], decoder_checkpoint["obs_stats"]

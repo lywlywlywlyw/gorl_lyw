@@ -452,10 +452,17 @@ def make_decoder_eval_functions(decoder: Any, inverse_steps: int | None):
     def metrics(state, obs, actions):
         latents = inverse(state, obs, actions)
         reconstructed = forward_fm_batch(state, obs, latents)
+        generated_latents = jax.random.normal(
+            jax.random.PRNGKey(0), actions.shape
+        )
+        generated_actions = forward_fm_batch(state, obs, generated_latents)
+        recovered_latents = inverse(state, obs, generated_actions)
         latent_std = jnp.std(latents, axis=0)
         values = jnp.asarray([
             jnp.mean(jnp.square(reconstructed - actions)),
             jnp.mean(jnp.abs(reconstructed - actions)),
+            jnp.mean(jnp.square(recovered_latents - generated_latents)),
+            jnp.sqrt(jnp.mean(jnp.square(recovered_latents - generated_latents)) + 1e-8),
             jnp.mean(jnp.abs(jnp.mean(latents, axis=0))),
             jnp.mean(latent_std),
             jnp.mean(jnp.abs(latent_std - 1.0)),
@@ -501,9 +508,17 @@ def decoder_metrics(
     batch_actions = actions[jnp.asarray(indices)]
     values, latents = metrics_fn(decoder, obs, batch_actions)
     values, latents = jax.device_get((values, latents))
-    names = ("decoder/cycle_action_mse", "decoder/cycle_action_mae",
-             "latent/mean_abs", "latent/std_mean", "latent/std_error",
-             "latent/norm_mean", "latent/max_abs")
+    names = (
+        "decoder/inverse_action_mse",
+        "decoder/inverse_action_mae",
+        "decoder/cycle_z_mse",
+        "decoder/cycle_z_rmse",
+        "latent/mean_abs",
+        "latent/std_mean",
+        "latent/std_error",
+        "latent/norm_mean",
+        "latent/max_abs",
+    )
     return dict(zip(names, np.asarray(values).tolist())), np.asarray(latents)
 
 
@@ -1191,11 +1206,10 @@ def main(config: ConfigView) -> None:
                 guidance_scale=config.meanflow_guidance_scale,
                 use_dispersive=config.use_dispersive,
                 dispersive_loss_weight=config.meanflow_dispersive_loss_weight,
-                bifm_loss_weight=config.meanflow_bifm_loss_weight,
-                warm_up_epoch=config.meanflow_warm_up_epoch,
+                cycle_z_weight=config.meanflow_cycle_z_weight,
+                cycle_a_weight=config.meanflow_cycle_a_weight,
                 dispersive_tau=config.meanflow_dispersive_tau,
                 dispersive_chunk_size=config.meanflow_dispersive_chunk_size,
-                use_lbifm=config.meanflow_use_lbifm,
                 feather_std=config.meanflow_feather_std,
                 latent_kl_weight=config.meanflow_latent_kl_weight,
             )

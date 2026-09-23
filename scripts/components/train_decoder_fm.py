@@ -17,7 +17,6 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from flow_policy.decoder_fm import DecoderFMConfig, DecoderFMState
 from flow_policy.decoder_1step_fm_residualMLP import Decoder1StepFMConfig, Decoder1StepFMState
-from flow_policy.config_utils import fill_unspecified_config_values
 from envs.robomimic.online_config.training_config import TrainingConfig
 from envs.robomimic.online_config.env_config import EnvConfig
 try:
@@ -83,11 +82,6 @@ def train_async_stage(
         raise ValueError("replay action dimension does not match decoder.")
 
     decoder_config = previous["config"]
-    if decoder_type == "meanflow":
-        decoder_config = fill_unspecified_config_values(
-            decoder_config,
-            warm_up_epoch=config["meanflow_warm_up_epoch"],
-        )
     state_cls = Decoder1StepFMState if decoder_type == "meanflow" else DecoderFMState
     expected_config = Decoder1StepFMConfig if decoder_type == "meanflow" else DecoderFMConfig
     if not isinstance(decoder_config, expected_config):

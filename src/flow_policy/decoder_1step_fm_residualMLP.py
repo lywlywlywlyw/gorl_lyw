@@ -160,11 +160,10 @@ class Decoder1StepFMConfig:
     guidance_scale: float | None = None
     use_dispersive: jdc.Static[bool | None] = None
     dispersive_loss_weight: float | None = None
-    bifm_loss_weight: float | None = None
-    warm_up_epoch: jdc.Static[int | None] = None
+    cycle_z_weight: float | None = None
+    cycle_a_weight: float | None = None
     dispersive_tau: float | None = None
     dispersive_chunk_size: jdc.Static[int | None] = None
-    use_lbifm: jdc.Static[bool | None] = None
     feather_std: float | None = None
     latent_kl_weight: float | None = None
 
@@ -537,21 +536,11 @@ class Decoder1StepFMState:
         r: Array,
         params: Any | None = None
     ) -> tuple[Array, Array, Array]:
-        loss, meanflow_loss, dis_loss, _, _ = self._compute_training_losses(
+        loss, metrics = self._compute_training_losses(
             epoch, obs_norm, action, eps, t, r, params=params
         )
-        return loss, meanflow_loss, dis_loss
+        return loss, metrics["meanflow_loss"], metrics["dis_loss"]
 
-    def compute_warm_up_bifm_weight(self, epoch):
-        warm_up_epoch = self.config.warm_up_epoch
-        # 使用 lax.cond 进行条件分支，两个分支都必须是函数
-        weight = jax.lax.cond(
-            epoch < warm_up_epoch,
-            lambda: 0.0, 
-            lambda: self.config.bifm_loss_weight                    
-        )
-        return weight
-    
     def _compute_training_losses(
         self,
         epoch,
@@ -561,10 +550,9 @@ class Decoder1StepFMState:
         t: Array,
         r: Array,
         params: Any | None = None,
-    ) -> tuple[Array, Array, Array, Array, Array]:
+    ) -> tuple[Array, dict[str, Array]]:
         params = self.params if params is None else params
         x_t = t * eps + (1.0 - t) * action
-        x_r = r * eps + (1.0 - r) * action
         v = eps - action
 
         def model_fn(
@@ -607,20 +595,40 @@ class Decoder1StepFMState:
             - 1.0
             - 2.0 * jnp.log(latent_std)
         )
-        bifm_loss = jnp.zeros(())
-        if self.config.use_lbifm:
-            backward_u, _ = model_fn(x_r, r, t)
-            nonzero_interval = jnp.squeeze(t != r, axis=-1)
-            bifm_loss = self.adaptive_l2_loss(
-                u + backward_u, sample_mask=nonzero_interval
-            )
+        # Endpoint cycle losses use the same decoder in both directions.
+        # Keep gradients through both calls and through each intermediate
+        # endpoint so the shared map is trained to be self-consistent.
+        z = eps
+        generated_action = z - model_fn(
+            z, jnp.ones_like(t), jnp.zeros_like(t)
+        )[0]
+        reconstructed_z = generated_action + model_fn(
+            generated_action, jnp.zeros_like(t), jnp.ones_like(t)
+        )[0]
+        inverse_latent = action + model_fn(
+            action, jnp.zeros_like(t), jnp.ones_like(t)
+        )[0]
+        reconstructed_action = inverse_latent - model_fn(
+            inverse_latent, jnp.ones_like(t), jnp.zeros_like(t)
+        )[0]
+        cycle_z_loss = jnp.mean(jnp.square(reconstructed_z - z))
+        cycle_a_loss = jnp.mean(jnp.square(reconstructed_action - action))
         loss = (
             meanflow_loss
             + self.config.dispersive_loss_weight * dis_loss
-            + self.compute_warm_up_bifm_weight(epoch) * bifm_loss
             + self.config.latent_kl_weight * prior_kl
+            + self.config.cycle_z_weight * cycle_z_loss
+            + self.config.cycle_a_weight * cycle_a_loss
         )
-        return loss, meanflow_loss, dis_loss, bifm_loss, prior_kl
+        return loss, {
+            "meanflow_loss": meanflow_loss,
+            "dis_loss": dis_loss,
+            "latent_prior_kl": prior_kl,
+            "cycle_z_loss": cycle_z_loss,
+            "cycle_a_loss": cycle_a_loss,
+            "cycle_z_rmse": jnp.sqrt(cycle_z_loss + 1e-8),
+            "cycle_a_rmse": jnp.sqrt(cycle_a_loss + 1e-8),
+        }
 
     @jax.jit
     def train_step(
@@ -639,10 +647,8 @@ class Decoder1StepFMState:
         t, r = self.sample_t_r(prng_tr, batch_size)
 
         def loss_fn(params: Any):
-            loss, meanflow_loss, dis_loss, bifm_loss, prior_kl = (
-                self._compute_training_losses(
-                    epoch, obs_norm, batch_actions, eps, t, r, params=params
-                )
+            loss, decoder_metrics = self._compute_training_losses(
+                epoch, obs_norm, batch_actions, eps, t, r, params=params
             )
             if anchor_z is not None:
                 if anchor_actions is None or anchor_prng is None:
@@ -675,10 +681,7 @@ class Decoder1StepFMState:
                 "loss": loss,
                 "anchor_loss": anchor_loss,
                 "inverse_anchor_loss": inverse_anchor_loss,
-                "meanflow_loss": meanflow_loss,
-                "dis_loss": dis_loss,
-                "bifm_loss": bifm_loss,
-                "latent_prior_kl": prior_kl,
+                **decoder_metrics,
                 "t_mean": jnp.mean(t),
                 "r_mean": jnp.mean(r),
             }
