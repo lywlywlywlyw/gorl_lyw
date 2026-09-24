@@ -45,12 +45,30 @@ def _runtime_env_config(environment: str):
         raise ValueError("environment must be 'robomimic' or 'd4rl'.")
     return EnvConfig
 
+_RUNTIME_ENV_CACHE: dict[tuple, Any] = {}
+_INVERSE_DECODER_CACHE: dict[tuple, Any] = {}
+_DECODER_STATE_CACHE: dict[tuple, Any] = {}
+_DEMO_CACHE: dict[tuple, dict[str, np.ndarray]] = {}
+
+
 def _make_runtime_env(config: dict):
-    if config.get("environment", "robomimic") == "d4rl":
-        from envs.d4rl.D4RLEnv import D4RLEnv
-        return D4RLEnv(dataset_path=config.get("dataset_path"), reward_shaping=config["dense_reward"])
-    from envs.robomimic.RobomimicEnv import RobomimicEnv
-    return RobomimicEnv(dataset_path=config["dataset_path"], reward_shaping=config["dense_reward"])
+    key = (
+        config.get("environment", "robomimic"),
+        config.get("dataset_path"),
+        bool(config["dense_reward"]),
+    )
+    if key not in _RUNTIME_ENV_CACHE:
+        if key[0] == "d4rl":
+            from envs.d4rl.D4RLEnv import D4RLEnv
+            _RUNTIME_ENV_CACHE[key] = D4RLEnv(
+                dataset_path=key[1], reward_shaping=key[2]
+            )
+        else:
+            from envs.robomimic.RobomimicEnv import RobomimicEnv
+            _RUNTIME_ENV_CACHE[key] = RobomimicEnv(
+                dataset_path=key[1], reward_shaping=key[2]
+            )
+    return _RUNTIME_ENV_CACHE[key]
 
 
 @dataclass
@@ -159,6 +177,11 @@ def _load_encoder_demo_buffer(path: str | None, obs_dim: int, action_dim: int):
     if path is None:
         return None
     dataset_path = Path(path).expanduser()
+    stat = dataset_path.stat()
+    cache_key = (str(dataset_path.resolve()), int(stat.st_mtime_ns), int(stat.st_size), int(obs_dim), int(action_dim))
+    cached = _DEMO_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     with open(dataset_path, "rb") as file:
         data = pickle.load(file)
     if not isinstance(data, dict):
@@ -183,24 +206,57 @@ def _load_encoder_demo_buffer(path: str | None, obs_dim: int, action_dim: int):
     size = len(arrays["rewards"])
     if not all(len(value) == size for value in arrays.values()):
         raise ValueError("Offline latent transition arrays have unequal lengths.")
+    _DEMO_CACHE[cache_key] = arrays
     return arrays
 
 
 def _make_inverse_decoder_batch(
     decoder: DecoderFMState | Decoder1StepFMState,
 ) -> Any:
-    """Compile the fixed stage decoder's inverse exactly once."""
-    if isinstance(decoder, Decoder1StepFMState):
-        return jax.jit(
-            lambda observations, actions: decoder.inverse_fm_batch(
-                observations, actions
+    """Reuse one JIT executable while passing decoder parameters explicitly."""
+    key = (type(decoder).__name__, repr(decoder.config))
+    if key not in _INVERSE_DECODER_CACHE:
+        if isinstance(decoder, Decoder1StepFMState):
+            _INVERSE_DECODER_CACHE[key] = jax.jit(
+                lambda params, observations, actions: decoder.inverse_fm_batch(
+                    observations, actions, params=params
+                )
             )
-        )
-    return jax.jit(
-        lambda observations, actions: decoder.inverse_fm_batch(
-            observations, actions, decoder.config.flow_steps
-        )
+        else:
+            _INVERSE_DECODER_CACHE[key] = jax.jit(
+                lambda params, observations, actions: decoder.inverse_fm_batch(
+                    observations, actions, decoder.config.flow_steps, params=params
+                )
+            )
+    compiled = _INVERSE_DECODER_CACHE[key]
+    return lambda observations, actions: compiled(decoder.params, observations, actions)
+
+
+def _load_frozen_decoder_state(
+    checkpoint_path: str | Path,
+    decoder_type: str,
+    seed: int,
+) -> DecoderFMState | Decoder1StepFMState:
+    """Load a frozen decoder once; version aliases are hard links when possible."""
+    source = Path(checkpoint_path).expanduser()
+    stat = source.stat()
+    key = (int(stat.st_dev), int(stat.st_ino), decoder_type)
+    cached = _DECODER_STATE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    with source.open("rb") as file:
+        checkpoint = pickle.load(file)
+    checkpoint_type = checkpoint.get("decoder_type", "flow_matching")
+    if checkpoint_type != decoder_type:
+        raise ValueError("Fixed decoder type does not match pipeline type.")
+    state_cls = Decoder1StepFMState if decoder_type == "meanflow" else DecoderFMState
+    state = state_cls.init(
+        jax.random.PRNGKey(seed), checkpoint["obs_dim"], checkpoint["action_dim"], checkpoint["config"]
     )
+    with jdc.copy_and_mutate(state) as state:
+        state.params, state.obs_stats = checkpoint["params"], checkpoint["obs_stats"]
+    _DECODER_STATE_CACHE[key] = state
+    return state
 
 
 def _sample_mixed_batch(
@@ -256,12 +312,18 @@ def _sample_mixed_batch(
     }
     batch["observations"] = observations
     env_actions = np.concatenate(environment_actions, axis=0)
-    decoded_latents = inverse_decoder_batch(observations, jnp.asarray(env_actions))
     stored = np.concatenate(stored_latents, axis=0).astype(np.float32)
     valid = np.isfinite(stored).all(axis=-1)
-    batch["actions"] = jnp.where(
-        jnp.asarray(valid)[:, None], jnp.asarray(stored), decoded_latents
-    )
+    decoded_latents = np.zeros_like(stored)
+    missing = np.flatnonzero(~valid)
+    if len(missing):
+        decoded_latents[missing] = np.asarray(jax.device_get(
+            inverse_decoder_batch(
+                observations[jnp.asarray(missing)],
+                jnp.asarray(env_actions[missing]),
+            )
+        ))
+    batch["actions"] = jnp.asarray(np.where(valid[:, None], stored, decoded_latents))
     return encoder_rlpd.RLPDTransitionBatch(**batch)
 
 
@@ -317,54 +379,35 @@ def _sample_async_mixed_batch(
     }
     batch["observations"] = observations
     env_actions = np.concatenate(environment_actions, axis=0)
-    decoded_latents = inverse_decoder_batch(observations, jnp.asarray(env_actions))
     stored = np.concatenate(stored_latents, axis=0).astype(np.float32)
     valid = np.isfinite(stored).all(axis=-1)
-    batch["actions"] = jnp.where(
-        jnp.asarray(valid)[:, None], jnp.asarray(stored), decoded_latents
-    )
+    decoded_latents = np.zeros_like(stored)
+    missing = np.flatnonzero(~valid)
+    if len(missing):
+        decoded_latents[missing] = np.asarray(jax.device_get(
+            inverse_decoder_batch(
+                observations[jnp.asarray(missing)],
+                jnp.asarray(env_actions[missing]),
+            )
+        ))
+    batch["actions"] = jnp.asarray(np.where(valid[:, None], stored, decoded_latents))
     return encoder_rlpd.RLPDTransitionBatch(**batch)
 
 
 def _sample_async_encoder_batch(
-    latest_replay: dict[str, np.ndarray], historical_replay: dict[str, np.ndarray],
-    demo: dict[str, np.ndarray], batch_size: int, rng: np.random.Generator,
+    replay: dict[str, np.ndarray], demo: dict[str, np.ndarray], batch_size: int,
+    rng: np.random.Generator,
     inverse_decoder_batch: Any,
 ) -> encoder_rlpd.RLPDTransitionBatch:
-    """50% previous-policy data, 25% online history, 25% demonstrations."""
-    latest_count = batch_size // 4
-    history_count = batch_size // 4
-    demo_count = batch_size - latest_count - history_count
-    sources = [(latest_replay, latest_count), (historical_replay, history_count), (demo, demo_count)]
-    pieces = {key: [] for key in ("observations", "actions", "rewards", "next_observations", "masks")}
-    environment_actions = []
-    stored_latents = []
-    for source, count in sources:
-        if count <= 0:
-            continue
-        if len(source["rewards"]) == 0:
-            raise ValueError("Encoder sampling source is empty.")
-        sampled = _sample_transition_arrays(source, count, rng)
-        pieces["observations"].append(sampled["observations"])
-        actions = sampled.get("actions", sampled.get("env_actions"))
-        environment_actions.append(actions)
-        if "latents" in sampled:
-            stored_latents.append(sampled["latents"])
-        else:
-            stored_latents.append(np.full_like(actions, np.nan, dtype=np.float32))
-        for key in ("rewards", "next_observations", "masks"):
-            pieces[key].append(sampled[key])
-    observations = jnp.asarray(np.concatenate(pieces["observations"], axis=0))
-    batch = {key: jnp.asarray(np.concatenate(values, axis=0)) for key, values in pieces.items() if key != "actions"}
-    batch["observations"] = observations
-    env_actions = np.concatenate(environment_actions, axis=0)
-    decoded_latents = inverse_decoder_batch(observations, jnp.asarray(env_actions))
-    stored = np.concatenate(stored_latents, axis=0).astype(np.float32)
-    valid = np.isfinite(stored).all(axis=-1)
-    batch["actions"] = jnp.where(
-        jnp.asarray(valid)[:, None], jnp.asarray(stored), decoded_latents
+    """Sample 50% from the unified online replay and 50% from demonstrations."""
+    return _sample_async_mixed_batch(
+        replay,
+        demo,
+        demo_ratio=0.5,
+        batch_size=batch_size,
+        rng=rng,
+        inverse_decoder_batch=inverse_decoder_batch,
     )
-    return encoder_rlpd.RLPDTransitionBatch(**batch)
 
 
 def _checkpoint(
@@ -408,8 +451,6 @@ def train_async_stage(
     version: int,
     train_env_steps: int,
     train_updates: int | None = None,
-    latest_replay_snapshot_path: str | None = None,
-    historical_replay_snapshot_path: str | None = None,
     online_replay_size: int | None = None,
     demo_ratio: float = 0.5,
     replay_ratio: float = 0.5,
@@ -424,6 +465,7 @@ def train_async_stage(
     iql_operator_transition_updates: int = 2000,
     environment: str = "robomimic",
     dataset_path: str | None = None,
+    freeze_decoder: bool = True,
 ) -> None:
     """Train one immutable Encoder_n stage without collecting environment data.
 
@@ -547,21 +589,20 @@ def train_async_stage(
             if key in previous:
                 setattr(encoder_state, name, previous[key])
 
-    with Path(decoder_checkpoint_path).expanduser().open("rb") as file:
-        decoder_checkpoint = pickle.load(file)
-    checkpoint_type = decoder_checkpoint.get("decoder_type", "flow_matching")
-    if checkpoint_type != decoder_type: raise ValueError("Fixed decoder type does not match pipeline type.")
-    state_cls = Decoder1StepFMState if decoder_type == "meanflow" else DecoderFMState
-    decoder_config = decoder_checkpoint["config"]
-    decoder_state = state_cls.init(jax.random.PRNGKey(config["seed"] + 1000 + version), decoder_checkpoint["obs_dim"], decoder_checkpoint["action_dim"], decoder_config)
-    with jdc.copy_and_mutate(decoder_state) as decoder_state:
-        decoder_state.params, decoder_state.obs_stats = decoder_checkpoint["params"], decoder_checkpoint["obs_stats"]
+    decoder_state = _load_frozen_decoder_state(
+        decoder_checkpoint_path, decoder_type, int(config["seed"] + 1000)
+    )
     inverse_decoder_batch = _make_inverse_decoder_batch(decoder_state)
 
     demo = _load_encoder_demo_buffer(demo_buffer_path, int(env.observation_size), int(env.action_size))
+    if freeze_decoder and demo is not None:
+        demo["latents"] = np.asarray(jax.device_get(
+            inverse_decoder_batch(
+                jnp.asarray(demo["observations"]),
+                jnp.asarray(demo["env_actions"]),
+            )
+        ), dtype=np.float32)
     replay = load_transition_data(replay_snapshot_path)
-    latest_replay = load_transition_data(latest_replay_snapshot_path) if latest_replay_snapshot_path else replay
-    historical_replay = load_transition_data(historical_replay_snapshot_path) if historical_replay_snapshot_path else replay
     if demo["observations"].shape[-1] != int(env.observation_size):
         raise ValueError("demo_buffer observation dimension does not match env.")
     if replay["observations"].shape[-1] != int(env.observation_size):
@@ -602,8 +643,8 @@ def train_async_stage(
                 )
             else:
                 batch = _sample_async_encoder_batch(
-                    latest_replay, historical_replay, demo,
-                    config["rlpd_batch_size"], rng, inverse_decoder_batch,
+                    replay, demo, config["rlpd_batch_size"], rng,
+                    inverse_decoder_batch,
                 )
             if bridge_update < iql_bellman_bridge_updates:
                 bellman_mix = 0.0
@@ -647,8 +688,8 @@ def train_async_stage(
             )
         else:
             batch = _sample_async_encoder_batch(
-                latest_replay, historical_replay, demo,
-                config["rlpd_batch_size"], rng, inverse_decoder_batch,
+                replay, demo, config["rlpd_batch_size"], rng,
+                inverse_decoder_batch,
             )
         if update == 0:
             # Record the checkpoint critic before the first online critic
@@ -713,8 +754,6 @@ def train_async_stage(
         "online_encoder_updates": online_encoder_updates + updates,
         "demo_ratio": demo_ratio,
         "replay_ratio": replay_ratio,
-        "latest_replay_ratio": 0.25,
-        "historical_replay_ratio": 0.25,
         "demonstration_ratio": 0.50,
         "inherited_optimizer_state": inherit_optimizer_state,
         "wall_time_seconds": time.time() - started,

@@ -65,8 +65,8 @@ def _global_norm(tree: Any) -> Array:
 @jdc.pytree_dataclass
 class EncoderState:
     actor_params: networks.MlpWeights
-    critic_params: tuple[networks.MlpWeights, ...]
-    target_critic_params: tuple[networks.MlpWeights, ...]
+    critic_params: networks.CriticEnsembleParams
+    target_critic_params: networks.CriticEnsembleParams
     log_temperature: Array
     actor_opt_state: optax.OptState
     critic_opt_state: optax.OptState
@@ -96,9 +96,8 @@ class EncoderState:
             obs_dim + config.z_dim,
         ) + (config.hidden_size,) * config.hidden_layers + (1,)
         actor_params = networks.gaussian_policy_init(actor_key, actor_dims)
-        critic_params = tuple(
-            networks.mlp_init(key, critic_dims, use_layer_norm=True)
-            for key in jax.random.split(critic_key, config.critic_ensemble_size)
+        critic_params = networks.critic_ensemble_init(
+            critic_key, critic_dims, config.critic_ensemble_size
         )
         actor_optimizer = optax.chain(
             optax.clip_by_global_norm(config.max_grad_norm),
@@ -167,9 +166,7 @@ class EncoderState:
 
     def _critic_values(self, params: Any, obs: Array, actions: Array) -> Array:
         obs_norm = self._normalize_obs(obs)
-        return jnp.stack(
-            [networks.q_mlp_fwd(member, obs_norm, actions) for member in params]
-        )
+        return networks.q_ensemble_values(params, obs_norm, actions)
 
     @property
     def temperature(self) -> Array:
@@ -202,11 +199,11 @@ class EncoderState:
             subset_size = min(
                 self.config.critic_subsample_size, self.config.critic_ensemble_size
             )
-            subset = jax.random.choice(
+            subset = jax.random.randint(
                 subset_key,
-                self.config.critic_ensemble_size,
                 shape=(subset_size,),
-                replace=False,
+                minval=0,
+                maxval=self.config.critic_ensemble_size,
             )
             target_next_qs = target_next_qs[subset]
         target_q = (
@@ -242,11 +239,11 @@ class EncoderState:
             subset_size = min(
                 self.config.critic_subsample_size, self.config.critic_ensemble_size
             )
-            subset = jax.random.choice(
+            subset = jax.random.randint(
                 subset_key,
-                self.config.critic_ensemble_size,
                 shape=(subset_size,),
-                replace=False,
+                minval=0,
+                maxval=self.config.critic_ensemble_size,
             )
             # target_qs = jnp.min(target_qs[subset], axis=0)
             target_next_qs = target_next_qs[subset]
@@ -328,11 +325,11 @@ class EncoderState:
             subset_size = min(
                 self.config.critic_subsample_size, self.config.critic_ensemble_size
             )
-            subset = jax.random.choice(
+            subset = jax.random.randint(
                 subset_key,
-                self.config.critic_ensemble_size,
                 shape=(subset_size,),
-                replace=False,
+                minval=0,
+                maxval=self.config.critic_ensemble_size,
             )
             target_next_qs = target_next_qs[subset]
         online_next_value = jnp.min(target_next_qs, axis=0)

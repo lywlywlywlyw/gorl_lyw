@@ -558,19 +558,16 @@ def make_iql_update(
         latent_actions,
         critic_subset_key,
     ):
-        target_qs = jnp.stack([
-            networks.q_mlp_fwd(member, obs, latent_actions)
-            for member in target_critic_params
-        ])
+        target_qs = networks.q_ensemble_values(target_critic_params, obs, latent_actions)
         subset_size = min(
             int(config.rlpd_critic_subsample_size),
-            len(target_critic_params),
+            len(target_critic_params.backbones),
         )
-        subset = jax.random.choice(
+        subset = jax.random.randint(
             critic_subset_key,
-            len(target_critic_params),
             shape=(subset_size,),
-            replace=False,
+            minval=0,
+            maxval=len(target_critic_params.backbones),
         )
         target_q = jnp.min(target_qs[subset], axis=0)
 
@@ -621,10 +618,7 @@ def make_iql_update(
         bellman_target = rewards + config.discount * masks * next_value
 
         def critic_loss_fn(params):
-            predicted = jnp.stack([
-                networks.q_mlp_fwd(member, obs, latent_actions)
-                for member in params
-            ])
+            predicted = networks.q_ensemble_values(params, obs, latent_actions)
             loss = jnp.mean(jnp.square(predicted - bellman_target[None, :]))
             return loss, predicted
 
@@ -689,21 +683,12 @@ def make_iql_alignment_update(
         )
 
         def q_mean_single(params, observation, latent):
-            values = jnp.stack([
-                networks.q_mlp_fwd(member, observation, latent)
-                for member in params
-            ])
+            values = networks.q_ensemble_values(params, observation, latent)
             return jnp.mean(values, axis=0)
 
         def critic_loss_fn(params):
-            predicted = jnp.stack([
-                networks.q_mlp_fwd(member, obs, latent_actions)
-                for member in params
-            ])
-            reference = jnp.stack([
-                networks.q_mlp_fwd(member, obs, latent_actions)
-                for member in q0_params
-            ])
+            predicted = networks.q_ensemble_values(params, obs, latent_actions)
+            reference = networks.q_ensemble_values(q0_params, obs, latent_actions)
             current_q_grad = jax.vmap(
                 jax.grad(q_mean_single, argnums=2), in_axes=(None, 0, 0)
             )(params, obs, latent_actions)
@@ -717,10 +702,7 @@ def make_iql_alignment_update(
             critic_grads, critic_opt_state, critic_params
         )
         critic_params = optax.apply_updates(critic_params, critic_updates)
-        after = jnp.stack([
-            networks.q_mlp_fwd(member, obs, latent_actions)
-            for member in critic_params
-        ])
+        after = networks.q_ensemble_values(critic_params, obs, latent_actions)
         reference_mean = jnp.mean(reference, axis=0)
         q_abs_drift = jnp.mean(jnp.abs(after - reference))
         q_relative_drift = q_abs_drift / (
@@ -757,10 +739,7 @@ def _iql_validation_kernel(
     actor_params, critic_params, value_params, target_critic_params,
     obs, next_obs, latents, rewards, masks,
 ):
-    target_qs = jnp.stack([
-        networks.q_mlp_fwd(member, obs, latents)
-        for member in target_critic_params
-    ])
+    target_qs = networks.q_ensemble_values(target_critic_params, obs, latents)
     target_q = jnp.min(target_qs, axis=0)
     distribution = networks.gaussian_policy_fwd(actor_params, obs)
     actor_nll = -jnp.mean(jnp.sum(distribution.log_prob(latents), axis=-1))
@@ -768,10 +747,7 @@ def _iql_validation_kernel(
     value_loss = jnp.mean(expectile_loss(target_q - value, expectile))
     next_value = networks.value_mlp_fwd(value_params, next_obs)
     bellman_target = rewards + discount * masks * next_value
-    predicted_qs = jnp.stack([
-        networks.q_mlp_fwd(member, obs, latents)
-        for member in critic_params
-    ])
+    predicted_qs = networks.q_ensemble_values(critic_params, obs, latents)
     td_loss = jnp.mean(jnp.square(predicted_qs - bellman_target[None, :]))
     q_scale = jnp.maximum(jnp.mean(jnp.abs(bellman_target)), 1.0)
     value_scale = jnp.maximum(jnp.mean(jnp.abs(target_q)), 1.0)
@@ -847,14 +823,8 @@ def _policy_metrics_kernel(
     distribution = networks.gaussian_policy_fwd(actor_params, obs_norm)
     policy_z = distribution.loc
     policy_actions = forward_fm_batch(decoder, obs_raw, policy_z)
-    q_policy_all = jnp.stack([
-        networks.q_mlp_fwd(member, obs_norm, policy_z)
-        for member in critic_params
-    ])
-    q_data_all = jnp.stack([
-        networks.q_mlp_fwd(member, obs_norm, targets)
-        for member in critic_params
-    ])
+    q_policy_all = networks.q_ensemble_values(critic_params, obs_norm, policy_z)
+    q_data_all = networks.q_ensemble_values(critic_params, obs_norm, targets)
     q_policy = jnp.min(q_policy_all, axis=0)
     q_data = jnp.min(q_data_all, axis=0)
     value = networks.value_mlp_fwd(value_params, obs_norm)
@@ -1033,10 +1003,10 @@ def save_offline_checkpoint(
 ) -> None:
     obs_dim = int(decoder.obs_stats.mean.shape[-1])
     action_dim = int(decoder.action_dim if hasattr(decoder, "action_dim") else decoder.params[-1][0].shape[-1])
-    if len(critic_params) != rlpd_config.critic_ensemble_size:
+    if rlpd_config.critic_ensemble_size != len(critic_params.backbones):
         raise ValueError(
             "Offline critic ensemble size does not match online RLPD config: "
-            f"{len(critic_params)} != {rlpd_config.critic_ensemble_size}."
+            f"{len(critic_params.backbones)} != {rlpd_config.critic_ensemble_size}."
         )
     checkpoint = {
         "checkpoint_format": "gorl_offline_fm_rlpd",
@@ -1078,15 +1048,15 @@ def save_offline_checkpoint(
         "offline_config": dict(config),
         "iql_critic_params": critic_params,
         # Preserve twin-Q aliases for older analysis utilities.
-        "q1_params": critic_params[0],
-        "q2_params": critic_params[1],
+        "q1_params": critic_params.backbones[0],
+        "q2_params": critic_params.backbones[1],
         "value_params": value_params,
         "actor_opt_state": actor_opt_state,
         "critic_opt_state": critic_opt_state,
         "value_opt_state": value_opt_state,
         "target_iql_critic_params": target_critic_params,
-        "target_q1_params": target_critic_params[0],
-        "target_q2_params": target_critic_params[1],
+        "target_q1_params": target_critic_params.backbones[0],
+        "target_q2_params": target_critic_params.backbones[1],
         "numpy_rng_state": rng.bit_generator.state,
         "jax_key": key,
     }
@@ -1269,11 +1239,8 @@ def main(config: ConfigView) -> None:
             *((rlpd_config.hidden_size,) * rlpd_config.hidden_layers),
             1,
         )
-        critic_params = tuple(
-            networks.mlp_init(member_key, q_dims, use_layer_norm=True)
-            for member_key in jax.random.split(
-                critic_key, rlpd_config.critic_ensemble_size
-            )
+        critic_params = networks.critic_ensemble_init(
+            critic_key, q_dims, rlpd_config.critic_ensemble_size
         )
         resume_encoder = (
             resume_checkpoint is not None
@@ -1289,7 +1256,7 @@ def main(config: ConfigView) -> None:
                     "SERL-style critic ensemble and cannot resume this architecture."
                 )
             critic_params = resume_checkpoint["iql_critic_params"]
-            if len(critic_params) != rlpd_config.critic_ensemble_size:
+            if rlpd_config.critic_ensemble_size != len(critic_params.backbones):
                 raise ValueError("Resume checkpoint critic ensemble size mismatch.")
             encoder_obs_stats = resume_checkpoint.get(
                 "iql_z_obs_stats", encoder_obs_stats

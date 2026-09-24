@@ -32,7 +32,7 @@ class TrainingConfig:
     wandb_mode: str = "online"
     wandb_group: str | None = None
     wandb_tags: tuple[str, ...] = ("gorl", "fm", "robomimic")
-    wandb_video_interval_evals: int = 1
+    wandb_video_interval_evals: int = 0
     wandb_video_fps: int = 20
     wandb_video_width: int = 256
     wandb_video_height: int = 256

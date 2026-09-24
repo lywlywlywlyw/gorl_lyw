@@ -700,26 +700,31 @@ def run_async_evaluator(
         int(config["eval_num_envs"]),
         terminate_on_success=config["terminate_on_success"],
     )
-    video_interval = max(1, int(config["wandb_video_interval_evals"]))
+    video_interval = int(config["wandb_video_interval_evals"])
+    eval_interval = max(1, int(config.get("eval_interval", 1)))
     try:
         # Waiting for an explicit version, rather than latest_policy(), ensures
         # that a quickly advancing trainer cannot skip evaluations.
         version = 0
         while not stop.exists():
+            if version % eval_interval != 0:
+                version += 1
+                continue
             encoder_path, decoder_path = manager.wait_policy(
                 version, poll_seconds, stop
             )
             agent, apply_tanh = _load_policy_pair(
                 encoder_path, decoder_path, env, config
             )
-            record_video = (version + 1) % video_interval == 0
             metrics = _record_policy_evaluation(
                 agent,
                 config,
                 version,
                 (
                     Path(evaluation_dir) / f"policy_{version:04d}.mp4"
-                    if record_video and evaluation_dir is not None
+                    if video_interval > 0
+                    and (version // eval_interval + 1) % video_interval == 0
+                    and evaluation_dir is not None
                     else None
                 ),
                 apply_tanh,

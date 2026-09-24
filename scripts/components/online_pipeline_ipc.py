@@ -23,6 +23,8 @@ from typing import Any, Iterable
 import numpy as np
 
 
+_TRANSITION_CACHE: dict[tuple[str, int, int], dict[str, np.ndarray]] = {}
+
 TRANSITION_KEYS = (
     "observations",
     "actions",
@@ -64,12 +66,37 @@ def atomic_json_dump(value: Any, path: str | Path) -> Path:
     return target
 
 
+def _cached_transition_data(path: str | Path) -> dict[str, np.ndarray]:
+    """Read one immutable chunk once per worker process."""
+    source = Path(path).expanduser()
+    stat = source.stat()
+    key = (str(source.resolve()), int(stat.st_mtime_ns), int(stat.st_size))
+    cached = _TRANSITION_CACHE.get(key)
+    if cached is None:
+        cached = load_transition_data(source)
+        _TRANSITION_CACHE[key] = cached
+    return cached
+
+
 def load_transition_data(path: str | Path) -> dict[str, np.ndarray]:
     """Load legacy or canonical transition dictionaries into one schema."""
     with Path(path).expanduser().open("rb") as file:
         raw = pickle.load(file)
     if not isinstance(raw, dict):
         raise TypeError(f"Transition buffer must be a dictionary: {path}")
+    manifest = raw.get("__chunk_manifest__")
+    if manifest is not None:
+        pieces = [_cached_transition_data(item) for item in manifest]
+        if not pieces:
+            raise ValueError(f"Empty transition manifest: {path}")
+        merged = {
+            key: np.concatenate([piece[key] for piece in pieces], axis=0)
+            for key in TRANSITION_KEYS
+        }
+        capacity = raw.get("capacity")
+        if capacity is not None and len(merged["rewards"]) > int(capacity):
+            merged = {key: value[-int(capacity):] for key, value in merged.items()}
+        return merged
 
     aliases = {
         "observations": ("observations", "states", "obs"),
@@ -152,6 +179,33 @@ class ChunkReplayBuffer:
         self.chunks = self.root / "chunks"
         self.chunks.mkdir(parents=True, exist_ok=True)
         self.capacity = capacity
+        self.index_path = self.root / "index.json"
+        if not self.index_path.exists():
+            self._rebuild_index()
+
+    def _rebuild_index(self) -> None:
+        # Do not call snapshot_paths here: if index.json is corrupt that would
+        # recurse back into _rebuild_index. Chunk files are immutable, so a
+        # direct directory scan is sufficient for recovery.
+        chunks = sorted(self.chunks.glob("*.pkl"))
+        total = 0
+        for path in chunks:
+            with path.open("rb") as file:
+                payload = pickle.load(file)
+            total += len(payload["rewards"])
+        atomic_json_dump({"chunks": [str(p) for p in chunks], "total": total}, self.index_path)
+
+    def _index(self) -> dict[str, Any]:
+        try:
+            with self.index_path.open("r", encoding="utf-8") as file:
+                value = json.load(file)
+            if isinstance(value, dict) and "chunks" in value:
+                return value
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+        self._rebuild_index()
+        with self.index_path.open("r", encoding="utf-8") as file:
+            return json.load(file)
 
     def append(self, transitions: dict[str, Any], metadata: dict[str, Any] | None = None) -> Path:
         arrays = {
@@ -173,9 +227,20 @@ class ChunkReplayBuffer:
             raise ValueError("Replay chunk arrays must be non-empty and equally sized.")
         payload = {**arrays, "metadata": metadata or {}, "created_at": time.time()}
         name = f"{time.time_ns():020d}_{os.getpid()}_{uuid.uuid4().hex}.pkl"
-        return atomic_pickle_dump(payload, self.chunks / name)
+        path = atomic_pickle_dump(payload, self.chunks / name)
+        index = self._index()
+        index.setdefault("chunks", []).append(str(path))
+        index["total"] = int(index.get("total", 0)) + size
+        atomic_json_dump(index, self.index_path)
+        return path
 
     def snapshot_paths(self) -> list[Path]:
+        if self.index_path.exists():
+            try:
+                index = self._index()
+                return [Path(item) for item in index.get("chunks", []) if Path(item).is_file()]
+            except (OSError, ValueError):
+                pass
         return sorted(self.chunks.glob("*.pkl"))
 
     def load_snapshot(self, paths: Iterable[str | Path] | None = None) -> dict[str, np.ndarray]:
@@ -205,11 +270,9 @@ class ChunkReplayBuffer:
         return self.load_snapshot(paths)
 
     def size(self) -> int:
-        total = 0
-        for path in self.snapshot_paths():
-            with path.open("rb") as file:
-                chunk = pickle.load(file)
-            total += len(chunk["rewards"])
+        total = int(self._index().get("total", 0))
+        if self.capacity is not None:
+            return min(total, int(self.capacity))
         return total
 
 
@@ -245,7 +308,14 @@ class VersionManager:
         temporary = self.root / f".{component}_{version}.{uuid.uuid4().hex}.tmp"
         temporary.mkdir()
         try:
-            shutil.copy2(Path(checkpoint_source).expanduser(), temporary / "checkpoint.pkl")
+            source = Path(checkpoint_source).expanduser()
+            target = temporary / "checkpoint.pkl"
+            try:
+                # Checkpoints are immutable after publication; hard links avoid
+                # copying large frozen decoder files for every version.
+                os.link(source, target)
+            except OSError:
+                shutil.copy2(source, target)
             atomic_json_dump(metadata, temporary / "metadata.json")
             (temporary / "READY").write_text("ready\n", encoding="utf-8")
             os.replace(temporary, final)

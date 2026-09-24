@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import NewType
+from typing import NamedTuple, NewType
 
 import jax
 from jax import Array, nn
@@ -13,11 +13,19 @@ from .math_utils import NormalDistribution
 MlpWeights = NewType("MlpWeights", tuple[tuple[Array, ...], ...])
 
 
+class CriticEnsembleParams(NamedTuple):
+    """SERL critic ensemble: independent MLP backbones, shared output Dense."""
+
+    backbones: tuple[MlpWeights, ...]
+    output: tuple[Array, Array]
+
+
 def mlp_init(
     prng: Array,
     dims: tuple[int, ...],
     init_fn: nn.initializers.Initializer | None = None,
     use_layer_norm: bool = False,
+    layer_norm_final: bool = False,
 ) -> MlpWeights:
     """Initialize an MLP, optionally with SERL LayerNorm parameters."""
     prngs = jax.random.split(prng, len(dims) - 1)
@@ -31,10 +39,32 @@ def mlp_init(
     layers = []
     for index, (key, shape) in enumerate(zip(prngs, shapes)):
         layer = (init_fn(key, shape), jnp.zeros((shape[1],)))
-        if use_layer_norm and index < len(dims) - 2:
+        if use_layer_norm and (index < len(dims) - 2 or layer_norm_final):
             layer = layer + (jnp.ones((shape[1],)), jnp.zeros((shape[1],)))
         layers.append(layer)
     return MlpWeights(tuple(layers))
+
+
+def critic_ensemble_init(
+    prng: Array,
+    dims: tuple[int, ...],
+    ensemble_size: int,
+) -> CriticEnsembleParams:
+    """Initialize independent SERL backbones and one shared scalar head."""
+    if len(dims) < 3:
+        raise ValueError("A critic requires at least one hidden layer.")
+    backbone_keys, output_key = jax.random.split(prng)
+    backbone_dims = dims[:-1]
+    backbones = tuple(
+        mlp_init(key, backbone_dims, use_layer_norm=True, layer_norm_final=True)
+        for key in jax.random.split(backbone_keys, ensemble_size)
+    )
+    output_init = nn.initializers.xavier_uniform()
+    output = (
+        output_init(output_key, (dims[-2], dims[-1])),
+        jnp.zeros((dims[-1],)),
+    )
+    return CriticEnsembleParams(backbones, output)
 
 
 def gaussian_policy_init(
@@ -77,6 +107,18 @@ def _serl_hidden_fwd(weights: MlpWeights, x: Array) -> Array:
     """SERL MLP backbone: Dense -> LayerNorm -> tanh per hidden layer."""
     for layer in weights[:-1]:
         linear, bias, scale, offset = layer
+        x = jnp.einsum("...i,ij->...j", x, linear) + bias
+        mean = jnp.mean(x, axis=-1, keepdims=True)
+        variance = jnp.mean(jnp.square(x - mean), axis=-1, keepdims=True)
+        x = (x - mean) * jax.lax.rsqrt(variance + 1e-6)
+        x = x * scale + offset
+        x = nn.tanh(x)
+    return x
+
+
+def _serl_all_hidden_fwd(weights: MlpWeights, x: Array) -> Array:
+    """Apply Dense -> LayerNorm -> tanh to every supplied hidden layer."""
+    for linear, bias, scale, offset in weights:
         x = jnp.einsum("...i,ij->...j", x, linear) + bias
         mean = jnp.mean(x, axis=-1, keepdims=True)
         variance = jnp.mean(jnp.square(x - mean), axis=-1, keepdims=True)
@@ -171,3 +213,23 @@ def q_mlp_fwd(weights: MlpWeights, obs: Array, action: Array) -> Array:
     x = jnp.einsum("...i,ij->...j", x, linear) + bias
     x = jnp.squeeze(x, axis=-1)
     return x
+
+
+def q_ensemble_values(
+    params: CriticEnsembleParams | tuple[MlpWeights, ...],
+    obs: Array,
+    action: Array,
+) -> Array:
+    """Return Q values with a leading ensemble dimension."""
+    if isinstance(params, CriticEnsembleParams):
+        x = jnp.concatenate([obs, action], axis=-1)
+        output_kernel, output_bias = params.output
+        values = []
+        for backbone in params.backbones:
+            hidden = _serl_all_hidden_fwd(backbone, x)
+            value = jnp.einsum(
+                "...i,ij->...j", hidden, output_kernel
+            ) + output_bias
+            values.append(jnp.squeeze(value, axis=-1))
+        return jnp.stack(values)
+    return jnp.stack([q_mlp_fwd(member, obs, action) for member in params])

@@ -9,6 +9,8 @@ class EnvConfig:
     episode_length: int = 150#1000
     num_envs: int = 48#50#16
     eval_num_envs: int = 48
+    # Evaluate one published policy every N versions.
+    eval_interval: int = 10
     dense_reward: bool = True
     success_reward_bonus: float = 0.0
     terminate_on_success: bool = False
