@@ -26,19 +26,19 @@ import numpy as np
 
 
 INPUT_PATH = Path(
-    "/root/GoRL/datasets/robomimic/mg_can_low_dim_dense_v141.hdf5"
+    "/root/GoRL/datasets/robomimic/lift_mg_low_dim_dense_v141.hdf5"
 )
 PROCESSED_PATH = Path(
     "/root/GoRL/datasets/robomimic/"
-    "mg_can_low_dim_dense_done_processed_v141_nocut.hdf5"
+    "lift_mg_low_dim_dense_done_processed_v141_nocut.hdf5"
 )
 SUCCESS_OUTPUT_PATH = Path(
     "/root/GoRL/datasets/robomimic/"
-    "mg_can_low_dim_dense_done_processed_success_v141_nocut.pkl"
+    "lift_mg_low_dim_dense_done_processed_success_v141_nocut.pkl"
 )
 SUCCESS_HDF5_OUTPUT_PATH = Path(
     "/root/GoRL/datasets/robomimic/"
-    "mg_can_low_dim_dense_done_processed_success_v141_nocut.hdf5"
+    "lift_mg_low_dim_dense_done_processed_success_v141_nocut.hdf5"
 )
 
 TRANSITION_KEYS = (

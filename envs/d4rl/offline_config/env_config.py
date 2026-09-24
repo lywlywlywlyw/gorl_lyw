@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 @dataclass
 class EnvConfig:
     """Minari dataset and Gymnasium v5 task settings."""
-    dataset_path: str = "mujoco/halfcheetah/medium-v0"
+    dataset_path: str = "mujoco/hopper/medium-v0"
     action_repeat: int = 1
     episode_length: int = 1000
     num_envs: int = 96

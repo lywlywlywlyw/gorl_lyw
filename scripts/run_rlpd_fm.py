@@ -329,6 +329,7 @@ def run_async_pipeline(
     online_decoder_anchor_weight: float = 1.0,
     online_decoder_inverse_anchor_weight: float = 1.0,
     environment: str = "robomimic",
+    env_name: str | None = None,
     dataset_path: str | None = None,
 ) -> None:
     """Run collection, evaluation, and both trainers as independent processes."""
@@ -340,6 +341,8 @@ def run_async_pipeline(
         raise ValueError("environment must be 'robomimic' or 'd4rl'.")
     config = TrainingConfig().to_dict() | EnvConfig().to_dict()
     config["environment"] = environment
+    if env_name is not None:
+        config["env_name"] = env_name
     if dataset_path is not None:
         config["dataset_path"] = dataset_path
     if environment == "d4rl":
@@ -724,6 +727,7 @@ def main(
     online_decoder_anchor_weight: float = 1.0,
     online_decoder_inverse_anchor_weight: float = 1.0,
     environment: str = "robomimic",
+    env_name: str | None = None,
     dataset_path: str | None = None,
 ) -> None:
     """Run the asynchronous RLPD encoder + FM decoder training pipeline."""
@@ -753,6 +757,7 @@ def main(
         online_decoder_anchor_weight=online_decoder_anchor_weight,
         online_decoder_inverse_anchor_weight=online_decoder_inverse_anchor_weight,
         environment=environment,
+        env_name=env_name,
         dataset_path=dataset_path,
     )
 
