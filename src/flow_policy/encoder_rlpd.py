@@ -89,15 +89,15 @@ class EncoderState:
             raise ValueError("latent_kl_weight must be non-negative")
         obs_dim = int(env.observation_size)
         actor_key, critic_key, prng = jax.random.split(prng, 3)
-        actor_dims = (obs_dim,) + (config.hidden_size,) * config.hidden_layers + (
-            2 * config.z_dim,
-        )
+        actor_dims = (
+            obs_dim,
+        ) + (config.hidden_size,) * config.hidden_layers + (config.z_dim,)
         critic_dims = (
             obs_dim + config.z_dim,
         ) + (config.hidden_size,) * config.hidden_layers + (1,)
-        actor_params = networks.mlp_init(actor_key, actor_dims)
+        actor_params = networks.gaussian_policy_init(actor_key, actor_dims)
         critic_params = tuple(
-            networks.mlp_init(key, critic_dims)
+            networks.mlp_init(key, critic_dims, use_layer_norm=True)
             for key in jax.random.split(critic_key, config.critic_ensemble_size)
         )
         actor_optimizer = optax.chain(

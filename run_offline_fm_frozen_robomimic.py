@@ -545,27 +545,34 @@ def make_iql_update(
     def update(
         actor_params,
         actor_opt_state,
-        q1_params,
-        q2_params,
+        critic_params,
         critic_opt_state,
         value_params,
         value_opt_state,
-        target_q1_params,
-        target_q2_params,
+        target_critic_params,
         obs,
         actions,
         rewards,
         next_obs,
         masks,
         latent_actions,
+        critic_subset_key,
     ):
-        # The encoder chooses decoder latents, so IQL must estimate Q(s, z).
-        # Keeping environment actions here would train a shape-compatible but
-        # semantically incompatible critic for online latent-space RLPD.
-        target_q = jnp.minimum(
-            networks.q_mlp_fwd(target_q1_params, obs, latent_actions),
-            networks.q_mlp_fwd(target_q2_params, obs, latent_actions),
+        target_qs = jnp.stack([
+            networks.q_mlp_fwd(member, obs, latent_actions)
+            for member in target_critic_params
+        ])
+        subset_size = min(
+            int(config.rlpd_critic_subsample_size),
+            len(target_critic_params),
         )
+        subset = jax.random.choice(
+            critic_subset_key,
+            len(target_critic_params),
+            shape=(subset_size,),
+            replace=False,
+        )
+        target_q = jnp.min(target_qs[subset], axis=0)
 
         def value_loss_fn(params):
             value = networks.value_mlp_fwd(params, obs)
@@ -592,18 +599,12 @@ def make_iql_update(
             log_prob = jnp.sum(distribution.log_prob(latent_actions), axis=-1)
             mean = distribution.loc
             std = distribution.scale
-            # The frozen FM decoder was trained from a standard-normal latent
-            # prior. Regularize the offline IQL actor independently from the
-            # online RLPD actor so the two KL strengths can be tuned separately.
             prior_kl = 0.5 * jnp.sum(
                 jnp.square(mean) + jnp.square(std) - 1.0 - 2.0 * jnp.log(std),
                 axis=-1,
             )
             actor_loss = -jnp.mean(advantage_weight * log_prob)
-            actor_loss = (
-                actor_loss
-                + config.encoder_iql_prior_kl_weight * jnp.mean(prior_kl)
-            )
+            actor_loss += config.encoder_iql_prior_kl_weight * jnp.mean(prior_kl)
             return actor_loss, jnp.mean(prior_kl)
 
         (actor_loss, latent_prior_kl), actor_grads = jax.value_and_grad(
@@ -620,202 +621,181 @@ def make_iql_update(
         bellman_target = rewards + config.discount * masks * next_value
 
         def critic_loss_fn(params):
-            q1, q2 = params
-            q1_value = networks.q_mlp_fwd(q1, obs, latent_actions)
-            q2_value = networks.q_mlp_fwd(q2, obs, latent_actions)
-            loss = jnp.mean(
-                jnp.square(q1_value - bellman_target)
-                + jnp.square(q2_value - bellman_target)
-            )
-            return loss, (q1_value, q2_value)
+            predicted = jnp.stack([
+                networks.q_mlp_fwd(member, obs, latent_actions)
+                for member in params
+            ])
+            loss = jnp.mean(jnp.square(predicted - bellman_target[None, :]))
+            return loss, predicted
 
-        (critic_loss, (q1_value, q2_value)), critic_grads = jax.value_and_grad(
+        (critic_loss, predicted_qs), critic_grads = jax.value_and_grad(
             critic_loss_fn, has_aux=True
-        )((q1_params, q2_params))
+        )(critic_params)
         critic_updates, critic_opt_state = critic_optimizer.update(
-            critic_grads, critic_opt_state, (q1_params, q2_params)
+            critic_grads, critic_opt_state, critic_params
         )
-        q1_params, q2_params = optax.apply_updates(
-            (q1_params, q2_params), critic_updates
-        )
-        target_q1_params = polyak_update(
-            q1_params, target_q1_params, config.target_update_rate
-        )
-        target_q2_params = polyak_update(
-            q2_params, target_q2_params, config.target_update_rate
+        critic_params = optax.apply_updates(critic_params, critic_updates)
+        target_critic_params = polyak_update(
+            critic_params, target_critic_params, config.target_update_rate
         )
         return (
             actor_params,
             actor_opt_state,
-            q1_params,
-            q2_params,
+            critic_params,
             critic_opt_state,
             value_params,
             value_opt_state,
-            target_q1_params,
-            target_q2_params,
+            target_critic_params,
             {
                 "value_loss": value_loss,
                 "actor_loss": actor_loss,
                 "latent_prior_kl": latent_prior_kl,
                 "critic_loss": critic_loss,
                 "value": jnp.mean(value),
-                "q1": jnp.mean(q1_value),
-                "q2": jnp.mean(q2_value),
+                "q_mean": jnp.mean(predicted_qs),
+                "q_min": jnp.mean(jnp.min(predicted_qs, axis=0)),
                 "advantage": jnp.mean(advantage),
                 "adv_weight": jnp.mean(advantage_weight),
             },
-
         )
 
     return update
 
-
 def make_iql_alignment_update(
     config: ConfigView,
     critic_optimizer: optax.GradientTransformation,
-    q0_params: tuple[PyTree, PyTree],
+    q0_params: tuple[PyTree, ...],
 ):
-    """Adapt Q geometry while distilling the early-stopped IQL critics."""
+    """Adapt ensemble Q geometry while preserving the selected IQL critics."""
     online_temperature = float(config.rlpd_initial_temperature)
     online_kl_weight = float(config.rlpd_latent_kl_weight)
-    score_weight = float(config.encoder_score_matching_weight)
 
     @jax.jit
     def update(
-        q1_params,
-        q2_params,
+        critic_params,
         critic_opt_state,
         teacher_actor_params,
         obs,
         actor_sample_key,
     ):
-        actor_distribution = networks.gaussian_policy_fwd(
-            teacher_actor_params, obs
-        )
-        latent_actions = actor_distribution.sample(seed=actor_sample_key)
-        teacher_distribution = networks.gaussian_policy_fwd(
-            teacher_actor_params, obs
-        )
+        distribution = networks.gaussian_policy_fwd(teacher_actor_params, obs)
+        latent_actions = distribution.sample(seed=actor_sample_key)
         teacher_score = -(
-            latent_actions - teacher_distribution.loc
-        ) / jnp.square(teacher_distribution.scale)
+            latent_actions - distribution.loc
+        ) / jnp.square(distribution.scale)
         score_target = jax.lax.stop_gradient(
             (online_temperature + online_kl_weight) * teacher_score
             + online_kl_weight * latent_actions
         )
 
         def q_mean_single(params, observation, latent):
-            q1, q2 = params
-            return 0.5 * (
-                networks.q_mlp_fwd(q1, observation, latent)
-                + networks.q_mlp_fwd(q2, observation, latent)
-            )
+            values = jnp.stack([
+                networks.q_mlp_fwd(member, observation, latent)
+                for member in params
+            ])
+            return jnp.mean(values, axis=0)
 
         def critic_loss_fn(params):
-            q1, q2 = params
-            q1_value = networks.q_mlp_fwd(q1, obs, latent_actions)
-            q2_value = networks.q_mlp_fwd(q2, obs, latent_actions)
-            q01_value = networks.q_mlp_fwd(q0_params[0], obs, latent_actions)
-            q02_value = networks.q_mlp_fwd(q0_params[1], obs, latent_actions)
+            predicted = jnp.stack([
+                networks.q_mlp_fwd(member, obs, latent_actions)
+                for member in params
+            ])
+            reference = jnp.stack([
+                networks.q_mlp_fwd(member, obs, latent_actions)
+                for member in q0_params
+            ])
             current_q_grad = jax.vmap(
                 jax.grad(q_mean_single, argnums=2), in_axes=(None, 0, 0)
             )(params, obs, latent_actions)
             score_loss = jnp.mean(jnp.square(current_q_grad - score_target))
-            return score_loss, (
-                q1_value,
-                q2_value,
-                q01_value,
-                q02_value,
-                score_loss,
-            )
+            return score_loss, (predicted, reference, score_loss)
 
-        (critic_loss, (q1_value, q2_value, q01_value, q02_value,
-                       score_loss)), critic_grads = (
-            jax.value_and_grad(critic_loss_fn, has_aux=True)(
-                (q1_params, q2_params)
-            )
+        (critic_loss, (predicted, reference, score_loss)), critic_grads = (
+            jax.value_and_grad(critic_loss_fn, has_aux=True)(critic_params)
         )
         critic_updates, critic_opt_state = critic_optimizer.update(
-            critic_grads, critic_opt_state, (q1_params, q2_params)
+            critic_grads, critic_opt_state, critic_params
         )
-        q1_params, q2_params = optax.apply_updates(
-            (q1_params, q2_params), critic_updates
+        critic_params = optax.apply_updates(critic_params, critic_updates)
+        after = jnp.stack([
+            networks.q_mlp_fwd(member, obs, latent_actions)
+            for member in critic_params
+        ])
+        reference_mean = jnp.mean(reference, axis=0)
+        q_abs_drift = jnp.mean(jnp.abs(after - reference))
+        q_relative_drift = q_abs_drift / (
+            jnp.mean(jnp.abs(reference_mean)) + 1e-8
         )
-        q1_after = networks.q_mlp_fwd(q1_params, obs, latent_actions)
-        q2_after = networks.q_mlp_fwd(q2_params, obs, latent_actions)
-        q0_mean = 0.5 * (q01_value + q02_value)
-        q_abs_drift = jnp.mean(
-            0.5 * (jnp.abs(q1_after - q01_value) + jnp.abs(q2_after - q02_value))
-        )
-        q_relative_drift = q_abs_drift / (jnp.mean(jnp.abs(q0_mean)) + 1e-8)
-
         q_grad = jax.vmap(
             jax.grad(q_mean_single, argnums=2), in_axes=(None, 0, 0)
-        )((q1_params, q2_params), obs, latent_actions)
+        )(critic_params, obs, latent_actions)
         q0_grad = jax.vmap(
             jax.grad(q_mean_single, argnums=2), in_axes=(None, 0, 0)
         )(q0_params, obs, latent_actions)
         q_grad_norm = jnp.mean(jnp.linalg.norm(q_grad, axis=-1))
         q_grad_cosine = jnp.mean(
             jnp.sum(q_grad * q0_grad, axis=-1)
-            / (jnp.linalg.norm(q_grad, axis=-1) * jnp.linalg.norm(q0_grad, axis=-1) + 1e-8)
+            / (
+                jnp.linalg.norm(q_grad, axis=-1)
+                * jnp.linalg.norm(q0_grad, axis=-1)
+                + 1e-8
+            )
         )
-        return (
-            q1_params,
-            q2_params,
-            critic_opt_state,
-            {
-                "q_abs_drift": q_abs_drift,
-                "q_relative_drift": q_relative_drift,
-                "score_matching_loss": score_loss,
-                "q_latent_grad_norm": q_grad_norm,
-                "q_latent_grad_cosine_to_q0": q_grad_cosine,
-            },
-        )
+        return critic_params, critic_opt_state, {
+            "q_abs_drift": q_abs_drift,
+            "q_relative_drift": q_relative_drift,
+            "score_matching_loss": score_loss,
+            "q_latent_grad_norm": q_grad_norm,
+            "q_latent_grad_cosine_to_q0": q_grad_cosine,
+        }
 
     return update
-
 
 @jax.jit
 def _iql_validation_kernel(
     expectile, discount, actor_nll_weight,
-    actor_params, q1_params, q2_params, value_params,
-    target_q1_params, target_q2_params, obs, next_obs, latents,
-    rewards, masks,
+    actor_params, critic_params, value_params, target_critic_params,
+    obs, next_obs, latents, rewards, masks,
 ):
-    target_q = jnp.minimum(
-        networks.q_mlp_fwd(target_q1_params, obs, latents),
-        networks.q_mlp_fwd(target_q2_params, obs, latents),
-    )
+    target_qs = jnp.stack([
+        networks.q_mlp_fwd(member, obs, latents)
+        for member in target_critic_params
+    ])
+    target_q = jnp.min(target_qs, axis=0)
     distribution = networks.gaussian_policy_fwd(actor_params, obs)
     actor_nll = -jnp.mean(jnp.sum(distribution.log_prob(latents), axis=-1))
     value = networks.value_mlp_fwd(value_params, obs)
     value_loss = jnp.mean(expectile_loss(target_q - value, expectile))
     next_value = networks.value_mlp_fwd(value_params, next_obs)
     bellman_target = rewards + discount * masks * next_value
-    q1 = networks.q_mlp_fwd(q1_params, obs, latents)
-    q2 = networks.q_mlp_fwd(q2_params, obs, latents)
-    td_loss = jnp.mean(jnp.square(q1 - bellman_target) + jnp.square(q2 - bellman_target))
+    predicted_qs = jnp.stack([
+        networks.q_mlp_fwd(member, obs, latents)
+        for member in critic_params
+    ])
+    td_loss = jnp.mean(jnp.square(predicted_qs - bellman_target[None, :]))
     q_scale = jnp.maximum(jnp.mean(jnp.abs(bellman_target)), 1.0)
     value_scale = jnp.maximum(jnp.mean(jnp.abs(target_q)), 1.0)
-    relative_td_rmse = jnp.sqrt(td_loss / 2.0) / q_scale
+    relative_td_rmse = jnp.sqrt(td_loss) / q_scale
     relative_value_rmse = jnp.sqrt(value_loss) / value_scale
     actor_nll_per_dim = actor_nll / latents.shape[-1]
-    validation_score = relative_td_rmse + relative_value_rmse + actor_nll_weight * actor_nll_per_dim
-    return jnp.asarray((td_loss, value_loss, td_loss + value_loss, q_scale,
-                        value_scale, relative_td_rmse, relative_value_rmse,
-                        actor_nll, actor_nll_per_dim, validation_score))
+    validation_score = (
+        relative_td_rmse
+        + relative_value_rmse
+        + actor_nll_weight * actor_nll_per_dim
+    )
+    return jnp.asarray((
+        td_loss, value_loss, td_loss + value_loss, q_scale, value_scale,
+        relative_td_rmse, relative_value_rmse, actor_nll,
+        actor_nll_per_dim, validation_score,
+    ))
 
 
 def iql_validation_losses(
     config: ConfigView,
     actor_params: PyTree,
-    q1_params: PyTree,
-    q2_params: PyTree,
+    critic_params: tuple[PyTree, ...],
     value_params: PyTree,
-    target_q1_params: PyTree,
-    target_q2_params: PyTree,
+    target_critic_params: tuple[PyTree, ...],
     normalized_observations: Array,
     normalized_next_observations: Array,
     rewards: Array,
@@ -823,23 +803,25 @@ def iql_validation_losses(
     latent_targets: Array,
     indices: np.ndarray,
 ) -> dict[str, float]:
-    """Compute deterministic held-out Bellman TD and expectile value losses."""
+    """Compute held-out ensemble Bellman TD and expectile value losses."""
     values = jax.device_get(_iql_validation_kernel(
-        config.expectile, config.discount, config.early_stopping_actor_nll_weight,
-        actor_params, q1_params, q2_params, value_params,
-        target_q1_params, target_q2_params,
+        config.expectile, config.discount,
+        config.early_stopping_actor_nll_weight,
+        actor_params, critic_params, value_params, target_critic_params,
         normalized_observations[jnp.asarray(indices)],
         normalized_next_observations[jnp.asarray(indices)],
-        latent_targets[jnp.asarray(indices)], rewards[jnp.asarray(indices)],
+        latent_targets[jnp.asarray(indices)],
+        rewards[jnp.asarray(indices)],
         masks[jnp.asarray(indices)],
     ))
-    names = ("validation_td_loss", "validation_value_loss", "validation_loss",
-             "validation_q_scale", "validation_value_scale",
-             "validation_relative_td_rmse", "validation_relative_value_rmse",
-             "validation_actor_nll", "validation_actor_nll_per_dim",
-             "validation_score")
+    names = (
+        "validation_td_loss", "validation_value_loss", "validation_loss",
+        "validation_q_scale", "validation_value_scale",
+        "validation_relative_td_rmse", "validation_relative_value_rmse",
+        "validation_actor_nll", "validation_actor_nll_per_dim",
+        "validation_score",
+    )
     return dict(zip(names, np.asarray(values).tolist()))
-
 
 def compatible_opt_state(
     checkpoint: dict[str, Any], name: str, default: PyTree
@@ -859,33 +841,37 @@ def compatible_opt_state(
 
 @jax.jit
 def _policy_metrics_kernel(
-    actor_params, q1_params, q2_params, value_params, decoder,
+    actor_params, critic_params, value_params, decoder,
     obs_norm, obs_raw, data_actions, targets,
 ):
     distribution = networks.gaussian_policy_fwd(actor_params, obs_norm)
     policy_z = distribution.loc
     policy_actions = forward_fm_batch(decoder, obs_raw, policy_z)
-    q_policy = jnp.minimum(
-        networks.q_mlp_fwd(q1_params, obs_norm, policy_z),
-        networks.q_mlp_fwd(q2_params, obs_norm, policy_z),
-    )
-    q_data = jnp.minimum(
-        networks.q_mlp_fwd(q1_params, obs_norm, targets),
-        networks.q_mlp_fwd(q2_params, obs_norm, targets),
-    )
+    q_policy_all = jnp.stack([
+        networks.q_mlp_fwd(member, obs_norm, policy_z)
+        for member in critic_params
+    ])
+    q_data_all = jnp.stack([
+        networks.q_mlp_fwd(member, obs_norm, targets)
+        for member in critic_params
+    ])
+    q_policy = jnp.min(q_policy_all, axis=0)
+    q_data = jnp.min(q_data_all, axis=0)
     value = networks.value_mlp_fwd(value_params, obs_norm)
     return jnp.asarray((
-        jnp.mean(q_policy), jnp.mean(q_data), jnp.mean(q_policy - q_data),
-        jnp.mean(q_policy - value), jnp.mean(jnp.square(policy_actions - data_actions)),
+        jnp.mean(q_policy), jnp.mean(q_data),
+        jnp.mean(q_policy - q_data), jnp.mean(q_policy - value),
+        jnp.mean(jnp.square(policy_actions - data_actions)),
         -jnp.mean(jnp.sum(distribution.log_prob(targets), axis=-1)),
-        jnp.mean(jnp.square(policy_z - targets)), jnp.mean(distribution.scale),
+        jnp.mean(jnp.square(policy_z - targets)),
+        jnp.mean(distribution.scale),
+        jnp.mean(jnp.std(q_policy_all, axis=0)),
     ))
 
 
 def policy_metrics(
     actor_params: PyTree,
-    q1_params: PyTree,
-    q2_params: PyTree,
+    critic_params: tuple[PyTree, ...],
     value_params: PyTree,
     decoder: Any,
     normalized_observations: Array,
@@ -895,17 +881,20 @@ def policy_metrics(
     latent_targets: Array,
 ) -> dict[str, float]:
     values = jax.device_get(_policy_metrics_kernel(
-        actor_params, q1_params, q2_params, value_params, decoder,
+        actor_params, critic_params, value_params, decoder,
         normalized_observations[jnp.asarray(indices)],
         observations[jnp.asarray(indices)],
         data_actions[jnp.asarray(indices)],
         latent_targets[jnp.asarray(indices)],
     ))
-    names = ("comparison/policy_q", "comparison/data_q", "comparison/policy_q_minus_data_q",
-             "comparison/policy_q_minus_v", "comparison/policy_action_data_mse",
-             "encoder/latent_nll", "encoder/mean_target_mse", "encoder/scale_mean")
+    names = (
+        "comparison/policy_q", "comparison/data_q",
+        "comparison/policy_q_minus_data_q", "comparison/policy_q_minus_v",
+        "comparison/policy_action_data_mse", "encoder/latent_nll",
+        "encoder/mean_target_mse", "encoder/scale_mean",
+        "comparison/critic_std_policy",
+    )
     return dict(zip(names, np.asarray(values).tolist()))
-
 
 def append_metrics(path: Path, record: dict[str, Any]) -> None:
     with open(path, "a") as file:
@@ -1030,33 +1019,28 @@ def save_offline_checkpoint(
     decoder: Any,
     actor_params: PyTree,
     encoder_obs_stats: Any,
-    q1_params: PyTree,
-    q2_params: PyTree,
+    critic_params: tuple[PyTree, ...],
     value_params: PyTree,
     decoder_epoch: int,
     encoder_iql_step: int,
     actor_opt_state: PyTree,
     critic_opt_state: PyTree,
     value_opt_state: PyTree,
-    target_q1_params: PyTree,
-    target_q2_params: PyTree,
+    target_critic_params: tuple[PyTree, ...],
     rng: np.random.Generator,
     key: Array,
     bridge_metadata: dict[str, Any] | None = None,
 ) -> None:
     obs_dim = int(decoder.obs_stats.mean.shape[-1])
     action_dim = int(decoder.action_dim if hasattr(decoder, "action_dim") else decoder.params[-1][0].shape[-1])
-    critic_params = tuple(
-        q1_params if member % 2 == 0 else q2_params
-        for member in range(rlpd_config.critic_ensemble_size)
-    )
-    target_critic_params = tuple(
-        target_q1_params if member % 2 == 0 else target_q2_params
-        for member in range(rlpd_config.critic_ensemble_size)
-    )
+    if len(critic_params) != rlpd_config.critic_ensemble_size:
+        raise ValueError(
+            "Offline critic ensemble size does not match online RLPD config: "
+            f"{len(critic_params)} != {rlpd_config.critic_ensemble_size}."
+        )
     checkpoint = {
         "checkpoint_format": "gorl_offline_fm_rlpd",
-        "checkpoint_version": 2,
+        "checkpoint_version": 3,
         "offline_checkpoint_type": "decoder_encoder",
         "training_phase": "encoder",
         # Frozen FM decoder loaded by the RLPD training component.
@@ -1079,9 +1063,8 @@ def save_offline_checkpoint(
         # Stage-0 RLPD warm start used when stage_init_before_training=True.
         "iql_z_actor_params": actor_params,
         "iql_z_obs_stats": encoder_obs_stats,
-        # Full RLPD-compatible state used when stage_init_before_training=False.
-        # IQL trains two Q networks; expand them alternately to the configured
-        # RLPD ensemble so every online critic starts from an offline-trained Q.
+        # Full RLPD-compatible state: all ensemble members are independently
+        # initialized and trained offline before the online warm start.
         "rlpd_z_actor_params": actor_params,
         "rlpd_z_critic_params": critic_params,
         "rlpd_z_target_critic_params": target_critic_params,
@@ -1093,14 +1076,17 @@ def save_offline_checkpoint(
         # Offline-only training state/metadata.
         "decoder_type": config.decoder_type,
         "offline_config": dict(config),
-        "q1_params": q1_params,
-        "q2_params": q2_params,
+        "iql_critic_params": critic_params,
+        # Preserve twin-Q aliases for older analysis utilities.
+        "q1_params": critic_params[0],
+        "q2_params": critic_params[1],
         "value_params": value_params,
         "actor_opt_state": actor_opt_state,
         "critic_opt_state": critic_opt_state,
         "value_opt_state": value_opt_state,
-        "target_q1_params": target_q1_params,
-        "target_q2_params": target_q2_params,
+        "target_iql_critic_params": target_critic_params,
+        "target_q1_params": target_critic_params[0],
+        "target_q2_params": target_critic_params[1],
         "numpy_rng_state": rng.bit_generator.state,
         "jax_key": key,
     }
@@ -1178,8 +1164,8 @@ def main(config: ConfigView) -> None:
             )
 
         key = jax.random.key(config.seed)
-        key, decoder_key, actor_key, value_key, q1_key, q2_key = (
-            jax.random.split(key, 6)
+        key, decoder_key, actor_key, value_key, critic_key = (
+            jax.random.split(key, 5)
         )
         if config.decoder_type == "meanflow":
             decoder_config = Decoder1StepFMConfig(
@@ -1239,14 +1225,14 @@ def main(config: ConfigView) -> None:
         # IQL keeps its original actor/value training objectives, but the actor
         # layout matches EncoderState.init in encoder_rlpd.py so its parameters
         # can initialize online RLPD without conversion.
-        actor_params = networks.mlp_init(
+        actor_params = networks.gaussian_policy_init(
             actor_key,
             (obs_dim,)
             + (rlpd_config.hidden_size,) * rlpd_config.hidden_layers
-            + (action_dim * 2,),
+            + (action_dim,),
         )
         value_params = networks.mlp_init(
-            value_key, (obs_dim, 256, 256, 256, 256, 256, 1)
+            value_key, (obs_dim, 256, 256, 1), use_layer_norm=True
         )
         encoder_obs_stats = math_utils.RunningStats.init((obs_dim,)).update(
             jnp.asarray(buffer.observations)
@@ -1283,8 +1269,12 @@ def main(config: ConfigView) -> None:
             *((rlpd_config.hidden_size,) * rlpd_config.hidden_layers),
             1,
         )
-        q1_params = networks.mlp_init(q1_key, q_dims)
-        q2_params = networks.mlp_init(q2_key, q_dims)
+        critic_params = tuple(
+            networks.mlp_init(member_key, q_dims, use_layer_norm=True)
+            for member_key in jax.random.split(
+                critic_key, rlpd_config.critic_ensemble_size
+            )
+        )
         resume_encoder = (
             resume_checkpoint is not None
             and is_combined_checkpoint(resume_checkpoint)
@@ -1293,8 +1283,14 @@ def main(config: ConfigView) -> None:
         if resume_encoder:
             actor_params = resume_checkpoint["iql_z_actor_params"]
             value_params = resume_checkpoint["value_params"]
-            q1_params = resume_checkpoint["q1_params"]
-            q2_params = resume_checkpoint["q2_params"]
+            if "iql_critic_params" not in resume_checkpoint:
+                raise ValueError(
+                    "The requested encoder checkpoint predates the independent "
+                    "SERL-style critic ensemble and cannot resume this architecture."
+                )
+            critic_params = resume_checkpoint["iql_critic_params"]
+            if len(critic_params) != rlpd_config.critic_ensemble_size:
+                raise ValueError("Resume checkpoint critic ensemble size mismatch.")
             encoder_obs_stats = resume_checkpoint.get(
                 "iql_z_obs_stats", encoder_obs_stats
             )
@@ -1528,10 +1524,9 @@ def main(config: ConfigView) -> None:
             optax.adam(config.value_learning_rate),
         )
         actor_opt_state = actor_optimizer.init(actor_params)
-        critic_opt_state = critic_optimizer.init((q1_params, q2_params))
+        critic_opt_state = critic_optimizer.init(critic_params)
         value_opt_state = value_optimizer.init(value_params)
-        target_q1_params = jax.tree.map(jnp.copy, q1_params)
-        target_q2_params = jax.tree.map(jnp.copy, q2_params)
+        target_critic_params = jax.tree.map(jnp.copy, critic_params)
         if resume_encoder and resume_checkpoint is not None:
             actor_opt_state = compatible_opt_state(
                 resume_checkpoint, "actor_opt_state", actor_opt_state
@@ -1542,11 +1537,8 @@ def main(config: ConfigView) -> None:
             value_opt_state = compatible_opt_state(
                 resume_checkpoint, "value_opt_state", value_opt_state
             )
-            target_q1_params = resume_checkpoint.get(
-                "target_q1_params", target_q1_params
-            )
-            target_q2_params = resume_checkpoint.get(
-                "target_q2_params", target_q2_params
+            target_critic_params = resume_checkpoint.get(
+                "target_iql_critic_params", target_critic_params
             )
         iql_update = make_iql_update(
             config, actor_optimizer, critic_optimizer, value_optimizer
@@ -1580,30 +1572,27 @@ def main(config: ConfigView) -> None:
             (
                 actor_params,
                 actor_opt_state,
-                q1_params,
-                q2_params,
+                critic_params,
                 critic_opt_state,
                 value_params,
                 value_opt_state,
-                target_q1_params,
-                target_q2_params,
+                target_critic_params,
                 metrics,
             ) = iql_update(
                 actor_params,
                 actor_opt_state,
-                q1_params,
-                q2_params,
+                critic_params,
                 critic_opt_state,
                 value_params,
                 value_opt_state,
-                target_q1_params,
-                target_q2_params,
+                target_critic_params,
                 device_normalized_observations[jnp.asarray(indices)],
                 device_actions[jnp.asarray(indices)],
                 device_rewards[jnp.asarray(indices)],
                 device_normalized_next_observations[jnp.asarray(indices)],
                 device_masks[jnp.asarray(indices)],
                 device_latent_targets[jnp.asarray(indices)],
+                (key := jax.random.fold_in(key, step)),
             )
             for name, value in metrics.items():
                 accumulators[name] = accumulators.get(name, jnp.asarray(0.0)) + value
@@ -1618,11 +1607,9 @@ def main(config: ConfigView) -> None:
                 latest_validation_metrics = iql_validation_losses(
                     config,
                     actor_params,
-                    q1_params,
-                    q2_params,
+                    critic_params,
                     value_params,
-                    target_q1_params,
-                    target_q2_params,
+                    target_critic_params,
                     device_normalized_observations,
                     device_normalized_next_observations,
                     device_rewards,
@@ -1638,9 +1625,9 @@ def main(config: ConfigView) -> None:
                     best_iql_step = completed_iql_steps
                     best_iql_state = (
                         actor_params, actor_opt_state,
-                        q1_params, q2_params, critic_opt_state,
+                        critic_params, critic_opt_state,
                         value_params, value_opt_state,
-                        target_q1_params, target_q2_params,
+                        target_critic_params,
                     )
                     stale_validations = 0
                 elif completed_iql_steps >= config.early_stopping_min_steps:
@@ -1673,8 +1660,7 @@ def main(config: ConfigView) -> None:
                     },
                     **policy_metrics(
                         actor_params,
-                        q1_params,
-                        q2_params,
+                        critic_params,
                         value_params,
                         decoder,
                         device_normalized_observations,
@@ -1709,16 +1695,14 @@ def main(config: ConfigView) -> None:
                     decoder,
                     actor_params,
                     encoder_obs_stats,
-                    q1_params,
-                    q2_params,
+                    critic_params,
                     value_params,
                     decoder_epoch,
                     completed_iql_steps,
                     actor_opt_state,
                     critic_opt_state,
                     value_opt_state,
-                    target_q1_params,
-                    target_q2_params,
+                    target_critic_params,
                     rng,
                     key,
                 )
@@ -1738,16 +1722,16 @@ def main(config: ConfigView) -> None:
             best_iql_step = completed_iql_steps
             best_iql_state = (
                 actor_params, actor_opt_state,
-                q1_params, q2_params, critic_opt_state,
+                critic_params, critic_opt_state,
                 value_params, value_opt_state,
-                target_q1_params, target_q2_params,
+                target_critic_params,
             )
         (
             actor_params,
             actor_opt_state,
-            q1_params, q2_params, critic_opt_state,
+            critic_params, critic_opt_state,
             value_params, value_opt_state,
-            target_q1_params, target_q2_params,
+            target_critic_params,
         ) = best_iql_state
         print(
             f"Restored best encoder from IQL step {best_iql_step}."
@@ -1764,16 +1748,14 @@ def main(config: ConfigView) -> None:
             decoder,
             actor_params,
             encoder_obs_stats,
-            q1_params,
-            q2_params,
+            critic_params,
             value_params,
             decoder_epoch,
             best_iql_step,
             actor_opt_state,
             critic_opt_state,
             value_opt_state,
-            target_q1_params,
-            target_q2_params,
+            target_critic_params,
             rng,
             key,
             bridge_metadata={
@@ -1793,9 +1775,8 @@ def main(config: ConfigView) -> None:
         teacher_actor_params = jax.tree.map(
             lambda value: jax.lax.stop_gradient(value), actor_params
         )
-        q0_params = (
-            jax.tree.map(lambda value: jax.lax.stop_gradient(value), q1_params),
-            jax.tree.map(lambda value: jax.lax.stop_gradient(value), q2_params),
+        q0_params = jax.tree.map(
+            lambda value: jax.lax.stop_gradient(value), critic_params
         )
         alignment_steps = int(config.encoder_alignment_steps)
         if alignment_steps < 0:
@@ -1812,13 +1793,11 @@ def main(config: ConfigView) -> None:
         ):
             indices = rng.choice(train_indices, size=config.batch_size, replace=True)
             (
-                q1_params,
-                q2_params,
+                critic_params,
                 critic_opt_state,
                 alignment_metrics,
             ) = alignment_update(
-                q1_params,
-                q2_params,
+                critic_params,
                 critic_opt_state,
                 teacher_actor_params,
                 device_normalized_observations[jnp.asarray(indices)],
@@ -1862,8 +1841,7 @@ def main(config: ConfigView) -> None:
         # Online must start with a target critic consistent with the aligned
         # critic; retaining the pre-alignment target would immediately pull Q
         # back toward Q0 during the first online updates.
-        target_q1_params = q1_params
-        target_q2_params = q2_params
+        target_critic_params = critic_params
 
         decoder_path = output_dir / "checkpoint_final.pkl"
         final_iql_step = best_iql_step
@@ -1874,16 +1852,14 @@ def main(config: ConfigView) -> None:
             decoder,
             actor_params,
             encoder_obs_stats,
-            q1_params,
-            q2_params,
+            critic_params,
             value_params,
             decoder_epoch,
             final_iql_step,
             actor_opt_state,
             critic_opt_state,
             value_opt_state,
-            target_q1_params,
-            target_q2_params,
+            target_critic_params,
             rng,
             key,
             bridge_metadata={

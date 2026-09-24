@@ -523,6 +523,9 @@ def train_async_stage(
                 "The initial online IQL Bellman bridge requires the offline "
                 f"value function fields: {missing_value}."
             )
+    _validate_rlpd_state_warm_start(
+        encoder_state, previous, previous_encoder_checkpoint_path
+    )
     with jdc.copy_and_mutate(encoder_state) as encoder_state:
         encoder_state.actor_params = previous["rlpd_z_actor_params"]
         encoder_state.critic_params = previous["rlpd_z_critic_params"]
@@ -726,6 +729,36 @@ def _tree_shapes(tree: Any) -> Any:
     return jax.tree.map(lambda value: tuple(value.shape), tree)
 
 
+def _validate_rlpd_state_warm_start(
+    encoder_state: encoder_rlpd.EncoderState,
+    checkpoint: dict[str, Any],
+    checkpoint_path: str,
+) -> None:
+    """Reject actor/critic checkpoints from the pre-SERL architecture."""
+    expected_trees = {
+        "rlpd_z_actor_params": encoder_state.actor_params,
+        "rlpd_z_critic_params": encoder_state.critic_params,
+        "rlpd_z_target_critic_params": encoder_state.target_critic_params,
+    }
+    for key, expected_tree in expected_trees.items():
+        actual_tree = checkpoint[key]
+        expected = _tree_shapes(expected_tree)
+        actual = _tree_shapes(actual_tree)
+        same_structure = jax.tree.structure(expected) == jax.tree.structure(actual)
+        same_shapes = same_structure and all(
+            left == right
+            for left, right in zip(
+                jax.tree.leaves(expected), jax.tree.leaves(actual), strict=True
+            )
+        )
+        if not same_shapes:
+            raise ValueError(
+                "Encoder checkpoint does not match the SERL actor/critic "
+                f"architecture ({key}): {checkpoint_path}. Re-run offline "
+                "training with the current code/config."
+            )
+
+
 def _validate_iql_actor_warm_start(
     encoder_state: encoder_rlpd.EncoderState,
     checkpoint: dict[str, Any],
@@ -848,6 +881,9 @@ def main(
         )
     )
     if resume:
+        _validate_rlpd_state_warm_start(
+            encoder_state, encoder_checkpoint, encoder_model_path
+        )
         with jdc.copy_and_mutate(encoder_state) as state:
             state.actor_params = encoder_checkpoint["rlpd_z_actor_params"]
             state.critic_params = encoder_checkpoint["rlpd_z_critic_params"]
